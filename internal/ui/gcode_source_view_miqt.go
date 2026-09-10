@@ -65,8 +65,12 @@ func (v *GCodeSourceView) paintLineNumbers(event *qt.QPaintEvent) {
 	painter.SetPen(qt.NewQColor2(qt.DarkGray))
 
 	block := v.editor.FirstVisibleBlock()
-	top := int(math.Round(v.editor.BlockBoundingGeometry(&block).TranslatedWithQPointF(v.editor.ContentOffset()).Top()))
-	bottom := top + int(math.Round(v.editor.BlockBoundingRect(&block).Height()))
+	geometry := v.editor.BlockBoundingGeometry(&block)
+	offset := v.editor.ContentOffset()
+	translated := geometry.TranslatedWithQPointF(&offset)
+	top := int(math.Round(translated.Top()))
+	blockRect := v.editor.BlockBoundingRect(&block)
+	bottom := top + int(math.Round(blockRect.Height()))
 	for block.IsValid() && top <= event.Rect().Bottom() {
 		if block.IsVisible() && bottom >= event.Rect().Top() {
 			painter.DrawText7(0, top, v.gutter.Width()-5, v.editor.FontMetrics().Height(), int(qt.AlignRight), fmt.Sprintf("%d", block.BlockNumber()+1))
@@ -74,7 +78,8 @@ func (v *GCodeSourceView) paintLineNumbers(event *qt.QPaintEvent) {
 		block = *block.Next()
 		top = bottom
 		if block.IsValid() {
-			bottom = top + int(math.Round(v.editor.BlockBoundingRect(&block).Height()))
+			blockRect = v.editor.BlockBoundingRect(&block)
+			bottom = top + int(math.Round(blockRect.Height()))
 		}
 	}
 	painter.End()

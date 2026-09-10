@@ -26,6 +26,19 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
+      - name: Install Qt 5 development dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            qtbase5-dev \
+            qtbase5-dev-tools
+
+      - name: Build MIQT GUI
+        if: matrix.os == 'ubuntu-latest'
+        run: CGO_ENABLED=1 go build -tags "miqt serial" ./cmd/ddgo
+
       - name: Verify formatting
         if: matrix.os == 'ubuntu-latest'
         shell: bash
