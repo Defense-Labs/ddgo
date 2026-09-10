@@ -4,9 +4,11 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"os"
 
 	"github.com/ianbruene/ddgo/internal/app"
+	"github.com/ianbruene/ddgo/internal/gcode"
 	qt "github.com/mappu/miqt/qt"
 )
 
@@ -37,7 +39,7 @@ func (a *Application) Run() error {
 	state, revision := a.controller.SnapshotWithRevision()
 	a.dispatcher.state = state
 	a.dispatcher.revision = revision
-	mainWindow := newMainWindow(a.controller, func() { a.openBlankWindow() })
+	mainWindow := newMainWindow(a.controller, func() { a.openGCodeFile() })
 	a.windows.add(mainWindow)
 	mainWindow.show()
 
@@ -53,8 +55,21 @@ func (a *Application) Run() error {
 	return nil
 }
 
-func (a *Application) openBlankWindow() {
-	window := newBlankWindow(func() { a.openBlankWindow() })
+func (a *Application) openGCodeFile() {
+	path := chooseProgramFile(nil)
+	if path == "" {
+		return
+	}
+	document, err := gcode.LoadDocument(path)
+	if err != nil {
+		qt.QMessageBox_Critical(nil, "Unable to Open File", fmt.Sprintf("Could not open %s:\n%v", path, err))
+		return
+	}
+	a.openGCodeDocument(document)
+}
+
+func (a *Application) openGCodeDocument(document gcode.Document) {
+	window := newGCodeWindow(document, func() { a.openGCodeFile() })
 	a.windows.add(window)
 	window.show()
 }
