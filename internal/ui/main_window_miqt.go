@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -19,7 +18,7 @@ import (
 
 type MainWindow struct {
 	controller    *app.Controller
-	onNewWindow   func()
+	onOpen        func()
 	onClose       func()
 	closeNotified bool
 
@@ -78,8 +77,8 @@ type MainWindow struct {
 	lastErrorLabel    *qt.QLabel
 }
 
-func newMainWindow(controller *app.Controller, onNewWindow func()) *MainWindow {
-	w := &MainWindow{controller: controller, onNewWindow: onNewWindow}
+func newMainWindow(controller *app.Controller, onOpen func()) *MainWindow {
+	w := &MainWindow{controller: controller, onOpen: onOpen}
 	w.build()
 	w.bind()
 	return w
@@ -91,10 +90,10 @@ func (w *MainWindow) build() {
 	w.window.Resize(1180, 640)
 	w.window.SetAttribute(qt.WA_DeleteOnClose)
 	fileMenu := w.window.MenuBar().AddMenuWithTitle("File")
-	newWindowAction := fileMenu.AddAction("New Window temp")
-	newWindowAction.OnTriggered(func() {
-		if w.onNewWindow != nil {
-			w.onNewWindow()
+	openAction := fileMenu.AddAction("Open…")
+	openAction.OnTriggered(func() {
+		if w.onOpen != nil {
+			w.onOpen()
 		}
 	})
 	w.window.OnCloseEvent(func(super func(*qt.QCloseEvent), event *qt.QCloseEvent) {
@@ -411,16 +410,7 @@ func (w *MainWindow) toggleConnection() {
 }
 
 func (w *MainWindow) browseAndLoadProgram() {
-	dialog := qt.NewQFileDialog(w.window.QWidget)
-	dialog.SetWindowTitle("Open G-code Program")
-	dialog.SetFileMode(qt.QFileDialog__ExistingFile)
-	dialog.SetNameFilter("G-code Files (*.gcode *.gc *.nc *.tap *.ngc);;All Files (*)")
-	dialog.Exec()
-	files := dialog.SelectedFiles()
-	if len(files) == 0 {
-		return
-	}
-	path := filepath.Clean(strings.TrimSpace(files[0]))
+	path := chooseProgramFile(w.window.QWidget)
 	if path == "" {
 		return
 	}
