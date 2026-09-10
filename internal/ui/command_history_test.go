@@ -18,9 +18,12 @@ func TestCommandHistoryTraversalAndBoundaries(t *testing.T) {
 		h.add(command)
 	}
 
-	for i, want := range []string{"C", "B", "A", "A"} {
-		if got := h.previous("ignored after first Up"); got != want {
-			t.Fatalf("previous call %d = %q, want %q", i, got, want)
+	if got := h.previous(""); got != "C" {
+		t.Fatalf("first previous call = %q, want C", got)
+	}
+	for i, want := range []string{"B", "A", "A"} {
+		if got := h.previous("ignored while browsing"); got != want {
+			t.Fatalf("previous call %d while browsing = %q, want %q", i+2, got, want)
 		}
 	}
 	for i, want := range []string{"B", "C", "", ""} {
