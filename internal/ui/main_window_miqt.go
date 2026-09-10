@@ -24,9 +24,10 @@ type MainWindow struct {
 
 	window *qt.QMainWindow
 
-	console      *qt.QPlainTextEdit
-	commandEntry *qt.QLineEdit
-	sendButton   *qt.QPushButton
+	console        *qt.QPlainTextEdit
+	commandEntry   *qt.QLineEdit
+	sendButton     *qt.QPushButton
+	commandHistory commandHistory
 
 	portCombo         *qt.QComboBox
 	refreshButton     *qt.QPushButton
@@ -356,6 +357,25 @@ func (w *MainWindow) setOnClose(fn func()) { w.onClose = fn }
 func (w *MainWindow) bind() {
 	w.sendButton.OnClicked(func() { w.sendCommand() })
 	w.commandEntry.OnReturnPressed(func() { w.sendCommand() })
+	w.commandEntry.OnKeyPressEvent(func(super func(*qt.QKeyEvent), event *qt.QKeyEvent) {
+		switch qt.Key(event.Key()) {
+		case qt.Key_Up:
+			if w.commandHistory.canPrevious() {
+				text := w.commandHistory.previous(w.commandEntry.Text())
+				w.commandEntry.SetText(text)
+				w.commandEntry.SetCursorPosition(len(text))
+			}
+		case qt.Key_Down:
+			// At the live position, preserve the QLineEdit's current contents.
+			if w.commandHistory.browsing() {
+				text := w.commandHistory.next()
+				w.commandEntry.SetText(text)
+				w.commandEntry.SetCursorPosition(len(text))
+			}
+		default:
+			super(event)
+		}
+	})
 	w.refreshButton.OnClicked(func() {
 		go func() { _ = w.controller.RefreshPorts(context.Background()) }()
 	})
@@ -427,6 +447,7 @@ func (w *MainWindow) sendCommand() {
 	if line == "" {
 		return
 	}
+	w.commandHistory.add(line)
 	w.commandEntry.SetText("")
 	go func() { _ = w.controller.SendConsoleLine(context.Background(), line) }()
 }
