@@ -675,6 +675,22 @@ func TestAutoConnectStartsStatusPolling(t *testing.T) {
 	if snapshot.MachineState != "Idle" {
 		t.Fatalf("machine state after automatic connection = %q, want Idle", snapshot.MachineState)
 	}
+	mockEvents := m.events(t)
+	settingsIndex, statusIndex := -1, -1
+	for i, event := range mockEvents {
+		if event.Kind != "command" {
+			continue
+		}
+		if event.Text == "$$" && settingsIndex < 0 {
+			settingsIndex = i
+		}
+		if event.Text == "?" && statusIndex < 0 {
+			statusIndex = i
+		}
+	}
+	if settingsIndex < 0 || statusIndex < 0 || settingsIndex >= statusIndex {
+		t.Fatalf("mock command order does not contain $$ before status polling: events=%+v", mockEvents)
+	}
 
 	var connectionEvents []app.ConnectionStatus
 	deadline := time.After(2 * time.Second)

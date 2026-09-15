@@ -108,8 +108,13 @@ type Controller struct {
 	activeConnectAttempt                    connectAttemptID
 	connectAttemptErr                       error
 	connectAttemptGeneration                transport.ConnectionGeneration
+	connectAttemptEvents                    chan transport.Event
 	pendingDisconnectedGenerations          map[transport.ConnectionGeneration]error
 	connectionGeneration                    transport.ConnectionGeneration
+	connectionBannerTimeout                 time.Duration
+	connectionStartupQuietPeriod            time.Duration
+	connectionStartupSettleTimeout          time.Duration
+	connectionSettingsTimeout               time.Duration
 	realtimeWriteActive                     bool
 	realtimeWriteDone                       chan struct{}
 	statusPollCancel                        context.CancelFunc
@@ -136,13 +141,17 @@ func NewController(t transport.Transport, listPorts ports.ListFunc) *Controller 
 			ConnectionStatus: ConnectionDisconnected,
 			ProgramStatus:    ProgramNotLoaded,
 		},
-		statusPollInterval:  defaultStatusPollInterval,
-		portMonitorInterval: defaultPortMonitorInterval,
-		now:                 time.Now,
-		macroEngine:         macro.NewDefaultEngine(),
-		variables:           macro.NewVariableStore(),
-		contour:             macro.NewContourState(),
-		statusReportChanged: make(chan struct{}),
+		statusPollInterval:             defaultStatusPollInterval,
+		portMonitorInterval:            defaultPortMonitorInterval,
+		connectionBannerTimeout:        defaultConnectionBannerTimeout,
+		connectionStartupQuietPeriod:   defaultConnectionStartupQuietPeriod,
+		connectionStartupSettleTimeout: defaultConnectionStartupSettleTimeout,
+		connectionSettingsTimeout:      defaultConnectionSettingsTimeout,
+		now:                            time.Now,
+		macroEngine:                    macro.NewDefaultEngine(),
+		variables:                      macro.NewVariableStore(),
+		contour:                        macro.NewContourState(),
+		statusReportChanged:            make(chan struct{}),
 	}
 	go c.runTransportEventBridge()
 	return c
@@ -234,26 +243,14 @@ func (c *Controller) connect(ctx context.Context, cfg transport.PortConfig, orig
 		Text:          fmt.Sprintf("connecting to %s", cfg.Name),
 	}
 	generation, openErr := c.transport.Open(ctx, cfg)
+	openSucceeded := openErr == nil
 
 	c.mu.Lock()
 	if c.connectionTransition != connectionConnecting || c.activeConnectAttempt != attempt {
-		var disconnected versionedState
-		emitDisconnected := c.state.ConnectionStatus == ConnectionConnecting
-		if emitDisconnected {
-			c.state.ConnectionStatus = ConnectionDisconnected
-			disconnected = c.captureEventStateLocked()
-		}
-		c.finishConnectAttemptLocked(attempt)
 		c.mu.Unlock()
-		if emitDisconnected {
-			c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: disconnected.state, StateRevision: disconnected.revision, Text: "disconnected"}
-		}
-		if report {
-			c.emitError(ErrConnectionInvariant)
-		}
-		return ErrConnectionInvariant
+		return c.failConnectAttempt(attempt, generation, ErrConnectionInvariant, openSucceeded || generation != 0, report)
 	}
-	if openErr == nil && generation == 0 {
+	if openSucceeded && generation == 0 {
 		openErr = ErrConnectionInvariant
 	}
 	if openErr == nil {
@@ -263,21 +260,29 @@ func (c *Controller) connect(ctx context.Context, cfg transport.PortConfig, orig
 			delete(c.pendingDisconnectedGenerations, generation)
 		}
 	}
-	if openErr != nil || c.connectAttemptErr != nil {
+	attemptErr := c.connectAttemptErr
+	c.mu.Unlock()
+	if openErr != nil || attemptErr != nil {
 		err := openErr
-		if c.connectAttemptErr != nil {
-			err = c.connectAttemptErr
+		if attemptErr != nil {
+			err = attemptErr
 		}
-		c.state.ConnectionStatus = ConnectionDisconnected
-		disconnected := c.captureEventStateLocked()
-		c.finishConnectAttemptLocked(attempt)
+		return c.failConnectAttempt(attempt, generation, serialOpenError(cfg.Name, err), openSucceeded || generation != 0, report)
+	}
+
+	if err := c.validateGRBLConnection(ctx, attempt, generation); err != nil {
+		return c.failConnectAttempt(attempt, generation, err, true, report)
+	}
+
+	c.mu.Lock()
+	if c.connectionTransition != connectionConnecting || c.activeConnectAttempt != attempt || c.connectAttemptGeneration != generation {
 		c.mu.Unlock()
-		c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: disconnected.state, StateRevision: disconnected.revision, Text: "disconnected"}
-		err = serialOpenError(cfg.Name, err)
-		if report {
-			c.emitError(err)
-		}
-		return err
+		return c.failConnectAttempt(attempt, generation, ErrConnectionInvariant, true, report)
+	}
+	if c.connectAttemptErr != nil {
+		err := c.connectAttemptErr
+		c.mu.Unlock()
+		return c.failConnectAttempt(attempt, generation, err, true, report)
 	}
 	c.state.ConnectionStatus = ConnectionConnected
 	c.connectionGeneration = generation
@@ -286,10 +291,14 @@ func (c *Controller) connect(ctx context.Context, cfg transport.PortConfig, orig
 	c.applySuccessfulConnectionPolicyLocked(origin, cfg)
 	c.finishConnectAttemptLocked(attempt)
 	snapshot := c.captureEventStateLocked()
-	c.startStatusPollingLocked()
 	c.mu.Unlock()
 
 	c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: snapshot.state, StateRevision: snapshot.revision, Text: fmt.Sprintf("connected to %s", cfg.Name)}
+	c.mu.Lock()
+	if c.state.ConnectionStatus == ConnectionConnected && c.connectionGeneration == generation {
+		c.startStatusPollingLocked()
+	}
+	c.mu.Unlock()
 	return nil
 }
 
@@ -301,6 +310,7 @@ func (c *Controller) beginConnectAttemptLocked() connectAttemptID {
 	c.activeConnectAttempt = c.nextConnectAttempt
 	c.connectAttemptErr = nil
 	c.connectAttemptGeneration = 0
+	c.connectAttemptEvents = make(chan transport.Event, connectAttemptEventCapacity)
 	c.pendingDisconnectedGenerations = make(map[transport.ConnectionGeneration]error)
 	c.connectionTransition = connectionConnecting
 	return c.activeConnectAttempt
@@ -313,6 +323,7 @@ func (c *Controller) finishConnectAttemptLocked(id connectAttemptID) bool {
 	c.activeConnectAttempt = 0
 	c.connectAttemptErr = nil
 	c.connectAttemptGeneration = 0
+	c.connectAttemptEvents = nil
 	c.pendingDisconnectedGenerations = nil
 	c.connectionTransition = connectionStable
 	return true
@@ -1393,6 +1404,10 @@ func (c *Controller) runTransportEventBridge() {
 			c.events <- Event{Kind: EventConsoleTX, When: ev.When, Text: ev.Text, State: snapshot.state, StateRevision: snapshot.revision, Raw: ev}
 		case transport.EventRX:
 			c.mu.Lock()
+			if c.captureConnectAttemptEventLocked(ev) {
+				c.mu.Unlock()
+				continue
+			}
 			if !c.acceptsTransportEventLocked(ev) {
 				c.mu.Unlock()
 				continue
@@ -1444,9 +1459,13 @@ func (c *Controller) runTransportEventBridge() {
 				c.events <- Event{Kind: EventConsoleRX, When: ev.When, Text: ev.Text, State: snapshot.state, StateRevision: snapshot.revision, Raw: ev}
 			}
 		case transport.EventError:
-			c.mu.RLock()
+			c.mu.Lock()
+			if c.captureConnectAttemptEventLocked(ev) {
+				c.mu.Unlock()
+				continue
+			}
 			accepted := c.acceptsTransportEventLocked(ev)
-			c.mu.RUnlock()
+			c.mu.Unlock()
 			if !accepted {
 				continue
 			}
@@ -1470,8 +1489,9 @@ func (c *Controller) acceptDisconnectedEvent(generation transport.ConnectionGene
 		return false
 	}
 	if c.connectionTransition == connectionConnecting && c.activeConnectAttempt != 0 {
+		c.captureConnectAttemptEventLocked(transport.Event{Kind: transport.EventDisconnected, Generation: generation, When: time.Now()})
 		if c.connectAttemptGeneration == generation && generation != 0 {
-			c.connectAttemptErr = ErrTransportDisconnected
+			c.setConnectAttemptErrorLocked(ErrTransportDisconnected)
 		} else if c.connectAttemptGeneration == 0 && generation != 0 {
 			// Only events racing the single active Open are relevant. Keep this
 			// deliberately bounded against a malformed/noisy transport.

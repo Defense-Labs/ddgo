@@ -52,6 +52,14 @@ func main() {
 		log.Fatal(err)
 	}
 	defer ptm.Close()
+	// Keep one slave descriptor open before writing the startup banner. Linux
+	// PTYs otherwise make startup delivery depend on whether a client already
+	// has the slave side open.
+	heldSlave, err := os.OpenFile(slave, os.O_RDWR, 0)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer heldSlave.Close()
 	_ = os.Remove(*symlink)
 	if err := os.Symlink(slave, *symlink); err != nil {
 		log.Printf("symlink: %v", err)

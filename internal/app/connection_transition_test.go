@@ -14,24 +14,26 @@ import (
 )
 
 type blockingOpenTransport struct {
-	events       chan transport.Event
-	openStarted  chan struct{}
-	releaseOpen  chan struct{}
-	startOnce    sync.Once
-	mu           sync.Mutex
-	openCalls    int
-	closeCalls   int
-	writes       []transport.Message
-	openErr      error
-	writeStarted chan struct{}
-	releaseWrite chan struct{}
-	blockWrites  bool
-	writeOnce    sync.Once
-	writeErr     error
+	events        chan transport.Event
+	openStarted   chan struct{}
+	releaseOpen   chan struct{}
+	startOnce     sync.Once
+	mu            sync.Mutex
+	openCalls     int
+	closeCalls    int
+	writes        []transport.Message
+	openErr       error
+	writeStarted  chan struct{}
+	releaseWrite  chan struct{}
+	blockWrites   bool
+	writeOnce     sync.Once
+	writeErr      error
+	closeErr      error
+	autoHandshake bool
 }
 
 func newBlockingOpenTransport() *blockingOpenTransport {
-	return &blockingOpenTransport{events: make(chan transport.Event, 16), openStarted: make(chan struct{}), releaseOpen: make(chan struct{})}
+	return &blockingOpenTransport{events: make(chan transport.Event, 16), openStarted: make(chan struct{}), releaseOpen: make(chan struct{}), autoHandshake: true}
 }
 func (t *blockingOpenTransport) Events() <-chan transport.Event { return t.events }
 func (t *blockingOpenTransport) Open(ctx context.Context, _ transport.PortConfig) (transport.ConnectionGeneration, error) {
@@ -48,7 +50,11 @@ func (t *blockingOpenTransport) Open(ctx context.Context, _ transport.PortConfig
 		if err != nil {
 			return 0, err
 		}
-		return transport.ConnectionGeneration(t.openCalls), nil
+		generation := transport.ConnectionGeneration(t.openCalls)
+		if t.autoHandshake {
+			t.events <- transport.Event{Kind: transport.EventRX, Generation: generation, When: time.Now(), Text: "Grbl 1.1g [help:'$']"}
+		}
+		return generation, nil
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	}
@@ -57,14 +63,24 @@ func (t *blockingOpenTransport) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.closeCalls++
-	return nil
+	return t.closeErr
 }
 func (t *blockingOpenTransport) Write(_ context.Context, msg transport.Message) error {
 	t.mu.Lock()
-	t.writes = append(t.writes, msg)
+	handshake := t.autoHandshake && msg.Display == "$$"
+	if !handshake {
+		t.writes = append(t.writes, msg)
+	}
 	block := t.blockWrites
 	err := t.writeErr
+	generation := transport.ConnectionGeneration(t.openCalls)
 	t.mu.Unlock()
+	if handshake && err == nil {
+		for _, line := range []string{"$0=10", "$1=25", "ok"} {
+			t.events <- transport.Event{Kind: transport.EventRX, Generation: generation, When: time.Now(), Text: line}
+		}
+		return nil
+	}
 	if block {
 		t.writeOnce.Do(func() { close(t.writeStarted) })
 		<-t.releaseWrite

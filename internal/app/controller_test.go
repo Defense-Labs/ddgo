@@ -345,6 +345,9 @@ func TestControllerConnectSendJogActionAndReceive(t *testing.T) {
 	if err := controller.Connect(context.Background(), cfg); err != nil {
 		t.Fatalf("Connect() error = %v", err)
 	}
+	if got := fake.HandshakeWrites(); got != 1 {
+		t.Fatalf("handshake settings writes = %d, want 1", got)
+	}
 
 	connecting := waitForEvent(t, controller.Events(), EventStateChanged)
 	requireStateRevision(t, connecting)
@@ -3197,6 +3200,7 @@ func newBlockingProgramTransport() *blockingProgramTransport {
 
 func (t *blockingProgramTransport) Events() <-chan transport.Event { return t.events }
 func (t *blockingProgramTransport) Open(context.Context, transport.PortConfig) (transport.ConnectionGeneration, error) {
+	t.events <- transport.Event{Kind: transport.EventRX, Generation: 1, When: time.Now(), Text: "Grbl 1.1g [help:'$']"}
 	return 1, nil
 }
 func (t *blockingProgramTransport) Close() error {
@@ -3204,6 +3208,12 @@ func (t *blockingProgramTransport) Close() error {
 	return nil
 }
 func (t *blockingProgramTransport) Write(ctx context.Context, msg transport.Message) error {
+	if msg.Display == "$$" {
+		for _, line := range []string{"$0=10", "$1=25", "ok"} {
+			t.events <- transport.Event{Kind: transport.EventRX, Generation: 1, When: time.Now(), Text: line}
+		}
+		return nil
+	}
 	t.writes <- msg.Display
 	if string(msg.Payload) == "?" {
 		return nil
