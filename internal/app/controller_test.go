@@ -57,12 +57,12 @@ func TestControllerHandlesTransportDisconnectedWhileIdle(t *testing.T) {
 	}
 	fake.InjectRX("<Idle|M:1.000,2.000,3.000|B:15,128|L:0|0000>")
 	waitForState(t, controller, func(s State) bool {
-		return s.Connected && s.MachineState == "Idle" && s.HasMachinePosition
+		return s.IsConnected() && s.MachineState == "Idle" && s.HasMachinePosition
 	})
 
 	fake.InjectDisconnected()
 	state := waitForState(t, controller, func(s State) bool {
-		return !s.Connected && s.MachineState == "" && !s.HasMachinePosition &&
+		return !s.IsConnected() && s.MachineState == "" && !s.HasMachinePosition &&
 			!s.HasWorkPosition && !s.HasWorkCoordinateOffset && !s.HasFeedSpindle &&
 			s.LastStatusRaw == ""
 	})
@@ -81,7 +81,7 @@ func TestControllerExplicitDisconnectDoesNotEmitTransportDisconnected(t *testing
 	}
 	fake.InjectRX("<Idle|M:1.000,2.000,3.000|B:15,128|L:0|0000>")
 	waitForState(t, controller, func(s State) bool {
-		return s.Connected && s.MachineState == "Idle" && s.HasMachinePosition
+		return s.IsConnected() && s.MachineState == "Idle" && s.HasMachinePosition
 	})
 	drainEvents(controller.Events())
 
@@ -94,7 +94,7 @@ func TestControllerExplicitDisconnectDoesNotEmitTransportDisconnected(t *testing
 	assertEventTextCount(t, events, "transport disconnected", 0)
 
 	state := controller.Snapshot()
-	if state.Connected || state.MachineState != "" || state.HasMachinePosition || state.LastStatusRaw != "" || state.LastError != "" {
+	if state.IsConnected() || state.MachineState != "" || state.HasMachinePosition || state.LastStatusRaw != "" || state.LastError != "" {
 		t.Fatalf("state after explicit disconnect = %+v", state)
 	}
 }
@@ -115,7 +115,7 @@ func TestControllerUnexpectedDisconnectStillEmitsTransportDisconnected(t *testin
 	events = append(events, collectEventsFor(controller.Events(), noExtraLifecycleEventWindow)...)
 	assertEventTextCount(t, events, "transport disconnected", 1)
 	assertEventTextCount(t, events, "disconnected", 0)
-	if state := controller.Snapshot(); state.Connected || state.LastError != "" {
+	if state := controller.Snapshot(); state.IsConnected() || state.LastError != "" {
 		t.Fatalf("state after unexpected disconnect = %+v", state)
 	}
 }
@@ -137,7 +137,7 @@ func TestControllerExplicitDisconnectIsIdempotentAfterSuppressingTransportEvent(
 	}
 	events := collectEventsFor(controller.Events(), noExtraLifecycleEventWindow)
 	assertEventTextCount(t, events, "transport disconnected", 0)
-	if state := controller.Snapshot(); state.Connected || state.LastError != "" {
+	if state := controller.Snapshot(); state.IsConnected() || state.LastError != "" {
 		t.Fatalf("state after repeated explicit disconnect = %+v", state)
 	}
 }
@@ -151,7 +151,7 @@ func TestControllerCloseErrorDoesNotLeaveDisconnectSuppressionStale(t *testing.T
 	}
 	fake.InjectRX("<Idle|M:1.000,2.000,3.000|B:15,128|L:0|0000>")
 	waitForState(t, controller, func(s State) bool {
-		return s.Connected && s.MachineState == "Idle" && s.HasMachinePosition
+		return s.IsConnected() && s.MachineState == "Idle" && s.HasMachinePosition
 	})
 	drainEvents(controller.Events())
 
@@ -164,7 +164,7 @@ func TestControllerCloseErrorDoesNotLeaveDisconnectSuppressionStale(t *testing.T
 	requireControllerErrorEventContaining(t, controller.Events(), "close failed")
 
 	state := controller.Snapshot()
-	if !state.Connected || state.MachineState != "Idle" || !state.HasMachinePosition {
+	if !state.IsConnected() || state.MachineState != "Idle" || !state.HasMachinePosition {
 		t.Fatalf("state after failed disconnect = %+v, want still connected with prior status", state)
 	}
 	drainEvents(controller.Events())
@@ -176,7 +176,7 @@ func TestControllerCloseErrorDoesNotLeaveDisconnectSuppressionStale(t *testing.T
 	assertEventTextCount(t, events, "disconnected", 0)
 
 	final := controller.Snapshot()
-	if final.Connected || final.MachineState != "" || final.HasMachinePosition ||
+	if final.IsConnected() || final.MachineState != "" || final.HasMachinePosition ||
 		final.LastStatusRaw != "" || final.LastError != "" {
 		t.Fatalf("state after injected disconnect = %+v", final)
 	}
@@ -201,7 +201,7 @@ func TestControllerHandlesTransportDisconnectedWhileProgramRunning(t *testing.T)
 
 	fake.InjectDisconnected()
 	state := waitForState(t, controller, func(s State) bool {
-		return !s.Connected && s.ProgramStatus == ProgramFailed &&
+		return !s.IsConnected() && s.ProgramStatus == ProgramFailed &&
 			strings.Contains(s.LastError, "transport disconnected")
 	})
 	if state.ProgramComplete != 0 {
@@ -223,18 +223,18 @@ func TestControllerReconnectsAfterTransportDisconnected(t *testing.T) {
 		t.Fatalf("first Connect() error = %v", err)
 	}
 	fake.InjectDisconnected()
-	waitForState(t, controller, func(s State) bool { return !s.Connected })
+	waitForState(t, controller, func(s State) bool { return !s.IsConnected() })
 
 	if err := controller.Connect(context.Background(), transport.DefaultPortConfig("fake2")); err != nil {
 		t.Fatalf("second Connect() error = %v", err)
 	}
 	state := controller.Snapshot()
-	if !state.Connected || state.PortName != "fake2" || state.LastError != "" {
+	if !state.IsConnected() || state.PortName != "fake2" || state.LastError != "" {
 		t.Fatalf("state after reconnect = %+v", state)
 	}
 	fake.InjectRX("<Idle|MPos:4.000,5.000,6.000>")
 	state = waitForState(t, controller, func(s State) bool {
-		return s.Connected && s.MachineState == "Idle" && s.HasMachinePosition
+		return s.IsConnected() && s.MachineState == "Idle" && s.HasMachinePosition
 	})
 	if got, want := state.MachinePosition, [3]float64{4, 5, 6}; got != want {
 		t.Fatalf("MachinePosition = %v, want %v", got, want)
@@ -346,6 +346,11 @@ func TestControllerConnectSendJogActionAndReceive(t *testing.T) {
 		t.Fatalf("Connect() error = %v", err)
 	}
 
+	connecting := waitForEvent(t, controller.Events(), EventStateChanged)
+	requireStateRevision(t, connecting)
+	if got, want := connecting.Text, "connecting to /dev/ttyACM0"; got != want {
+		t.Fatalf("state change text = %q, want %q", got, want)
+	}
 	stateChanged := waitForEvent(t, controller.Events(), EventStateChanged)
 	requireStateRevision(t, stateChanged)
 	if got, want := stateChanged.Text, "connected to /dev/ttyACM0"; got != want {
@@ -353,7 +358,7 @@ func TestControllerConnectSendJogActionAndReceive(t *testing.T) {
 	}
 
 	state := controller.Snapshot()
-	if !state.Connected {
+	if !state.IsConnected() {
 		t.Fatalf("connected state = false, want true")
 	}
 	if state.PortName != cfg.Name {
@@ -418,6 +423,7 @@ func TestControllerJogToWritesMachineJog(t *testing.T) {
 	if err := controller.Connect(context.Background(), transport.DefaultPortConfig("/dev/ttyACM0")); err != nil {
 		t.Fatalf("Connect() error = %v", err)
 	}
+	_ = waitForEvent(t, controller.Events(), EventStateChanged)
 	_ = waitForEvent(t, controller.Events(), EventStateChanged)
 
 	if err := controller.JogTo(context.Background(), "x", -300, 500); err != nil {
@@ -517,8 +523,8 @@ func TestControllerConnectValidationAndOpenError(t *testing.T) {
 	if !errors.Is(ev.Err, wantErr) {
 		t.Fatalf("event error = %v, want %v", ev.Err, wantErr)
 	}
-	if controller.Snapshot().Connected {
-		t.Fatal("state.Connected = true after failed connect, want false")
+	if controller.Snapshot().IsConnected() {
+		t.Fatal("state.IsConnected() = true after failed connect, want false")
 	}
 }
 
@@ -544,8 +550,8 @@ func TestControllerDisconnect(t *testing.T) {
 		t.Fatalf("state change text = %q, want %q", got, want)
 	}
 	state := controller.Snapshot()
-	if state.Connected {
-		t.Fatal("state.Connected = true, want false")
+	if state.IsConnected() {
+		t.Fatal("state.IsConnected() = true, want false")
 	}
 	if got := state.MachineState; got != "" {
 		t.Fatalf("state.MachineState = %q, want empty", got)
@@ -571,8 +577,8 @@ func TestControllerDisconnectError(t *testing.T) {
 	if !errors.Is(ev.Err, wantErr) {
 		t.Fatalf("event error = %v, want %v", ev.Err, wantErr)
 	}
-	if !controller.Snapshot().Connected {
-		t.Fatal("state.Connected = false after failed disconnect, want true")
+	if !controller.Snapshot().IsConnected() {
+		t.Fatal("state.IsConnected() = false after failed disconnect, want true")
 	}
 }
 
@@ -763,6 +769,7 @@ func TestControllerProgramLoadStartComplete(t *testing.T) {
 	if err := controller.Connect(context.Background(), transport.DefaultPortConfig("/dev/ttyACM0")); err != nil {
 		t.Fatalf("Connect() error = %v", err)
 	}
+	_ = waitForEvent(t, controller.Events(), EventStateChanged)
 	_ = waitForEvent(t, controller.Events(), EventStateChanged)
 
 	if err := controller.StartProgram(context.Background()); err != nil {

@@ -129,10 +129,13 @@ type Controller struct {
 
 func NewController(t transport.Transport, listPorts ports.ListFunc) *Controller {
 	c := &Controller{
-		transport:           t,
-		listPorts:           listPorts,
-		events:              make(chan Event, 1024),
-		state:               State{ProgramStatus: ProgramNotLoaded},
+		transport: t,
+		listPorts: listPorts,
+		events:    make(chan Event, 1024),
+		state: State{
+			ConnectionStatus: ConnectionDisconnected,
+			ProgramStatus:    ProgramNotLoaded,
+		},
 		statusPollInterval:  defaultStatusPollInterval,
 		portMonitorInterval: defaultPortMonitorInterval,
 		now:                 time.Now,
@@ -220,13 +223,31 @@ func (c *Controller) connect(ctx context.Context, cfg transport.PortConfig, orig
 		return err
 	}
 	attempt := c.beginConnectAttemptLocked()
+	c.state.ConnectionStatus = ConnectionConnecting
+	connecting := c.captureEventStateLocked()
 	c.mu.Unlock()
+	c.events <- Event{
+		Kind:          EventStateChanged,
+		When:          time.Now(),
+		State:         connecting.state,
+		StateRevision: connecting.revision,
+		Text:          fmt.Sprintf("connecting to %s", cfg.Name),
+	}
 	generation, openErr := c.transport.Open(ctx, cfg)
 
 	c.mu.Lock()
 	if c.connectionTransition != connectionConnecting || c.activeConnectAttempt != attempt {
+		var disconnected versionedState
+		emitDisconnected := c.state.ConnectionStatus == ConnectionConnecting
+		if emitDisconnected {
+			c.state.ConnectionStatus = ConnectionDisconnected
+			disconnected = c.captureEventStateLocked()
+		}
 		c.finishConnectAttemptLocked(attempt)
 		c.mu.Unlock()
+		if emitDisconnected {
+			c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: disconnected.state, StateRevision: disconnected.revision, Text: "disconnected"}
+		}
 		if report {
 			c.emitError(ErrConnectionInvariant)
 		}
@@ -247,15 +268,18 @@ func (c *Controller) connect(ctx context.Context, cfg transport.PortConfig, orig
 		if c.connectAttemptErr != nil {
 			err = c.connectAttemptErr
 		}
+		c.state.ConnectionStatus = ConnectionDisconnected
+		disconnected := c.captureEventStateLocked()
 		c.finishConnectAttemptLocked(attempt)
 		c.mu.Unlock()
+		c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: disconnected.state, StateRevision: disconnected.revision, Text: "disconnected"}
 		err = serialOpenError(cfg.Name, err)
 		if report {
 			c.emitError(err)
 		}
 		return err
 	}
-	c.state.Connected = true
+	c.state.ConnectionStatus = ConnectionConnected
 	c.connectionGeneration = generation
 	c.state.PortName = cfg.Name
 	c.state.LastError = ""
@@ -484,7 +508,7 @@ func (c *Controller) StopMotion(ctx context.Context) error {
 }
 
 func (c *Controller) startStatusPollingLocked() {
-	if c.statusPollCancel != nil || !c.state.Connected {
+	if c.statusPollCancel != nil || !c.state.IsConnected() {
 		return
 	}
 	pollCtx, cancel := context.WithCancel(context.Background())
@@ -530,7 +554,7 @@ func (c *Controller) pollStatusLoop(ctx context.Context, done chan struct{}, int
 
 func (c *Controller) writeStatusPoll(ctx context.Context) error {
 	c.mu.Lock()
-	if !c.state.Connected {
+	if !c.state.IsConnected() {
 		c.mu.Unlock()
 		return nil
 	}
@@ -746,7 +770,7 @@ func (c *Controller) StartProgram(ctx context.Context) error {
 		c.emitError(err)
 		return err
 	}
-	if !c.state.Connected {
+	if !c.state.IsConnected() {
 		c.mu.Unlock()
 		err := errors.New("connect to a machine before starting a program")
 		c.emitError(err)
@@ -1217,14 +1241,14 @@ func (c *Controller) handleTransportDisconnected(generation transport.Connection
 }
 
 func (c *Controller) clearConnectionStateLocked() bool {
-	changed := c.state.Connected ||
+	changed := c.state.ConnectionStatus != ConnectionDisconnected ||
 		c.state.MachineState != "" ||
 		c.state.HasMachinePosition ||
 		c.state.HasWorkPosition ||
 		c.state.HasWorkCoordinateOffset ||
 		c.state.HasFeedSpindle ||
 		c.state.LastStatusRaw != ""
-	c.state.Connected = false
+	c.state.ConnectionStatus = ConnectionDisconnected
 	c.connectionGeneration = 0
 	c.state.MachineState = ""
 	c.state.HasMachinePosition = false

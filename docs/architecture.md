@@ -20,6 +20,8 @@ The controller coordinates these concerns but keeps lower-level details in focus
 
 The controller owns status-poll cancellation and waits for the polling goroutine to stop during either explicit or unexpected disconnect cleanup. The serial transport owns its read loop and line buffer; partial serial lines are scoped to one connection and are discarded before a replacement read loop starts.
 
+Connection establishment has an explicit public lifecycle: `disconnected -> connecting -> connected`. The `connecting` phase currently covers the transport-open attempt. A successful transport open is sufficient to enter `connected`; protocol startup and firmware validation are not yet part of connection establishment.
+
 ## Program execution
 
 Current program execution flow:

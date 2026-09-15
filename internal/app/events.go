@@ -13,12 +13,20 @@ type StateRevision uint64
 
 type ProgramStatus string
 
+type ConnectionStatus string
+
 const (
 	EventStateChanged   EventKind = "state_changed"
 	EventPortsRefreshed EventKind = "ports_refreshed"
 	EventConsoleRX      EventKind = "console_rx"
 	EventConsoleTX      EventKind = "console_tx"
 	EventError          EventKind = "error"
+)
+
+const (
+	ConnectionDisconnected ConnectionStatus = "disconnected"
+	ConnectionConnecting   ConnectionStatus = "connecting"
+	ConnectionConnected    ConnectionStatus = "connected"
 )
 
 const (
@@ -41,7 +49,7 @@ func (s ProgramStatus) IsActive() bool {
 }
 
 type State struct {
-	Connected               bool
+	ConnectionStatus        ConnectionStatus
 	PortName                string
 	MachineState            string
 	MachinePosition         [3]float64
@@ -60,6 +68,14 @@ type State struct {
 	ProgramStatus           ProgramStatus
 	ProgramTotal            int
 	ProgramComplete         int
+}
+
+func (s State) IsConnected() bool {
+	return s.ConnectionStatus == ConnectionConnected
+}
+
+func (s State) IsConnecting() bool {
+	return s.ConnectionStatus == ConnectionConnecting
 }
 
 type Event struct {

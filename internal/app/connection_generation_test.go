@@ -66,7 +66,7 @@ func TestGenerationStaleEventsCannotAffectReconnectedOwnerOrState(t *testing.T) 
 
 	fake.InjectDisconnectedForGeneration(generationA)
 	fake.InjectRXForGeneration(generationB, "<Run|MPos:4,5,6>")
-	waitForState(t, c, func(s State) bool { return s.Connected && s.MachineState == "Run" })
+	waitForState(t, c, func(s State) bool { return s.IsConnected() && s.MachineState == "Run" })
 	c.mu.RLock()
 	gotGeneration := c.connectionGeneration
 	c.mu.RUnlock()
@@ -75,14 +75,14 @@ func TestGenerationStaleEventsCannotAffectReconnectedOwnerOrState(t *testing.T) 
 	}
 
 	fake.InjectDisconnectedForGeneration(generationB)
-	waitForState(t, c, func(s State) bool { return !s.Connected })
+	waitForState(t, c, func(s State) bool { return !s.IsConnected() })
 }
 
 func TestGenerationExplicitDisconnectSuppressionIsIdentitySpecific(t *testing.T) {
 	c := NewController(transport.NewFakeTransport(), nil)
 	c.mu.Lock()
 	c.connectionGeneration = 2
-	c.state.Connected = true
+	c.state.ConnectionStatus = ConnectionConnected
 	c.suppressTransportDisconnectedGeneration = 1
 	c.mu.Unlock()
 

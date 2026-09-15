@@ -98,7 +98,7 @@ func TestPortMonitorImmediateScanAndLaterAppearance(t *testing.T) {
 	list = []ports.Info{knownMachine("/dev/machine", "GrblDD-1")}
 	mu.Unlock()
 	deadline := time.After(time.Second)
-	for !c.Snapshot().Connected {
+	for !c.Snapshot().IsConnected() {
 		select {
 		case <-deadline:
 			t.Fatal("machine appearance did not connect")
@@ -151,7 +151,7 @@ func TestAutoConnectRetriesAfterBackoff(t *testing.T) {
 	if err := c.RefreshPorts(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !c.Snapshot().Connected || len(tr.openNames()) != 2 {
+	if !c.Snapshot().IsConnected() || len(tr.openNames()) != 2 {
 		t.Fatalf("retry did not connect; opens=%v state=%+v", tr.openNames(), c.Snapshot())
 	}
 }
@@ -255,7 +255,7 @@ func TestManualDisconnectSuppressedUntilRemoval(t *testing.T) {
 	if err := c.RefreshPorts(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(tr.openNames()) != 2 || !c.Snapshot().Connected {
+	if len(tr.openNames()) != 2 || !c.Snapshot().IsConnected() {
 		t.Fatalf("replug opens=%v state=%+v", tr.openNames(), c.Snapshot())
 	}
 }
@@ -287,11 +287,11 @@ func TestManualConnectClearsDisconnectSuppression(t *testing.T) {
 		t.Fatalf("suppression after successful manual Connect = %q", suppressed)
 	}
 	tr.InjectDisconnected()
-	waitForState(t, c, func(s State) bool { return !s.Connected })
+	waitForState(t, c, func(s State) bool { return !s.IsConnected() })
 	if err := c.RefreshPorts(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := len(tr.openNames()); got != 3 || !c.Snapshot().Connected {
+	if got := len(tr.openNames()); got != 3 || !c.Snapshot().IsConnected() {
 		t.Fatalf("reconnect opens=%d state=%+v", got, c.Snapshot())
 	}
 }
@@ -341,11 +341,11 @@ func TestManualConnectClearsAutomaticBackoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	tr.InjectDisconnected()
-	waitForState(t, c, func(s State) bool { return !s.Connected })
+	waitForState(t, c, func(s State) bool { return !s.IsConnected() })
 	if err := c.RefreshPorts(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := len(tr.openNames()); got != 3 || !c.Snapshot().Connected {
+	if got := len(tr.openNames()); got != 3 || !c.Snapshot().IsConnected() {
 		t.Fatalf("immediate reconnect opens=%d state=%+v", got, c.Snapshot())
 	}
 }
@@ -370,7 +370,7 @@ func TestManualConnectClearsAutomaticErrorDeduplication(t *testing.T) {
 		t.Fatal(err)
 	}
 	tr.InjectDisconnected()
-	waitForState(t, c, func(s State) bool { return !s.Connected })
+	waitForState(t, c, func(s State) bool { return !s.IsConnected() })
 	tr.SetOpenError(wantErr)
 	if err := c.RefreshPorts(context.Background()); err != nil {
 		t.Fatal(err)
@@ -446,7 +446,7 @@ func TestAutomaticPermissionErrorIsActionableDeduplicatedAndRetried(t *testing.T
 	if err := c.RefreshPorts(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if c.Snapshot().Connected {
+	if c.Snapshot().IsConnected() {
 		t.Fatal("permission-denied open connected")
 	}
 	if got := countEventsContaining(c.Events(), "does not have permission"); got != 1 {
@@ -467,7 +467,7 @@ func TestAutomaticPermissionErrorIsActionableDeduplicatedAndRetried(t *testing.T
 	if err := c.RefreshPorts(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !c.Snapshot().Connected {
+	if !c.Snapshot().IsConnected() {
 		t.Fatal("did not connect after permissions became available")
 	}
 }
@@ -508,7 +508,7 @@ func TestUnexpectedDisconnectDoesNotSuppressAutoConnect(t *testing.T) {
 		t.Fatal(err)
 	}
 	tr.InjectDisconnected()
-	waitForState(t, c, func(s State) bool { return !s.Connected })
+	waitForState(t, c, func(s State) bool { return !s.IsConnected() })
 	if err := c.RefreshPorts(context.Background()); err != nil {
 		t.Fatal(err)
 	}

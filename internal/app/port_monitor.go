@@ -159,7 +159,9 @@ func (c *Controller) considerAutoConnect(ctx context.Context, list []ports.Info)
 	id := identityForPort(p)
 	c.mu.RLock()
 	now := c.portMonitorNow()
-	blocked := c.state.Connected || c.portMonitor.suppressedIdentity == id ||
+	blocked := c.state.ConnectionStatus == ConnectionConnecting ||
+		c.state.ConnectionStatus == ConnectionConnected ||
+		c.portMonitor.suppressedIdentity == id ||
 		(c.portMonitor.retryIdentity == id && now.Before(c.portMonitor.retryAfter))
 	c.mu.RUnlock()
 	if blocked {

@@ -72,11 +72,52 @@ func (t *blockingOpenTransport) Write(_ context.Context, msg transport.Message) 
 	return err
 }
 
+func TestNewControllerStartsDisconnected(t *testing.T) {
+	c := NewController(newBlockingOpenTransport(), nil)
+	if got := c.Snapshot().ConnectionStatus; got != ConnectionDisconnected {
+		t.Fatalf("initial ConnectionStatus = %q, want %q", got, ConnectionDisconnected)
+	}
+}
+
+func TestConnectPublishesConnectingBeforeConnected(t *testing.T) {
+	tr := newBlockingOpenTransport()
+	c := NewController(tr, nil)
+	c.statusPollInterval = time.Hour
+	done := beginBlockedConnect(t, tr, c, context.Background())
+
+	if got := c.Snapshot().ConnectionStatus; got != ConnectionConnecting {
+		t.Fatalf("ConnectionStatus while Open is blocked = %q, want %q", got, ConnectionConnecting)
+	}
+	connecting := waitForEventText(t, c.Events(), EventStateChanged, "connecting to blocked")
+	if got := connecting.State.ConnectionStatus; got != ConnectionConnecting {
+		t.Fatalf("connecting event status = %q, want %q", got, ConnectionConnecting)
+	}
+
+	close(tr.releaseOpen)
+	if err := <-done; err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	connected := waitForEventText(t, c.Events(), EventStateChanged, "connected to blocked")
+	if got := connected.State.ConnectionStatus; got != ConnectionConnected {
+		t.Fatalf("connected event status = %q, want %q", got, ConnectionConnected)
+	}
+	if connecting.StateRevision >= connected.StateRevision {
+		t.Fatalf("state revisions out of order: connecting=%d connected=%d", connecting.StateRevision, connected.StateRevision)
+	}
+	if got := c.Snapshot().ConnectionStatus; got != ConnectionConnected {
+		t.Fatalf("final ConnectionStatus = %q, want %q", got, ConnectionConnected)
+	}
+}
+
 func TestConnectAttemptInvalidatedByDisconnectBeforeCommit(t *testing.T) {
 	tr := newBlockingOpenTransport()
 	c := NewController(tr, nil)
 	c.statusPollInterval = time.Hour
 	done := beginBlockedConnect(t, tr, c, context.Background())
+	connecting := waitForEventText(t, c.Events(), EventStateChanged, "connecting to blocked")
+	if connecting.State.ConnectionStatus != ConnectionConnecting {
+		t.Fatalf("connecting event state = %+v", connecting.State)
+	}
 
 	tr.events <- transport.Event{Kind: transport.EventDisconnected, Generation: 1, When: time.Now()}
 	// Open has not returned its physical generation yet. The bridge records the
@@ -94,8 +135,12 @@ func TestConnectAttemptInvalidatedByDisconnectBeforeCommit(t *testing.T) {
 	if err := <-done; !errors.Is(err, ErrTransportDisconnected) {
 		t.Fatalf("Connect() error = %v, want ErrTransportDisconnected", err)
 	}
-	if state := c.Snapshot(); state.Connected {
-		t.Fatal("Connect committed an invalidated attempt")
+	if state := c.Snapshot(); state.ConnectionStatus != ConnectionDisconnected {
+		t.Fatalf("ConnectionStatus after invalidation = %q, want %q", state.ConnectionStatus, ConnectionDisconnected)
+	}
+	disconnected := waitForEventText(t, c.Events(), EventStateChanged, "disconnected")
+	if disconnected.State.ConnectionStatus != ConnectionDisconnected {
+		t.Fatalf("disconnected event state = %+v", disconnected.State)
 	}
 	c.mu.RLock()
 	transition, attempt, poll := c.connectionTransition, c.activeConnectAttempt, c.statusPollCancel
@@ -235,6 +280,10 @@ func TestConnectAdmissionBlocksCommandsAndConcurrentConnect(t *testing.T) {
 	}
 	drainEvents(c.Events())
 	done := beginBlockedConnect(t, tr, c, context.Background())
+	connecting := waitForEventText(t, c.Events(), EventStateChanged, "connecting to blocked")
+	if connecting.State.ConnectionStatus != ConnectionConnecting || c.Snapshot().ConnectionStatus != ConnectionConnecting {
+		t.Fatalf("state while Open is blocked: event=%q snapshot=%q", connecting.State.ConnectionStatus, c.Snapshot().ConnectionStatus)
+	}
 
 	checks := []struct {
 		name string
@@ -332,7 +381,7 @@ func TestAutomaticConnectRacingManualConnectPreservesPolicyUntilWinnerCommits(t 
 	if err := <-scanDone; err != nil {
 		t.Fatal(err)
 	}
-	if !c.Snapshot().Connected {
+	if !c.Snapshot().IsConnected() {
 		t.Fatal("automatic winner did not connect")
 	}
 	if opens, _, _ := tr.counts(); opens != 1 {
@@ -371,7 +420,7 @@ func TestAutomaticConnectRacingManualDisconnectDoesNotCommitSuppression(t *testi
 	if err := <-scanDone; err != nil {
 		t.Fatal(err)
 	}
-	if !c.Snapshot().Connected {
+	if !c.Snapshot().IsConnected() {
 		t.Fatal("automatic connection did not commit")
 	}
 	if opens, closes, _ := tr.counts(); opens != 1 || closes != 0 {
@@ -393,6 +442,10 @@ func TestConnectionTransitionFailedAndCanceledConnectReleaseAdmission(t *testing
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			done := beginBlockedConnect(t, tr, c, ctx)
+			connecting := waitForEventText(t, c.Events(), EventStateChanged, "connecting to blocked")
+			if connecting.State.ConnectionStatus != ConnectionConnecting || c.Snapshot().ConnectionStatus != ConnectionConnecting {
+				t.Fatalf("state while Open is blocked: event=%q snapshot=%q", connecting.State.ConnectionStatus, c.Snapshot().ConnectionStatus)
+			}
 			want := errors.New("open failed")
 			if tc.cancel {
 				want = context.Canceled
@@ -407,8 +460,12 @@ func TestConnectionTransitionFailedAndCanceledConnectReleaseAdmission(t *testing
 			if tc.cancel {
 				close(tr.releaseOpen)
 			}
-			if state := c.Snapshot(); state.Connected {
-				t.Fatalf("state.Connected = true after failed Connect")
+			if state := c.Snapshot(); state.ConnectionStatus != ConnectionDisconnected {
+				t.Fatalf("ConnectionStatus after failed Connect = %q, want %q", state.ConnectionStatus, ConnectionDisconnected)
+			}
+			disconnected := waitForEventText(t, c.Events(), EventStateChanged, "disconnected")
+			if disconnected.State.ConnectionStatus != ConnectionDisconnected {
+				t.Fatalf("disconnected event state = %+v", disconnected.State)
 			}
 			c.mu.RLock()
 			transition, owner := c.connectionTransition, c.responseOwner.kind

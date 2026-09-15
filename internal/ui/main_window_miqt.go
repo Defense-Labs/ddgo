@@ -421,7 +421,10 @@ func (w *MainWindow) bind() {
 
 func (w *MainWindow) toggleConnection() {
 	state := w.controller.Snapshot()
-	if state.Connected {
+	switch state.ConnectionStatus {
+	case app.ConnectionConnecting:
+		return
+	case app.ConnectionConnected:
 		go func() { _ = w.controller.Disconnect() }()
 		return
 	}
@@ -564,7 +567,7 @@ func (w *MainWindow) applyEvent(ev app.Event) {
 
 func (w *MainWindow) populatePorts(list []ports.Info) {
 	selected := strings.TrimSpace(w.portCombo.CurrentText())
-	if state := w.controller.Snapshot(); state.Connected {
+	if state := w.controller.Snapshot(); state.IsConnected() {
 		selected = state.PortName
 	}
 	w.portCombo.Clear()
@@ -586,10 +589,14 @@ func (w *MainWindow) populatePorts(list []ports.Info) {
 }
 
 func (w *MainWindow) applyState(state app.State) {
-	if state.Connected {
+	switch state.ConnectionStatus {
+	case app.ConnectionConnecting:
+		w.connStatus.SetText("Connection: connecting...")
+		w.connectButton.SetText("Connecting...")
+	case app.ConnectionConnected:
 		w.connStatus.SetText(fmt.Sprintf("Connection: connected (%s)", state.PortName))
 		w.connectButton.SetText("Disconnect")
-	} else {
+	default:
 		w.connStatus.SetText("Connection: disconnected")
 		w.connectButton.SetText("Connect")
 	}
@@ -627,13 +634,13 @@ func (w *MainWindow) applyState(state app.State) {
 	}
 
 	programActive := state.ProgramStatus.IsActive()
-	connected := state.Connected
+	connected := state.IsConnected()
 	loaded := state.ProgramTotal > 0
 	canManual := connected && !programActive
 	canRun := connected && loaded && !programActive
 
 	w.refreshButton.SetEnabled(!programActive)
-	w.connectButton.SetEnabled(!programActive)
+	w.connectButton.SetEnabled(!programActive && !state.IsConnecting())
 	w.portCombo.SetEnabled(!programActive)
 	w.programPath.SetEnabled(!programActive)
 	w.browseButton.SetEnabled(!programActive)

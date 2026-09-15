@@ -53,7 +53,7 @@ func TestViewDispatcherDispatchesStateBeforeEventToEveryView(t *testing.T) {
 	t.Parallel()
 
 	initial := app.State{PortName: "initial"}
-	next := app.State{Connected: true, PortName: "next"}
+	next := app.State{ConnectionStatus: app.ConnectionConnected, PortName: "next"}
 	dispatcher := viewDispatcher{state: initial}
 	first, second := &recordingView{}, &recordingView{}
 	dispatcher.register(first)
@@ -80,7 +80,7 @@ func TestViewDispatcherLateRegistrationUsesDispatchedState(t *testing.T) {
 	t.Parallel()
 
 	initial := app.State{PortName: "initial"}
-	next := app.State{Connected: true, PortName: "next"}
+	next := app.State{ConnectionStatus: app.ConnectionConnected, PortName: "next"}
 	dispatcher := viewDispatcher{state: initial}
 	first := &recordingView{}
 	dispatcher.register(first)
@@ -189,7 +189,7 @@ func TestViewRegistryDeliversState(t *testing.T) {
 	var registry viewRegistry
 	view := &recordingView{}
 	registry.add(view)
-	state := app.State{Connected: true, PortName: "test-port"}
+	state := app.State{ConnectionStatus: app.ConnectionConnected, PortName: "test-port"}
 	registry.applyState(state)
 	if len(view.states) != 1 || !reflect.DeepEqual(view.states[0], state) {
 		t.Fatalf("view states = %#v, want %#v", view.states, []app.State{state})

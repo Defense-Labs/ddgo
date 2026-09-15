@@ -478,7 +478,7 @@ func assertControllerStateRemains(t *testing.T, c *app.Controller, duration time
 func requireControllerIdle(t *testing.T, c *app.Controller) app.State {
 	t.Helper()
 	return waitForControllerState(t, c, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected &&
+		return snapshot.IsConnected() &&
 			snapshot.HasMachinePosition &&
 			snapshot.MachineState == "Idle"
 	})
@@ -664,16 +664,39 @@ func TestAutoConnectStartsStatusPolling(t *testing.T) {
 	t.Cleanup(func() {
 		stop()
 		controller.StopPortMonitoring()
-		if controller.Snapshot().Connected {
+		if controller.Snapshot().IsConnected() {
 			_ = controller.Disconnect()
 		}
 	})
 
 	snapshot := waitForControllerState(t, controller, 5*time.Second, func(state app.State) bool {
-		return state.Connected && state.PortName == m.SerialPath && state.LastStatusRaw != ""
+		return state.IsConnected() && state.PortName == m.SerialPath && state.LastStatusRaw != ""
 	})
 	if snapshot.MachineState != "Idle" {
 		t.Fatalf("machine state after automatic connection = %q, want Idle", snapshot.MachineState)
+	}
+
+	var connectionEvents []app.ConnectionStatus
+	deadline := time.After(2 * time.Second)
+	for len(connectionEvents) < 2 {
+		select {
+		case event := <-controller.Events():
+			if event.Kind != app.EventStateChanged {
+				continue
+			}
+			switch event.State.ConnectionStatus {
+			case app.ConnectionConnecting, app.ConnectionConnected:
+				connectionEvents = append(connectionEvents, event.State.ConnectionStatus)
+			}
+		case <-deadline:
+			t.Fatalf("connection state-event sequence = %v, want connecting then connected", connectionEvents)
+		}
+	}
+	if connectionEvents[0] != app.ConnectionConnecting || connectionEvents[1] != app.ConnectionConnected {
+		t.Fatalf("connection state-event sequence = %v, want connecting then connected", connectionEvents)
+	}
+	if controller.Snapshot().ConnectionStatus != app.ConnectionConnected {
+		t.Fatalf("final ConnectionStatus = %q, want %q", controller.Snapshot().ConnectionStatus, app.ConnectionConnected)
 	}
 }
 
@@ -813,7 +836,7 @@ func connectControllerToMock(t *testing.T, m *mockProcess) *app.Controller {
 		}
 	}()
 	t.Cleanup(func() {
-		if err := controller.Disconnect(); err != nil && controller.Snapshot().Connected {
+		if err := controller.Disconnect(); err != nil && controller.Snapshot().IsConnected() {
 			t.Logf("disconnect controller: %v", err)
 		}
 		stopEvents()
@@ -825,7 +848,7 @@ func connectControllerToMock(t *testing.T, m *mockProcess) *app.Controller {
 	if err := controller.Connect(ctx, transport.DefaultPortConfig(m.SerialPath)); err != nil {
 		t.Fatalf("connect controller to mock: %v", err)
 	}
-	waitFor(t, 5*time.Second, func() bool { return controller.Snapshot().Connected })
+	waitFor(t, 5*time.Second, func() bool { return controller.Snapshot().IsConnected() })
 	return controller
 }
 
@@ -858,7 +881,7 @@ func connectControllerToMockWithEvents(t *testing.T, m *mockProcess) *controller
 	}()
 
 	t.Cleanup(func() {
-		if err := h.Controller.Disconnect(); err != nil && h.Controller.Snapshot().Connected {
+		if err := h.Controller.Disconnect(); err != nil && h.Controller.Snapshot().IsConnected() {
 			t.Logf("disconnect controller: %v", err)
 		}
 		h.stopEvents()
@@ -870,7 +893,7 @@ func connectControllerToMockWithEvents(t *testing.T, m *mockProcess) *controller
 	if err := h.Controller.Connect(ctx, transport.DefaultPortConfig(m.SerialPath)); err != nil {
 		t.Fatalf("connect controller to mock: %v", err)
 	}
-	waitFor(t, 5*time.Second, func() bool { return h.Controller.Snapshot().Connected })
+	waitFor(t, 5*time.Second, func() bool { return h.Controller.Snapshot().IsConnected() })
 	return h
 }
 
@@ -922,7 +945,7 @@ func TestDDGoConnectsToMockAndReadsStatus(t *testing.T) {
 	var snapshot app.State
 	waitFor(t, 5*time.Second, func() bool {
 		snapshot = controller.Snapshot()
-		return snapshot.Connected && snapshot.MachineState != "" && snapshot.HasMachinePosition
+		return snapshot.IsConnected() && snapshot.MachineState != "" && snapshot.HasMachinePosition
 	})
 	if snapshot.MachineState != "Idle" {
 		t.Fatalf("machine state = %q, want Idle; snapshot=%+v", snapshot.MachineState, snapshot)
@@ -940,7 +963,7 @@ func TestDDGoParsesMPosStatusAgainstMock(t *testing.T) {
 	requestStatus(t, controller)
 
 	snapshot := waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition &&
+		return snapshot.IsConnected() && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition &&
 			nearTriple(snapshot.MachinePosition, [3]float64{}, 0.001) && strings.Contains(snapshot.LastStatusRaw, "|MPos:")
 	})
 	if snapshot.HasWorkPosition || snapshot.HasWorkCoordinateOffset {
@@ -954,7 +977,7 @@ func TestDDGoParsesWPosStatusAgainstMock(t *testing.T) {
 	requestStatus(t, controller)
 
 	snapshot := waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected && snapshot.MachineState == "Idle" && snapshot.HasWorkPosition &&
+		return snapshot.IsConnected() && snapshot.MachineState == "Idle" && snapshot.HasWorkPosition &&
 			nearTriple(snapshot.WorkPosition, [3]float64{}, 0.001) && strings.Contains(snapshot.LastStatusRaw, "|WPos:")
 	})
 	if snapshot.HasMachinePosition || snapshot.HasWorkCoordinateOffset {
@@ -968,7 +991,7 @@ func TestDDGoParsesWPrimaryStatusAgainstMock(t *testing.T) {
 	requestStatus(t, controller)
 
 	snapshot := waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected && snapshot.MachineState == "Idle" && snapshot.HasWorkPosition &&
+		return snapshot.IsConnected() && snapshot.MachineState == "Idle" && snapshot.HasWorkPosition &&
 			nearTriple(snapshot.WorkPosition, [3]float64{}, 0.001) && strings.Contains(snapshot.LastStatusRaw, "|W:")
 	})
 	if snapshot.HasMachinePosition || snapshot.HasWorkCoordinateOffset {
@@ -987,13 +1010,13 @@ func TestDDGoParsesWCOAndFSStatusAgainstMock(t *testing.T) {
 
 	wantWCO := [3]float64{1, 2, -3.5}
 	snapshot := waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition &&
+		return snapshot.IsConnected() && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition &&
 			snapshot.HasWorkCoordinateOffset && nearTriple(snapshot.WorkCoordinateOffset, wantWCO, 0.001) &&
 			snapshot.HasFeedSpindle && near(snapshot.Feed, 123, 0.001) && near(snapshot.Spindle, 456, 0.001) &&
 			strings.Contains(snapshot.LastStatusRaw, "|W:1.000,2.000,-3.500|") &&
 			strings.Contains(snapshot.LastStatusRaw, "|FS:123,456|")
 	})
-	if !snapshot.Connected || snapshot.MachineState != "Idle" {
+	if !snapshot.IsConnected() || snapshot.MachineState != "Idle" {
 		t.Fatalf("controller not connected and idle: %+v", snapshot)
 	}
 }
@@ -1023,7 +1046,7 @@ func TestDDGoConsoleBuildInfoAgainstMock(t *testing.T) {
 		return hasMockLogEntry(events, "command", "$I")
 	})
 
-	if snapshot := controller.Snapshot(); !snapshot.Connected || snapshot.LastError != "" {
+	if snapshot := controller.Snapshot(); !snapshot.IsConnected() || snapshot.LastError != "" {
 		t.Fatalf("controller not healthy after build-info response: %+v", snapshot)
 	}
 	requestStatus(t, controller)
@@ -1093,7 +1116,7 @@ func TestDDGoConsoleResponsesAreNotConfusedByStatusPollingAgainstMock(t *testing
 	controller := connectControllerToMock(t, m)
 
 	waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected &&
+		return snapshot.IsConnected() &&
 			snapshot.HasMachinePosition &&
 			snapshot.LastStatusRaw != ""
 	})
@@ -1118,7 +1141,7 @@ func TestDDGoConsoleResponsesAreNotConfusedByStatusPollingAgainstMock(t *testing
 			hasMockLogEntry(events, "command", "?")
 	})
 
-	if snapshot := controller.Snapshot(); !snapshot.Connected || !snapshot.HasMachinePosition || snapshot.MachineState == "" {
+	if snapshot := controller.Snapshot(); !snapshot.IsConnected() || !snapshot.HasMachinePosition || snapshot.MachineState == "" {
 		t.Fatalf("controller missing parsed status after console response during polling: %+v", snapshot)
 	}
 	requestStatus(t, controller)
@@ -1131,7 +1154,7 @@ func TestDDGoConsoleResponseEventsDuringStatusPollingAgainstMock(t *testing.T) {
 	controller := h.Controller
 
 	waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected &&
+		return snapshot.IsConnected() &&
 			snapshot.HasMachinePosition &&
 			snapshot.LastStatusRaw != ""
 	})
@@ -1164,7 +1187,7 @@ func TestDDGoConsoleResponseEventsDuringStatusPollingAgainstMock(t *testing.T) {
 			hasControllerEventText(events, "ok")
 	})
 
-	if snapshot := controller.Snapshot(); !snapshot.Connected || !snapshot.HasMachinePosition || snapshot.MachineState == "" {
+	if snapshot := controller.Snapshot(); !snapshot.IsConnected() || !snapshot.HasMachinePosition || snapshot.MachineState == "" {
 		t.Fatalf("controller missing parsed status after console response events during polling: %+v", snapshot)
 	}
 	requestStatus(t, controller)
@@ -1243,7 +1266,7 @@ func TestDDGoStartProgramWithoutLoadedProgramAgainstMock(t *testing.T) {
 	requireProgramErrorEvent(t, h, controllerEventsAfter, "load a program before starting")
 
 	snapshot := controller.Snapshot()
-	if snapshot.ProgramStatus != app.ProgramNotLoaded || !snapshot.Connected || snapshot.MachineState != "Idle" {
+	if snapshot.ProgramStatus != app.ProgramNotLoaded || !snapshot.IsConnected() || snapshot.MachineState != "Idle" {
 		t.Fatalf("controller state after rejected start = %+v, want connected idle with no loaded program", snapshot)
 	}
 	assertNoNewMockCommandContainingFor(t, m, eventsAfter, 300*time.Millisecond, "$G", "$J=", "G4")
@@ -1275,7 +1298,7 @@ func TestDDGoProgramControlsRejectWithoutActiveRunAgainstMock(t *testing.T) {
 	requireProgramControlError(t, h, controllerEventsAfter, err, "program is not running")
 
 	snapshot := controller.Snapshot()
-	if !snapshot.Connected || snapshot.ProgramStatus != app.ProgramNotLoaded || snapshot.MachineState != "Idle" {
+	if !snapshot.IsConnected() || snapshot.ProgramStatus != app.ProgramNotLoaded || snapshot.MachineState != "Idle" {
 		t.Fatalf("controller state after rejected program controls = %+v, want connected idle with no loaded program", snapshot)
 	}
 	assertNoProgramRealtimeFor(t, m, eventsAfter, 300*time.Millisecond)
@@ -1401,7 +1424,7 @@ func TestDDGoDisconnectWhileProgramRunningAgainstMock(t *testing.T) {
 	requireProgramErrorEvent(t, h, controllerEventsAfter, app.ErrProgramActive.Error())
 
 	snapshot := controller.Snapshot()
-	if !snapshot.Connected ||
+	if !snapshot.IsConnected() ||
 		snapshot.PortName == "" ||
 		snapshot.ProgramComplete < before.ProgramComplete ||
 		!programStatusIsAny(snapshot.ProgramStatus, app.ProgramRunning, app.ProgramCompleted) {
@@ -1605,7 +1628,7 @@ func TestDDGoProgramControlsRejectAfterCompletionAgainstMock(t *testing.T) {
 		snapshot.ProgramComplete != snapshot.ProgramTotal ||
 		snapshot.ProgramName != before.ProgramName ||
 		snapshot.ProgramPath != before.ProgramPath ||
-		!snapshot.Connected ||
+		!snapshot.IsConnected() ||
 		snapshot.MachineState != "Idle" {
 		t.Fatalf("controller state after rejected controls following completion = %+v, before=%+v", snapshot, before)
 	}
@@ -1654,7 +1677,7 @@ func TestDDGoProgramControlsRejectAfterFailureAgainstMock(t *testing.T) {
 		snapshot.LastError == "" ||
 		snapshot.ProgramName != before.ProgramName ||
 		snapshot.ProgramPath != before.ProgramPath ||
-		!snapshot.Connected ||
+		!snapshot.IsConnected() ||
 		snapshot.MachineState != "Idle" {
 		t.Fatalf("controller state after rejected controls following failure = %+v, before=%+v", snapshot, before)
 	}
@@ -1712,7 +1735,7 @@ func TestDDGoProgramControlsRejectAfterStopAgainstMock(t *testing.T) {
 	if snapshot.ProgramStatus != app.ProgramStopped ||
 		snapshot.ProgramName != before.ProgramName ||
 		snapshot.ProgramPath != before.ProgramPath ||
-		!snapshot.Connected ||
+		!snapshot.IsConnected() ||
 		snapshot.MachineState != "Idle" {
 		t.Fatalf("controller state after rejected controls following stop = %+v, before=%+v", snapshot, before)
 	}
@@ -1750,7 +1773,7 @@ func TestDDGoProgramFailsWhenAckIsMissingAgainstMock(t *testing.T) {
 
 	requestStatus(t, controller)
 	idle := requireControllerIdle(t, controller)
-	if !idle.Connected || idle.MachineState != "Idle" || idle.ProgramStatus != app.ProgramFailed {
+	if !idle.IsConnected() || idle.MachineState != "Idle" || idle.ProgramStatus != app.ProgramFailed {
 		t.Fatalf("final status = %+v after failure %+v, want connected idle ProgramFailed", idle, failed)
 	}
 }
@@ -1790,7 +1813,7 @@ func TestDDGoProgramFailsWhenHardLimitOccursDuringAckWaitAgainstMock(t *testing.
 	requireProgramErrorEvent(t, h, controllerEventsAfter, "ALARM:1")
 	requestStatus(t, controller)
 	waitForControllerState(t, controller, 5*time.Second, func(state app.State) bool {
-		return state.Connected && state.MachineState == "Alarm" && strings.Contains(state.LastError, "ALARM:1")
+		return state.IsConnected() && state.MachineState == "Alarm" && strings.Contains(state.LastError, "ALARM:1")
 	})
 	requireUnlockAndRecoveryProgram(t, controller, m, "recovery-after-ack-alarm.gcode")
 }
@@ -1833,7 +1856,7 @@ func TestDDGoProgramFailsWhenHardLimitOccursDuringMacroQueryAgainstMock(t *testi
 	assertNoNewMockCommandContainingFor(t, m, eventsAfter, 300*time.Millisecond, "$G")
 	requestStatus(t, controller)
 	waitForControllerState(t, controller, 5*time.Second, func(state app.State) bool {
-		return state.Connected && state.MachineState == "Alarm"
+		return state.IsConnected() && state.MachineState == "Alarm"
 	})
 	requireUnlockAndRecoveryProgram(t, controller, m, "recovery-after-query-alarm.gcode")
 }
@@ -1906,7 +1929,7 @@ func TestDDGoReconnectsAfterActiveProgramMockProcessExit(t *testing.T) {
 	requireControllerErrorEventAny(t, h, controllerEventsAfter, transportDropErrorTexts()...)
 
 	disconnected := waitForControllerState(t, controller, 5*time.Second, func(state app.State) bool {
-		return !state.Connected &&
+		return !state.IsConnected() &&
 			state.MachineState == "" &&
 			!state.HasMachinePosition &&
 			state.LastStatusRaw == "" &&
@@ -1925,7 +1948,7 @@ func TestDDGoReconnectsAfterActiveProgramMockProcessExit(t *testing.T) {
 	if err := controller.Connect(ctx, transport.DefaultPortConfig(second.SerialPath)); err != nil {
 		t.Fatalf("reconnect after transport drop: %v", err)
 	}
-	waitFor(t, 5*time.Second, func() bool { return controller.Snapshot().Connected })
+	waitFor(t, 5*time.Second, func() bool { return controller.Snapshot().IsConnected() })
 	requestStatus(t, controller)
 	requireControllerIdle(t, controller)
 
@@ -1946,7 +1969,7 @@ func TestDDGoReconnectsAfterActiveProgramMockProcessExit(t *testing.T) {
 	requireProgramCompleted(t, controller, 1)
 	requestStatus(t, controller)
 	idle := requireControllerIdle(t, controller)
-	if !idle.Connected || idle.MachineState != "Idle" || idle.LastError != "" {
+	if !idle.IsConnected() || idle.MachineState != "Idle" || idle.LastError != "" {
 		t.Fatalf("final recovery status = %+v, want connected idle with no error", idle)
 	}
 }
@@ -1961,7 +1984,7 @@ func TestDDGoReconnectsAfterIdleMockProcessExit(t *testing.T) {
 
 	first.stopNow(t)
 	disconnected := waitForControllerState(t, controller, 5*time.Second, func(state app.State) bool {
-		return !state.Connected && state.MachineState == "" &&
+		return !state.IsConnected() && state.MachineState == "" &&
 			!state.HasMachinePosition && state.LastStatusRaw == ""
 	})
 	if disconnected.LastError != "" {
@@ -2003,7 +2026,7 @@ func TestDDGoExplicitDisconnectDoesNotReportTransportDisconnectedAgainstMock(t *
 		t.Fatalf("explicit disconnect: %v", err)
 	}
 	disconnected := waitForControllerState(t, controller, 5*time.Second, func(state app.State) bool {
-		return !state.Connected && state.MachineState == "" &&
+		return !state.IsConnected() && state.MachineState == "" &&
 			!state.HasMachinePosition && state.LastStatusRaw == ""
 	})
 	if disconnected.LastError != "" {
@@ -2053,7 +2076,7 @@ func TestDDGoReconnectsAfterManualJogMockProcessExit(t *testing.T) {
 
 	first.stopNow(t)
 	disconnected := waitForControllerState(t, controller, 5*time.Second, func(state app.State) bool {
-		return !state.Connected && state.MachineState == "" && !state.HasMachinePosition
+		return !state.IsConnected() && state.MachineState == "" && !state.HasMachinePosition
 	})
 	if disconnected.LastError != "" {
 		t.Fatalf("LastError after jog transport loss = %q, want empty", disconnected.LastError)
@@ -2077,7 +2100,7 @@ func TestDDGoReconnectsAfterManualJogMockProcessExit(t *testing.T) {
 	})
 	requestStatus(t, controller)
 	final := waitForControllerState(t, controller, 5*time.Second, func(state app.State) bool {
-		return state.Connected && state.MachineState != "Alarm" && state.HasMachinePosition
+		return state.IsConnected() && state.MachineState != "Alarm" && state.HasMachinePosition
 	})
 	if final.LastError != "" {
 		t.Fatalf("LastError after second jog = %q, want empty; state=%+v", final.LastError, final)
@@ -2131,7 +2154,7 @@ func TestDDGoProgramTimeoutFailureThenSuccessfulRunAgainstMock(t *testing.T) {
 	requireProgramCompleted(t, controller, 1)
 	requestStatus(t, controller)
 	idle := requireControllerIdle(t, controller)
-	if !idle.Connected || idle.MachineState != "Idle" || idle.LastError != "" {
+	if !idle.IsConnected() || idle.MachineState != "Idle" || idle.LastError != "" {
 		t.Fatalf("final recovery status = %+v, want connected idle with no error", idle)
 	}
 }
@@ -2226,7 +2249,7 @@ func TestDDGoProgramQueryFailsWhenTransportDropsAgainstMock(t *testing.T) {
 	if failed.ProgramComplete != 0 {
 		t.Fatalf("program completed %d lines after query transport drop; want 0; state=%+v", failed.ProgramComplete, failed)
 	}
-	if failed.Connected {
+	if failed.IsConnected() {
 		if err := controller.Disconnect(); err != nil {
 			t.Fatalf("disconnect after query transport drop: %v", err)
 		}
@@ -3053,7 +3076,7 @@ func TestDDGoProgramSendUnsupportedLineAgainstMock(t *testing.T) {
 
 	requestStatus(t, controller)
 	waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected &&
+		return snapshot.IsConnected() &&
 			snapshot.ProgramStatus == app.ProgramFailed &&
 			snapshot.HasMachinePosition &&
 			snapshot.MachineState == "Idle" &&
@@ -3077,7 +3100,7 @@ func TestDDGoProgramAcksAreNotConfusedByStatusPollingAgainstMock(t *testing.T) {
 	}
 
 	waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected &&
+		return snapshot.IsConnected() &&
 			snapshot.HasMachinePosition &&
 			snapshot.LastStatusRaw != ""
 	})
@@ -3189,7 +3212,7 @@ func TestDDGoJogToEndpointCompletesAgainstMock(t *testing.T) {
 		t.Fatalf("request baseline status: %v", err)
 	}
 	waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected && snapshot.HasMachinePosition
+		return snapshot.IsConnected() && snapshot.HasMachinePosition
 	})
 
 	jogCtx, jogCancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -3230,7 +3253,7 @@ func TestDDGoAbsoluteJogResponseOwnershipAgainstMock(t *testing.T) {
 		t.Fatalf("request baseline status: %v", err)
 	}
 	waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected &&
+		return snapshot.IsConnected() &&
 			snapshot.HasMachinePosition &&
 			snapshot.MachineState == "Idle"
 	})
@@ -3284,7 +3307,7 @@ func TestDDGoHomeActionAgainstMock(t *testing.T) {
 	controller := connectControllerToMock(t, m)
 	requestStatus(t, controller)
 	waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition
+		return snapshot.IsConnected() && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition
 	})
 
 	jogCtx, jogCancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -3318,7 +3341,7 @@ func TestDDGoHomeActionAgainstMock(t *testing.T) {
 
 	requestStatus(t, controller)
 	final := waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition &&
+		return snapshot.IsConnected() && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition &&
 			nearTriple(snapshot.MachinePosition, [3]float64{}, posTol) && snapshot.LastError == ""
 	})
 	if final.LastError != "" {
@@ -3338,7 +3361,7 @@ func TestDDGoManualHoldResumeAgainstMock(t *testing.T) {
 
 	requestStatus(t, controller)
 	waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition
+		return snapshot.IsConnected() && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition
 	})
 	eventsAfter := mockEventCount(t, m)
 
@@ -3352,7 +3375,7 @@ func TestDDGoManualHoldResumeAgainstMock(t *testing.T) {
 	})
 	requestStatus(t, controller)
 	waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected && snapshot.MachineState == "Hold" && snapshot.HasMachinePosition
+		return snapshot.IsConnected() && snapshot.MachineState == "Hold" && snapshot.HasMachinePosition
 	})
 
 	eventsAfter = mockEventCount(t, m)
@@ -3366,7 +3389,7 @@ func TestDDGoManualHoldResumeAgainstMock(t *testing.T) {
 	})
 	requestStatus(t, controller)
 	final := waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition
+		return snapshot.IsConnected() && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition
 	})
 	if final.LastError != "" {
 		t.Fatalf("LastError = %q, want empty; state=%+v", final.LastError, final)
@@ -3383,7 +3406,7 @@ func TestDDGoRealtimeHoldResumeDuringJogAgainstMock(t *testing.T) {
 		t.Fatalf("request baseline status: %v", err)
 	}
 	waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected &&
+		return snapshot.IsConnected() &&
 			snapshot.HasMachinePosition &&
 			snapshot.MachineState == "Idle" &&
 			near(snapshot.MachinePosition[0], 0, posTol)
@@ -3455,7 +3478,7 @@ func TestDDGoSoftResetReportsAlarmAndStartupAgainstMock(t *testing.T) {
 	controller := h.Controller
 	requestStatus(t, controller)
 	waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition
+		return snapshot.IsConnected() && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition
 	})
 
 	responsesAfter := mockResponseCount(t, m)
@@ -3482,7 +3505,7 @@ func TestDDGoSoftResetReportsAlarmAndStartupAgainstMock(t *testing.T) {
 
 	requestStatus(t, controller)
 	final := waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition
+		return snapshot.IsConnected() && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition
 	})
 	if final.LastError != "" {
 		t.Fatalf("post-reset LastError = %q, want empty; state=%+v", final.LastError, final)
@@ -3495,7 +3518,7 @@ func TestDDGoSeesHardLimitAlarmAndUnlocksAgainstMock(t *testing.T) {
 	controller := h.Controller
 	requestStatus(t, controller)
 	waitForControllerState(t, controller, 5*time.Second, func(state app.State) bool {
-		return state.Connected && state.MachineState == "Idle" && state.HasMachinePosition
+		return state.IsConnected() && state.MachineState == "Idle" && state.HasMachinePosition
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -3522,7 +3545,7 @@ func TestDDGoSeesHardLimitAlarmAndUnlocksAgainstMock(t *testing.T) {
 	})
 	assertNoControllerEventKind(t, controllerEvents, app.EventError)
 	alarmed := waitForControllerState(t, controller, 5*time.Second, func(state app.State) bool {
-		return state.Connected && state.MachineState == "Alarm" && state.HasMachinePosition &&
+		return state.IsConnected() && state.MachineState == "Alarm" && state.HasMachinePosition &&
 			state.MachinePosition[0] < 0 && state.MachinePosition[0] > -10
 	})
 	if alarmed.LastError != "" {
@@ -3553,7 +3576,7 @@ func TestDDGoSeesHardLimitAlarmAndUnlocksAgainstMock(t *testing.T) {
 	})
 	requestStatus(t, controller)
 	waitForControllerState(t, controller, 5*time.Second, func(state app.State) bool {
-		return state.Connected && state.MachineState == "Idle"
+		return state.IsConnected() && state.MachineState == "Idle"
 	})
 
 	responsesAfter = mockResponseCount(t, m)
@@ -3568,7 +3591,7 @@ func TestDDGoSeesHardLimitAlarmAndUnlocksAgainstMock(t *testing.T) {
 	})
 	requestStatus(t, controller)
 	final := waitForControllerState(t, controller, 5*time.Second, func(state app.State) bool {
-		return state.Connected && state.MachineState != "Alarm"
+		return state.IsConnected() && state.MachineState != "Alarm"
 	})
 	if final.LastError != "" {
 		t.Fatalf("post-recovery LastError = %q", final.LastError)
@@ -3580,7 +3603,7 @@ func TestDDGoUnlockAfterSoftResetAgainstMock(t *testing.T) {
 	controller := connectControllerToMock(t, m)
 	requestStatus(t, controller)
 	baseline := waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition
+		return snapshot.IsConnected() && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition
 	})
 
 	responsesAfter := mockResponseCount(t, m)
@@ -3608,7 +3631,7 @@ func TestDDGoUnlockAfterSoftResetAgainstMock(t *testing.T) {
 
 	requestStatus(t, controller)
 	final := waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition
+		return snapshot.IsConnected() && snapshot.MachineState == "Idle" && snapshot.HasMachinePosition
 	})
 	if final.LastError != "" || final.ProgramStatus != baseline.ProgramStatus || final.ProgramStatus.IsActive() {
 		t.Fatalf("post-unlock controller state = %+v; baseline=%+v", final, baseline)
@@ -3625,7 +3648,7 @@ func TestDDGoRealtimeResetDuringJogAgainstMock(t *testing.T) {
 		t.Fatalf("request baseline status: %v", err)
 	}
 	waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected &&
+		return snapshot.IsConnected() &&
 			snapshot.HasMachinePosition &&
 			snapshot.MachineState == "Idle" &&
 			near(snapshot.MachinePosition[0], 0, posTol)
@@ -3750,7 +3773,7 @@ func TestDDGoJogLimitRejectionAgainstMock(t *testing.T) {
 		t.Fatalf("request baseline status: %v", err)
 	}
 	baseline := waitForControllerState(t, controller, 5*time.Second, func(snapshot app.State) bool {
-		return snapshot.Connected && snapshot.HasMachinePosition
+		return snapshot.IsConnected() && snapshot.HasMachinePosition
 	})
 	baselineX := baseline.MachinePosition[0]
 

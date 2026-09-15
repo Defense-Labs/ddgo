@@ -105,7 +105,7 @@ func (c *Controller) admissionErrorLocked(request admissionKind) error {
 		return ErrControllerIOActive
 	}
 	if request == admissionConnect {
-		if c.state.Connected {
+		if c.state.IsConnected() {
 			return ErrAlreadyConnected
 		}
 		return c.responseOwnerBusyErrorLocked(responseOwnerProgram)
