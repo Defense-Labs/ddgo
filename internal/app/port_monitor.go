@@ -19,6 +19,16 @@ var autoConnectRetryDelays = [...]time.Duration{time.Second, 2 * time.Second, 5 
 
 type machineIdentity string
 
+type usbDeviceID struct {
+	VID string
+	PID string
+}
+
+var supportedGhostGunnerUSBDeviceIDs = [...]usbDeviceID{
+	{VID: "2341", PID: "003e"},
+	{VID: "2341", PID: "0043"},
+}
+
 type portMonitorState struct {
 	lastPorts             []ports.Info
 	hasScanned            bool
@@ -266,11 +276,20 @@ func selectMachinePort(list []ports.Info) (ports.Info, bool) {
 	return found, n == 1
 }
 
-// Production GrblDD controller hardware tested on Linux is the Arduino Due
-// native USB port (Arduino VID 2341, PID 003e). Its serial descriptor is not
-// reliably populated, so VID/PID are the positive classification fields.
+// DDGo recognizes the verified Ghost Gunner Arduino USB identities 2341:003e
+// and 2341:0043. Serial descriptors help track an identity when present, but
+// are not required for candidate classification.
 func isMachinePort(p ports.Info) bool {
-	return p.IsUSB && strings.EqualFold(strings.TrimSpace(p.VID), "2341") && strings.EqualFold(strings.TrimSpace(p.PID), "003e")
+	if !p.IsUSB {
+		return false
+	}
+	vid, pid := strings.TrimSpace(p.VID), strings.TrimSpace(p.PID)
+	for _, supported := range supportedGhostGunnerUSBDeviceIDs {
+		if strings.EqualFold(vid, supported.VID) && strings.EqualFold(pid, supported.PID) {
+			return true
+		}
+	}
+	return false
 }
 
 func identityForPort(p ports.Info) machineIdentity {

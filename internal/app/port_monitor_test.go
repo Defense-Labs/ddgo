@@ -14,10 +14,13 @@ import (
 )
 
 func knownMachine(name, serial string) ports.Info {
-	// The tested production controller is an Arduino Due native USB device.
-	// Linux does not reliably populate SerialNumber, so classification uses its
-	// verified 2341:003e VID/PID; serial remains useful only for identity tests.
+	// Keep the original verified 2341:003e identity in the shared fixture.
+	// Serial remains useful for identity tracking but is not a classifier.
 	return ports.Info{Name: name, IsUSB: true, VID: "2341", PID: "003e", SerialNumber: serial}
+}
+
+func knownGG3Machine(name, serial string) ports.Info {
+	return ports.Info{Name: name, IsUSB: true, VID: "2341", PID: "0043", SerialNumber: serial}
 }
 
 type countedTransport struct {
@@ -43,6 +46,7 @@ func (t *countedTransport) openNames() []string {
 
 func TestSelectMachinePort(t *testing.T) {
 	m1, m2 := knownMachine("/dev/a", "GrblDD-A"), knownMachine("/dev/b", "GrblDD-B")
+	gg3 := knownGG3Machine("/dev/gg3", "0353637333235131D013")
 	unrelated := ports.Info{Name: "/dev/other", IsUSB: true, VID: "1234", PID: "5678", SerialNumber: "other"}
 	tests := []struct {
 		name string
@@ -52,12 +56,20 @@ func TestSelectMachinePort(t *testing.T) {
 	}{
 		{"empty", nil, false, ""},
 		{"unrelated", []ports.Info{unrelated}, false, ""},
-		{"machine", []ports.Info{m1}, true, m1.Name},
+		{"2341:003e", []ports.Info{m1}, true, m1.Name},
+		{"2341:003e empty serial", []ports.Info{knownMachine("/dev/003e-no-serial", "")}, true, "/dev/003e-no-serial"},
+		{"2341:0043 observed serial", []ports.Info{gg3}, true, gg3.Name},
+		{"2341:0043 empty serial", []ports.Info{knownGG3Machine("/dev/no-serial", "")}, true, "/dev/no-serial"},
 		{"machine and unrelated", []ports.Info{unrelated, m1}, true, m1.Name},
 		{"ambiguous serials", []ports.Info{m1, m2}, false, ""},
-		{"missing serial", []ports.Info{{Name: "/dev/a", IsUSB: true, VID: "2341", PID: "003e"}}, true, "/dev/a"},
-		{"normalized metadata", []ports.Info{{Name: "/dev/a", IsUSB: true, VID: " 2341 ", PID: "003E"}}, true, "/dev/a"},
-		{"non USB", []ports.Info{{Name: "/dev/a", SerialNumber: "GrblDD"}}, false, ""},
+		{"ambiguous supported variants", []ports.Info{m1, gg3}, false, ""},
+		{"003e normalized metadata", []ports.Info{{Name: "/dev/003e", IsUSB: true, VID: " 2341 ", PID: " 003E "}}, true, "/dev/003e"},
+		{"0043 normalized metadata", []ports.Info{{Name: "/dev/0043", IsUSB: true, VID: " 2341 ", PID: " 0043 "}}, true, "/dev/0043"},
+		{"legacy CH340 rejected", []ports.Info{{Name: "/dev/ch340", IsUSB: true, VID: "1A86", PID: "7523"}}, false, ""},
+		{"same vendor unrelated product", []ports.Info{{Name: "/dev/other-product", IsUSB: true, VID: "2341", PID: "0001"}}, false, ""},
+		{"same product unrelated vendor", []ports.Info{{Name: "/dev/other-vendor", IsUSB: true, VID: "9999", PID: "0043"}}, false, ""},
+		{"non USB 2341:0043", []ports.Info{{Name: "/dev/not-usb", VID: "2341", PID: "0043"}}, false, ""},
+		{"name-only fallback", []ports.Info{{Name: "/dev/ttyACM2"}}, false, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -66,6 +78,50 @@ func TestSelectMachinePort(t *testing.T) {
 				t.Fatalf("selectMachinePort() = (%+v,%v), want name %q, ok %v", got, ok, tt.want, tt.ok)
 			}
 		})
+	}
+}
+
+func TestAutoConnectsObservedGG3USBIdentity(t *testing.T) {
+	tr := newCountedTransport()
+	machine := knownGG3Machine("/dev/ttyACM2", "0353637333235131D013")
+	c := NewController(tr, ports.StaticList([]ports.Info{machine}, nil))
+	c.statusPollInterval = time.Hour
+	t.Cleanup(func() {
+		if c.Snapshot().IsConnected() {
+			_ = c.Disconnect()
+		}
+	})
+
+	if err := c.RefreshPorts(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := tr.openNames(); len(got) != 1 || got[0] != "/dev/ttyACM2" {
+		t.Fatalf("automatic opens = %v", got)
+	}
+	if got := tr.HandshakeWrites(); got != 1 {
+		t.Fatalf("handshake settings writes = %d, want 1", got)
+	}
+	state := c.Snapshot()
+	if state.ConnectionStatus != ConnectionConnected || state.PortName != "/dev/ttyACM2" {
+		t.Fatalf("state after automatic connection = %+v", state)
+	}
+}
+
+func TestAutoConnectRejectsAmbiguousSupportedHardwareVariants(t *testing.T) {
+	tr := newCountedTransport()
+	list := []ports.Info{
+		knownMachine("/dev/a", "board-a"),
+		knownGG3Machine("/dev/b", "board-b"),
+	}
+	c := NewController(tr, ports.StaticList(list, nil))
+	if err := c.RefreshPorts(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := tr.openNames(); len(got) != 0 {
+		t.Fatalf("ambiguous automatic opens = %v", got)
+	}
+	if state := c.Snapshot(); state.ConnectionStatus != ConnectionDisconnected {
+		t.Fatalf("state after ambiguous scan = %+v", state)
 	}
 }
 
