@@ -4,7 +4,7 @@
 
 `cmd/mockgrbl` is a local GrblDD-style mock controller for DDGo development and Linux serial-tagged integration tests. It exposes a pseudo-terminal (PTY) that DDGo can open like a serial port, together with an HTTP debug API for inspecting state and injecting faults.
 
-The standalone process keeps an internal slave-side PTY handle open before emitting its initial `Grbl 1.1g [help:'$']` banner. This keeps the banner queued until DDGo opens the published serial path, making startup validation deterministic.
+The standalone Linux process uses an internal slave-side PTY handle as a between-client sentinel. While waiting for a client, the sentinel keeps the PTY alive and the startup banner queued. Once client traffic arrives, the mock releases the sentinel. When that client later closes and the PTY master reports `EIO`, the mock opens a new sentinel and queues a fresh startup banner for the next DDGo connection. This models repeatable PTY serial sessions for tests; it is not a claim about the exact USB reset behavior of GG3 hardware.
 
 The mock is for development and tests, not real CNC control. It is intentionally narrow: it models only the firmware behaviors that DDGo currently needs rather than attempting to be a full firmware emulator.
 

@@ -716,6 +716,100 @@ func TestAutoConnectStartsStatusPolling(t *testing.T) {
 	}
 }
 
+func TestControllerReconnectsToSameMockPTY(t *testing.T) {
+	m := startMockGRBL(t)
+	h := connectControllerToMockWithEvents(t, m)
+
+	waitForControllerState(t, h.Controller, 5*time.Second, func(state app.State) bool {
+		return state.IsConnected() && state.MachineState == "Idle" && state.LastStatusRaw != ""
+	})
+	waitForMockEvents(t, m, 5*time.Second, func(events []mockLogEntry) bool {
+		settingsIndex, statusIndex := -1, -1
+		for i, event := range events {
+			if event.Kind != "command" {
+				continue
+			}
+			if event.Text == "$$" && settingsIndex < 0 {
+				settingsIndex = i
+			}
+			if event.Text == "?" && statusIndex < 0 {
+				statusIndex = i
+			}
+		}
+		return settingsIndex >= 0 && statusIndex > settingsIndex
+	})
+
+	responsesBeforeDisconnect := mockResponseCount(t, m)
+	disconnectEventsAfter := h.eventCount()
+	if err := h.Controller.Disconnect(); err != nil {
+		t.Fatalf("first Disconnect(): %v", err)
+	}
+	waitForControllerState(t, h.Controller, 5*time.Second, func(state app.State) bool {
+		return state.ConnectionStatus == app.ConnectionDisconnected
+	})
+	h.waitForEventsAfter(t, disconnectEventsAfter, 5*time.Second, func(events []app.Event) bool {
+		for _, event := range events {
+			if event.Kind == app.EventStateChanged && event.State.ConnectionStatus == app.ConnectionDisconnected {
+				return true
+			}
+		}
+		return false
+	})
+
+	waitForNewMockResponses(t, m, responsesBeforeDisconnect, 5*time.Second, func(responses []mockLogEntry) bool {
+		for _, response := range responses {
+			if response.Kind == "response" && strings.HasPrefix(strings.ToLower(response.Text), "grbl ") {
+				return true
+			}
+		}
+		return false
+	})
+
+	mockEventsBeforeReconnect := mockEventCount(t, m)
+	controllerEventsBeforeReconnect := h.eventCount()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.Controller.Connect(ctx, transport.DefaultPortConfig(m.SerialPath)); err != nil {
+		t.Fatalf("second Connect() to same PTY: %v", err)
+	}
+	waitForControllerState(t, h.Controller, 5*time.Second, func(state app.State) bool {
+		return state.IsConnected() && state.MachineState == "Idle" && state.LastStatusRaw != ""
+	})
+
+	waitForNewMockEvents(t, m, mockEventsBeforeReconnect, 5*time.Second, func(events []mockLogEntry) bool {
+		settingsIndex, statusIndex := -1, -1
+		for i, event := range events {
+			if event.Kind != "command" {
+				continue
+			}
+			if event.Text == "$$" && settingsIndex < 0 {
+				settingsIndex = i
+			}
+			if event.Text == "?" && statusIndex < 0 {
+				statusIndex = i
+			}
+		}
+		return settingsIndex >= 0 && statusIndex > settingsIndex
+	})
+	h.waitForEventsAfter(t, controllerEventsBeforeReconnect, 5*time.Second, func(events []app.Event) bool {
+		sawConnecting := false
+		for _, event := range events {
+			if event.Kind != app.EventStateChanged {
+				continue
+			}
+			switch event.State.ConnectionStatus {
+			case app.ConnectionConnecting:
+				sawConnecting = true
+			case app.ConnectionConnected:
+				if sawConnecting {
+					return true
+				}
+			}
+		}
+		return false
+	})
+}
+
 func TestMockGRBLDebugResetEndpoint(t *testing.T) {
 	m := startMockGRBL(t)
 	controller := connectControllerToMock(t, m)

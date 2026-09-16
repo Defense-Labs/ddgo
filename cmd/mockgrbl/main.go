@@ -52,14 +52,15 @@ func main() {
 		log.Fatal(err)
 	}
 	defer ptm.Close()
-	// Keep one slave descriptor open before writing the startup banner. Linux
-	// PTYs otherwise make startup delivery depend on whether a client already
-	// has the slave side open.
-	heldSlave, err := os.OpenFile(slave, os.O_RDWR, 0)
+	heldSlave, err := armSerialClient(slave, ptm, ctl, *responseDelay)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer heldSlave.Close()
+	defer func() {
+		if heldSlave != nil {
+			_ = heldSlave.Close()
+		}
+	}()
 	_ = os.Remove(*symlink)
 	if err := os.Symlink(slave, *symlink); err != nil {
 		log.Printf("symlink: %v", err)
@@ -67,11 +68,14 @@ func main() {
 	log.Printf("mockgrbl serial path: %s", slave)
 	log.Printf("mockgrbl stable path: %s", *symlink)
 	go func() { log.Fatal(http.ListenAndServe(*httpAddr, mockgrbl.DebugHandler(ctl))) }()
-	writeResponses(ptm, ctl.Connect(), *responseDelay)
 	buf := make([]byte, 256)
 	for {
 		n, err := ptm.Read(buf)
 		if n > 0 {
+			if heldSlave != nil {
+				_ = heldSlave.Close()
+				heldSlave = nil
+			}
 			for _, b := range buf[:n] {
 				eventsBefore := len(ctl.Events())
 				responses := ctl.ProcessBytes([]byte{b})
@@ -97,13 +101,27 @@ func main() {
 			if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
 				return
 			}
-			if pathErr, ok := err.(*os.PathError); ok && errors.Is(pathErr.Err, syscall.EIO) {
+			if errors.Is(err, syscall.EIO) && heldSlave == nil {
+				heldSlave, err = armSerialClient(slave, ptm, ctl, *responseDelay)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "rearm serial client: %v\n", err)
+					return
+				}
 				continue
 			}
 			fmt.Fprintln(os.Stderr, err)
 			return
 		}
 	}
+}
+
+func armSerialClient(slave string, ptm io.Writer, ctl *mockgrbl.Controller, responseDelay time.Duration) (*os.File, error) {
+	heldSlave, err := os.OpenFile(slave, os.O_RDWR, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open sentinel slave %q: %w", slave, err)
+	}
+	writeResponses(ptm, ctl.Connect(), responseDelay)
+	return heldSlave, nil
 }
 
 func parseFloatTripleFlag(name, raw string) ([3]float64, bool, error) {

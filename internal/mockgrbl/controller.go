@@ -83,9 +83,14 @@ func NewController(fw FirmwareProfile, mach MachineProfile, clock Clock) *Contro
 	}
 	return &Controller{fw: fw, mach: mach, clock: clock, state: StateIdle, pos: mach.InitialPosition, distanceAbsolute: true}
 }
+
+// Connect begins a new serial framing session and emits the firmware startup banner.
 func (c *Controller) Connect() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.rx = c.rx[:0]
+	c.rxOverflow = false
+	c.pendingSerial = nil
 	return c.emit(c.fw.StartupBanner())
 }
 func (c *Controller) log(kind, text string) {

@@ -85,6 +85,26 @@ func TestStartupBlankNormalize(t *testing.T) {
 		t.Fatalf("norm %q", c.Snapshot().LastCommand)
 	}
 }
+
+func TestConnectClearsSerialSessionFraming(t *testing.T) {
+	c, _ := testCtl()
+	c.ProcessBytes([]byte("$"))
+	c.queueSerial([]string{"stale serial output\r\n"})
+
+	if got := joined(c.Connect()); got != "\r\nGrbl 1.1g [help:'$']\r\n" {
+		t.Fatalf("Connect() = %q", got)
+	}
+	got := joined(c.ProcessBytes([]byte("$$\n")))
+	if strings.Contains(got, "stale serial output") {
+		t.Fatalf("new session received stale serial output: %q", got)
+	}
+	if !strings.Contains(got, "$0=") || !strings.HasSuffix(got, "ok\r\n") {
+		t.Fatalf("new-session $$ response = %q", got)
+	}
+	if snap := c.Snapshot(); snap.LastCommand != "$$" {
+		t.Fatalf("new-session command = %q, want $$", snap.LastCommand)
+	}
+}
 func TestJogStatusCancel(t *testing.T) {
 	c, clk := testCtl()
 	if got := joined(c.ProcessBytes([]byte("$J=G53 G90 X-10 F60\n"))); got != "ok\r\n" {
