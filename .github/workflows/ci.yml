@@ -24,7 +24,10 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.sum
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            .github/go-cache-version
 
       - name: Install Qt 5 development dependencies
         if: matrix.os == 'ubuntu-latest'
