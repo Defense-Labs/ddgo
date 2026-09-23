@@ -323,6 +323,95 @@ jobs:
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --no-progress -y
+      - name: Determine Windows Go cache context
+        id: windows-cache-context
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export PATH="${MINGW_PREFIX}/bin:/usr/bin:${PATH}"
+          export CC=gcc
+
+          normalize_windows_path() {
+            local raw="$1"
+
+            if [[ "$raw" =~ ^[A-Za-z]:[\\/].* ]]; then
+              printf '%s\n' "$raw" | sed 's#\\#/#g'
+            else
+              cygpath -m "$raw"
+            fi
+          }
+
+          go_version="$(go env GOVERSION)"
+          go_mod_cache="$(normalize_windows_path "$(go env GOMODCACHE)")"
+          go_build_cache="$(normalize_windows_path "$(go env GOCACHE)")"
+
+          toolchain_packages=(
+            mingw-w64-x86_64-go
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
+            mingw-w64-x86_64-crt
+            mingw-w64-x86_64-headers
+            mingw-w64-x86_64-winpthreads
+            mingw-w64-x86_64-qt5-base
+            mingw-w64-x86_64-pkgconf
+          )
+
+          toolchain_description="$(
+            pacman -Q "${toolchain_packages[@]}" |
+              LC_ALL=C sort
+          )"
+
+          toolchain_hash="$(
+            printf '%s\n' "$toolchain_description" |
+              sha256sum |
+              awk '{print $1}'
+          )"
+
+          if [[ -z "$go_version" ]]; then
+            echo "Unable to determine Go version" >&2
+            exit 1
+          fi
+
+          if [[ -z "$go_mod_cache" ]]; then
+            echo "Unable to determine GOMODCACHE" >&2
+            exit 1
+          fi
+
+          if [[ -z "$go_build_cache" ]]; then
+            echo "Unable to determine GOCACHE" >&2
+            exit 1
+          fi
+
+          if [[ -z "$toolchain_hash" ]]; then
+            echo "Unable to determine Windows toolchain fingerprint" >&2
+            exit 1
+          fi
+
+          {
+            echo "go_version=$go_version"
+            echo "go_mod_cache=$go_mod_cache"
+            echo "go_build_cache=$go_build_cache"
+            echo "toolchain_hash=$toolchain_hash"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Go version: $go_version"
+          echo "GOMODCACHE: $go_mod_cache"
+          echo "GOCACHE: $go_build_cache"
+          echo "MSYS2 toolchain:"
+          printf '%s\n' "$toolchain_description"
+          echo "Toolchain fingerprint: $toolchain_hash"
+      - name: Restore Windows Go module cache
+        id: windows-go-mod-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.windows-cache-context.outputs.go_mod_cache }}
+          key: ddgo-go-mod-v1-windows-msys2-${{ steps.windows-cache-context.outputs.go_version }}-${{ hashFiles('go.mod', 'go.sum') }}
+      - name: Restore Windows Go build cache
+        id: windows-go-build-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.windows-cache-context.outputs.go_build_cache }}
+          key: ddgo-windows-build-v1-windows-2022-mingw64-amd64-${{ steps.windows-cache-context.outputs.toolchain_hash }}-${{ hashFiles('go.mod', 'go.sum') }}
       - name: Build and stage Windows app
         shell: msys2 {0}
         run: |
@@ -348,6 +437,18 @@ jobs:
             rm -f ../DDGo-windows-amd64.zip
             zip -r ../DDGo-windows-amd64.zip DDGo
           )
+      - name: Save Windows Go module cache
+        if: steps.windows-go-mod-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.windows-cache-context.outputs.go_mod_cache }}
+          key: ${{ steps.windows-go-mod-cache.outputs.cache-primary-key }}
+      - name: Save Windows Go build cache
+        if: steps.windows-go-build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.windows-cache-context.outputs.go_build_cache }}
+          key: ${{ steps.windows-go-build-cache.outputs.cache-primary-key }}
       - name: Verify Windows staged folder and ZIP
         shell: pwsh
         run: |
