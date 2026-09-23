@@ -82,9 +82,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - name: Set up Go
+        id: setup-go
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+          cache: false
       - name: Diagnose macOS runner
         run: |
           set -euo pipefail
@@ -101,6 +104,62 @@ jobs:
         run: |
           set -euo pipefail
           brew install qt@5 pkg-config
+      - name: Determine macOS cache context
+        id: cache-context
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          qt_prefix="$(brew --prefix qt@5)"
+          export PATH="${qt_prefix}/bin:$PATH"
+          export PKG_CONFIG_PATH="${qt_prefix}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+          go_mod_cache="$(go env GOMODCACHE)"
+          go_build_cache="$(go env GOCACHE)"
+          qt_formula_version="$(brew list --versions qt@5 | awk 'NR == 1 { print $2 }')"
+          qt_pkg_version="$(pkg-config --modversion Qt5Core)"
+
+          if [[ -z "$go_mod_cache" ]]; then
+            echo "Unable to determine GOMODCACHE" >&2
+            exit 1
+          fi
+
+          if [[ -z "$go_build_cache" ]]; then
+            echo "Unable to determine GOCACHE" >&2
+            exit 1
+          fi
+
+          if [[ -z "$qt_formula_version" ]]; then
+            echo "Unable to determine Homebrew qt@5 version" >&2
+            exit 1
+          fi
+
+          if [[ -z "$qt_pkg_version" ]]; then
+            echo "Unable to determine Qt5Core version" >&2
+            exit 1
+          fi
+
+          echo "go_mod_cache=$go_mod_cache" >> "$GITHUB_OUTPUT"
+          echo "go_build_cache=$go_build_cache" >> "$GITHUB_OUTPUT"
+          echo "qt_formula_version=$qt_formula_version" >> "$GITHUB_OUTPUT"
+          echo "qt_pkg_version=$qt_pkg_version" >> "$GITHUB_OUTPUT"
+
+          echo "GOMODCACHE=$go_mod_cache"
+          echo "GOCACHE=$go_build_cache"
+          echo "Homebrew qt@5 version=$qt_formula_version"
+          echo "Qt5Core pkg-config version=$qt_pkg_version"
+      - name: Restore macOS Go module cache
+        id: go-mod-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.cache-context.outputs.go_mod_cache }}
+          key: ddgo-go-mod-v1-${{ matrix.os }}-${{ matrix.arch }}-go-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.mod', 'go.sum') }}
+      - name: Restore macOS Go build cache
+        id: go-build-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.cache-context.outputs.go_build_cache }}
+          key: ddgo-macos-build-v1-${{ matrix.os }}-${{ matrix.arch }}-macos-${{ matrix.macos_min }}-go-${{ steps.setup-go.outputs.go-version }}-qt-${{ steps.cache-context.outputs.qt_formula_version }}-${{ steps.cache-context.outputs.qt_pkg_version }}-${{ hashFiles('go.mod', 'go.sum') }}
       - name: Configure macOS build environment
         run: |
           set -euxo pipefail
@@ -140,11 +199,22 @@ jobs:
           export CGO_CXXFLAGS="-I${qt_prefix}/include ${CGO_CXXFLAGS:-}"
           export CGO_LDFLAGS="-F${qt_prefix}/lib -L${qt_prefix}/lib ${CGO_LDFLAGS:-}"
 
-          go clean -cache
           GOOS=darwin GOARCH=${{ matrix.arch }} CGO_ENABLED=1 \
             go build -x -tags "miqt serial" -trimpath -ldflags="-s -w" \
             -o dist/ddgo-darwin-${{ matrix.slice }} \
             ./cmd/ddgo
+      - name: Save macOS Go module cache
+        if: steps.go-mod-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.cache-context.outputs.go_mod_cache }}
+          key: ${{ steps.go-mod-cache.outputs.cache-primary-key }}
+      - name: Save macOS Go build cache
+        if: steps.go-build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.cache-context.outputs.go_build_cache }}
+          key: ${{ steps.go-build-cache.outputs.cache-primary-key }}
       - name: Inspect macOS app binary
         run: |
           set -euxo pipefail
