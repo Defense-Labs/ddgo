@@ -126,7 +126,6 @@ func (c *Controller) noteStatusResponseLocked(generation transport.ConnectionGen
 	if strings.EqualFold(strings.TrimSpace(machineState), "Idle") {
 		c.state.EStopStatus = EStopClear
 		c.state.EStopSource = EStopSourceNone
-		c.state.LastError = ""
 		return true, c.captureEventStateLocked(), "emergency stop cleared"
 	}
 	if c.state.EStopStatus == EStopActive {

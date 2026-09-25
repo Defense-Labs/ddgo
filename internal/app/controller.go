@@ -637,11 +637,8 @@ func (c *Controller) writeStatusPollForGeneration(ctx context.Context, generatio
 		return err
 	}
 	c.pendingQuietStatusReports++
-	startedWatchdog := c.statusWatchdogStartedAt.IsZero()
-	var watchdogStart time.Time
-	if startedWatchdog {
-		watchdogStart = c.now()
-		c.statusWatchdogStartedAt = watchdogStart
+	if c.statusWatchdogStartedAt.IsZero() {
+		c.statusWatchdogStartedAt = c.now()
 	}
 	c.mu.Unlock()
 	defer c.endRealtimeWrite()
@@ -652,17 +649,25 @@ func (c *Controller) writeStatusPollForGeneration(ctx context.Context, generatio
 	msg.SuppressLog = true
 	if err := c.transport.Write(ctx, msg); err != nil {
 		c.mu.Lock()
-		if c.pendingQuietStatusReports > 0 {
+		currentGeneration := c.state.IsConnected() &&
+			c.connectionGeneration == generation &&
+			c.statusMonitoringGeneration == generation
+		if currentGeneration && c.pendingQuietStatusReports > 0 {
 			c.pendingQuietStatusReports--
 		}
-		if startedWatchdog && c.statusWatchdogStartedAt == watchdogStart && c.connectionGeneration == generation {
-			c.statusWatchdogStartedAt = time.Time{}
-		}
 		c.mu.Unlock()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !currentGeneration {
+			return nil
+		}
 		if errors.Is(err, transport.ErrNotOpen) {
 			return nil
 		}
-		c.emitError(err)
+		// Quiet polling leaves ordinary write-error reporting to transports that
+		// emit EventError. The health watchdog provides the single meaningful
+		// controller-level failure if valid status responses do not resume.
 		return err
 	}
 	return nil

@@ -338,6 +338,7 @@ func TestControllerConnectSendJogActionAndReceive(t *testing.T) {
 	t.Parallel()
 
 	fake := transport.NewFakeTransport()
+	fake.SetResponding(false)
 	controller := NewController(fake, ports.StaticList(nil, nil))
 	controller.statusPollInterval = 10 * time.Second
 	cfg := transport.DefaultPortConfig("/dev/ttyACM0")
@@ -837,6 +838,7 @@ func TestControllerProgramLoadStartComplete(t *testing.T) {
 func startBarrierTestProgram(t *testing.T, program string, staleIdle bool) (*Controller, *transport.FakeTransport) {
 	t.Helper()
 	fake := transport.NewFakeTransport()
+	fake.SetResponding(false)
 	controller := NewController(fake, ports.StaticList(nil, nil))
 	controller.statusPollInterval = time.Hour
 	if err := controller.LoadProgramFile(writeProgramFile(t, "barrier.gcode", program)); err != nil {
@@ -1902,6 +1904,7 @@ func TestControllerMacroHandlerCanSendControllerLines(t *testing.T) {
 func TestControllerMacroQueryCollectsIntermediateResponses(t *testing.T) {
 	path := writeProgramFile(t, "macro-query.gcode", "M90\nM5\n")
 	fake := transport.NewFakeTransport()
+	fake.SetResponding(false)
 	controller := NewController(fake, ports.StaticList(nil, nil))
 	controller.statusPollInterval = 10 * time.Second
 	reg := macro.NewRegistry()
@@ -2983,6 +2986,7 @@ func TestControllerAutomaticStatusPollSuppressesTXAndRXButUpdatesState(t *testin
 	t.Parallel()
 
 	fake := transport.NewFakeTransport()
+	fake.SetResponding(false)
 	controller := NewController(fake, ports.StaticList(nil, nil))
 	controller.statusPollInterval = 10 * time.Second
 	if err := controller.Connect(context.Background(), transport.DefaultPortConfig("/dev/ttyACM0")); err != nil {
@@ -3030,6 +3034,7 @@ func TestControllerTracksGrblDDWorkCoordinateOffset(t *testing.T) {
 	t.Parallel()
 
 	fake := transport.NewFakeTransport()
+	fake.SetResponding(false)
 	controller := NewController(fake, ports.StaticList(nil, nil))
 	if err := controller.Connect(context.Background(), transport.DefaultPortConfig("COM1")); err != nil {
 		t.Fatalf("Connect() error = %v", err)
@@ -3055,6 +3060,7 @@ func TestControllerManualStatusLogsTXAndRX(t *testing.T) {
 	t.Parallel()
 
 	fake := transport.NewFakeTransport()
+	fake.SetResponding(false)
 	controller := NewController(fake, ports.StaticList(nil, nil))
 	controller.statusPollInterval = 10 * time.Second
 	if err := controller.Connect(context.Background(), transport.DefaultPortConfig("/dev/ttyACM0")); err != nil {
@@ -3084,6 +3090,7 @@ func TestControllerConsoleCommandsAndNonStatusRXRemainLoggable(t *testing.T) {
 	t.Parallel()
 
 	fake := transport.NewFakeTransport()
+	fake.SetResponding(false)
 	controller := NewController(fake, ports.StaticList(nil, nil))
 	controller.statusPollInterval = 10 * time.Second
 	if err := controller.Connect(context.Background(), transport.DefaultPortConfig("/dev/ttyACM0")); err != nil {
@@ -3115,6 +3122,7 @@ func TestControllerManualStatusClearsPendingAutomaticSuppression(t *testing.T) {
 	t.Parallel()
 
 	fake := transport.NewFakeTransport()
+	fake.SetResponding(false)
 	controller := NewController(fake, ports.StaticList(nil, nil))
 	controller.statusPollInterval = 10 * time.Second
 	if err := controller.Connect(context.Background(), transport.DefaultPortConfig("/dev/ttyACM0")); err != nil {
@@ -3143,6 +3151,7 @@ func TestControllerConsoleStatusClearsPendingAutomaticSuppression(t *testing.T) 
 	t.Parallel()
 
 	fake := transport.NewFakeTransport()
+	fake.SetResponding(false)
 	controller := NewController(fake, ports.StaticList(nil, nil))
 	controller.statusPollInterval = 10 * time.Second
 	if err := controller.Connect(context.Background(), transport.DefaultPortConfig("/dev/ttyACM0")); err != nil {
@@ -3530,6 +3539,7 @@ func TestControllerExplicitDisconnectTerminatesInteractiveMacro(t *testing.T) {
 
 func TestControllerManualWritesRejectedDuringInteractiveMacro(t *testing.T) {
 	fake := transport.NewFakeTransport()
+	fake.SetResponding(false)
 	controller := NewController(fake, nil)
 	controller.statusPollInterval = time.Hour
 	if err := controller.Connect(context.Background(), transport.DefaultPortConfig("fake")); err != nil {

@@ -28,7 +28,7 @@ func TestFakeTransport_OpenWriteCloseLifecycle(t *testing.T) {
 		t.Fatalf("connected event text = %q, want %q", got, want)
 	}
 
-	msg := NewLineMessage("?")
+	msg := NewRawMessage([]byte("?"), "?")
 	if err := f.Write(context.Background(), msg); err != nil {
 		t.Fatalf("Write() error = %v", err)
 	}
@@ -39,6 +39,10 @@ func TestFakeTransport_OpenWriteCloseLifecycle(t *testing.T) {
 	}
 	if got, want := tx.Text, msg.Display; got != want {
 		t.Fatalf("tx text = %q, want %q", got, want)
+	}
+	status := waitForTransportEvent(t, f.Events(), EventRX)
+	if got, want := status.Text, f.statusResponse; got != want {
+		t.Fatalf("automatic status response = %q, want %q", got, want)
 	}
 	if got, want := string(tx.Payload), string(msg.Payload); got != want {
 		t.Fatalf("tx payload = %q, want %q", got, want)

@@ -43,6 +43,28 @@ func waitForEStop(t *testing.T, c *Controller, source EStopSource) State {
 	})
 }
 
+func waitForOutstandingHeartbeat(t *testing.T, c *Controller) time.Time {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.RLock()
+		started := c.statusWatchdogStartedAt
+		c.mu.RUnlock()
+		if !started.IsZero() {
+			time.Sleep(2 * time.Millisecond)
+			c.mu.RLock()
+			stillOutstanding := c.statusWatchdogStartedAt == started
+			c.mu.RUnlock()
+			if stillOutstanding {
+				return started
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for an outstanding status heartbeat")
+	return time.Time{}
+}
+
 func TestStatusWatchdogHealthyControllerDoesNotFire(t *testing.T) {
 	c, fake := connectWatchdogController(t, true)
 	time.Sleep(3 * testResponseTimeout)
@@ -104,6 +126,54 @@ func TestStatusWatchdogSilentControllerEntersEStopAndKeepsPolling(t *testing.T) 
 		if ev.Kind == EventError && errors.Is(ev.Err, ErrEmergencyStop) {
 			t.Fatalf("duplicate emergency-stop error event: %+v", ev)
 		}
+	}
+}
+
+func TestStatusWatchdogWriteFailuresEnterEStopWithoutDisconnect(t *testing.T) {
+	c, fake := connectWatchdogController(t, true)
+	const timeout = 120 * time.Millisecond
+	c.mu.Lock()
+	c.controllerResponseTimeout = timeout
+	c.mu.Unlock()
+	fake.SetWriteError(errors.New("status write failed"))
+	started := waitForOutstandingHeartbeat(t, c)
+
+	time.Sleep(timeout / 3)
+	if state := c.Snapshot(); state.EStopStatus != EStopClear {
+		t.Fatalf("write error immediately entered e-stop: %+v", state)
+	}
+	state := waitForEStop(t, c, EStopSourceUnresponsive)
+	if elapsed := time.Since(started); elapsed < timeout {
+		t.Fatalf("watchdog fired after %v, before timeout %v", elapsed, timeout)
+	}
+	if state.ConnectionStatus != ConnectionConnected || !fake.IsOpen() {
+		t.Fatalf("write failure disconnected transport: state=%+v open=%v", state, fake.IsOpen())
+	}
+}
+
+func TestStatusWatchdogTransientWriteFailureRecoversBeforeDeadline(t *testing.T) {
+	c, fake := connectWatchdogController(t, true)
+	const timeout = 160 * time.Millisecond
+	c.mu.Lock()
+	c.controllerResponseTimeout = timeout
+	c.mu.Unlock()
+	fake.SetWriteError(errors.New("temporary status write failure"))
+	started := waitForOutstandingHeartbeat(t, c)
+	time.Sleep(2 * testStatusPollInterval)
+	fake.SetWriteError(nil)
+
+	waitForState(t, c, func(s State) bool {
+		c.mu.RLock()
+		responded := c.lastStatusResponseTime.After(started) && c.statusWatchdogStartedAt.IsZero()
+		c.mu.RUnlock()
+		return responded && s.EStopStatus == EStopClear
+	})
+	if remaining := time.Until(started.Add(timeout + 40*time.Millisecond)); remaining > 0 {
+		time.Sleep(remaining)
+	}
+	state := c.Snapshot()
+	if state.ConnectionStatus != ConnectionConnected || state.EStopStatus != EStopClear {
+		t.Fatalf("transient write failure latched e-stop: %+v", state)
 	}
 }
 
@@ -275,16 +345,16 @@ func TestEStopRecoveryRequiresFreshUsableStatusAndNeverResumesProgram(t *testing
 	}
 	waitForWrites(t, fake, 1)
 	fake.SetResponding(false)
-	waitForEStop(t, c, EStopSourceUnresponsive)
+	active := waitForEStop(t, c, EStopSourceUnresponsive)
+	if active.ProgramStatus != ProgramFailed || !strings.Contains(active.LastError, "emergency stop: controller stopped responding") {
+		t.Fatalf("active e-stop did not retain program failure: %+v", active)
+	}
 
 	fake.SetStatusResponse("<Alarm|MPos:0,0,0|FS:0,0>")
 	fake.SetResponding(true)
 	state := waitForState(t, c, func(s State) bool { return s.EStopStatus == EStopRecovery })
 	if state.ConnectionStatus != ConnectionConnected || state.ProgramStatus != ProgramFailed || state.EStopSource != EStopSourceUnresponsive {
 		t.Fatalf("recovery state = %+v", state)
-	}
-	if err := c.Jog(context.Background(), "X", 1, 100); !errors.Is(err, ErrEmergencyStopActive) {
-		t.Fatalf("Jog() in recovery error = %v, want ErrEmergencyStopActive", err)
 	}
 	if err := c.Action(context.Background(), grbl.ActionSoftReset); err != nil {
 		t.Fatalf("Soft Reset in recovery error = %v", err)
@@ -295,8 +365,26 @@ func TestEStopRecoveryRequiresFreshUsableStatusAndNeverResumesProgram(t *testing
 
 	fake.SetStatusResponse("<Idle|MPos:0,0,0|FS:0,0>")
 	state = waitForState(t, c, func(s State) bool { return s.EStopStatus == EStopClear })
-	if state.EStopSource != EStopSourceNone || state.ProgramStatus != ProgramFailed {
+	if state.EStopSource != EStopSourceNone || state.ProgramStatus != ProgramFailed || !strings.Contains(state.LastError, "emergency stop: controller stopped responding") {
 		t.Fatalf("cleared state = %+v", state)
+	}
+}
+
+func TestEStopRecoveryAdmission(t *testing.T) {
+	c, fake := connectWatchdogController(t, false)
+	waitForEStop(t, c, EStopSourceUnresponsive)
+	fake.SetStatusResponse("<Alarm|MPos:0,0,0>")
+	fake.SetResponding(true)
+	waitForState(t, c, func(s State) bool { return s.EStopStatus == EStopRecovery })
+
+	if err := c.Jog(context.Background(), "X", 1, 100); !errors.Is(err, ErrEmergencyStopActive) {
+		t.Fatalf("Jog() in recovery error = %v, want ErrEmergencyStopActive", err)
+	}
+	if err := c.Action(context.Background(), grbl.ActionSoftReset); err != nil {
+		t.Fatalf("Soft Reset in recovery error = %v", err)
+	}
+	if err := c.Action(context.Background(), grbl.ActionUnlock); err != nil {
+		t.Fatalf("Unlock in recovery error = %v", err)
 	}
 }
 
