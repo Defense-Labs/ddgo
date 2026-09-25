@@ -216,14 +216,14 @@ func TestSoftResetReservationBlocksReplacementOwner(t *testing.T) {
 	if !errors.Is(ownerA.Err(), ErrControllerReset) {
 		t.Fatalf("interrupted owner error = %v, want ErrControllerReset", ownerA.Err())
 	}
-	if _, err := c.beginInteractiveSession(); !errors.Is(err, ErrControllerIOActive) {
+	if _, err := c.beginInteractiveSession(context.Background()); !errors.Is(err, ErrControllerIOActive) {
 		t.Fatalf("replacement owner error = %v, want ErrControllerIOActive", err)
 	}
 	close(tr.releaseWrite)
 	if err := <-resetDone; err != nil {
 		t.Fatalf("Soft Reset error = %v", err)
 	}
-	if session, err := c.beginInteractiveSession(); err != nil {
+	if session, err := c.beginInteractiveSession(context.Background()); err != nil {
 		t.Fatalf("replacement after reset error = %v", err)
 	} else {
 		c.endInteractiveSession(session, nil)
@@ -305,7 +305,7 @@ func TestConnectAdmissionBlocksCommandsAndConcurrentConnect(t *testing.T) {
 		name string
 		fn   func() error
 	}{
-		{"interactive", func() error { _, err := c.beginInteractiveSession(); return err }},
+		{"interactive", func() error { _, err := c.beginInteractiveSession(context.Background()); return err }},
 		{"gcode", func() error { return c.SendConsoleLine(context.Background(), "G0 X1") }},
 		{"macro-like-line", func() error { return c.SendConsoleLine(context.Background(), "M103") }},
 		{"query", func() error { return c.SendConsoleLine(context.Background(), "$I") }},

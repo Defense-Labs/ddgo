@@ -85,6 +85,14 @@ const (
 	admissionDisconnect
 )
 
+type realtimeWriteOwner uint8
+
+const (
+	realtimeWriteOwnerNone realtimeWriteOwner = iota
+	realtimeWriteOwnerForeground
+	realtimeWriteOwnerStatusPoll
+)
+
 type programRun struct {
 	program    gcode.Program
 	session    *responseSession
@@ -122,6 +130,8 @@ type Controller struct {
 	connectionSettingsTimeout               time.Duration
 	realtimeWriteActive                     bool
 	realtimeWriteDone                       chan struct{}
+	realtimeWriteOwner                      realtimeWriteOwner
+	foregroundAdmissionWaiters              int
 	statusPollCancel                        context.CancelFunc
 	statusPollDone                          chan struct{}
 	statusPollInterval                      time.Duration
@@ -401,7 +411,7 @@ func (c *Controller) SendConsoleLine(ctx context.Context, text string) error {
 		engine := c.macroEngine
 		c.mu.RUnlock()
 		if commandCanBeApplicationMacro(line, engine) {
-			session, err := c.beginInteractiveSession()
+			session, err := c.beginInteractiveSession(ctx)
 			if err != nil {
 				c.emitError(err)
 				return err
@@ -432,13 +442,10 @@ func (c *Controller) writeManualResponseMessage(ctx context.Context, msg transpo
 
 func (c *Controller) writeManualResponseMessageForAdmission(ctx context.Context, msg transport.Message, request admissionKind) error {
 	session := newResponseSession(make(chan string, 1))
-	c.mu.Lock()
-	if err := c.acquireResponseOwnerForAdmissionLocked(responseOwnerManualLine, session, request); err != nil {
-		c.mu.Unlock()
+	if err := c.acquireResponseOwnerForAdmission(ctx, responseOwnerManualLine, session, request); err != nil {
 		c.emitError(err)
 		return err
 	}
-	c.mu.Unlock()
 	if err := c.transport.Write(ctx, msg); err != nil {
 		c.mu.Lock()
 		c.releaseResponseOwnerLocked(responseOwnerManualLine, session)
@@ -451,6 +458,10 @@ func (c *Controller) writeManualResponseMessageForAdmission(ctx context.Context,
 
 func (c *Controller) rejectManualWriteIfBusy() error {
 	c.mu.RLock()
+	if c.realtimeWriteActive && c.realtimeWriteOwner == realtimeWriteOwnerStatusPoll {
+		c.mu.RUnlock()
+		return nil
+	}
 	err := c.admissionErrorLocked(admissionManual)
 	c.mu.RUnlock()
 	if err != nil {
@@ -512,19 +523,16 @@ func (c *Controller) writeSpindleCommand(ctx context.Context, build func() (tran
 }
 
 func (c *Controller) StopMotion(ctx context.Context) error {
-	c.mu.Lock()
-	programActive := c.state.ProgramStatus.IsActive() || c.run != nil
-	if programActive {
-		c.mu.Unlock()
-		c.emitError(ErrProgramActive)
-		return ErrProgramActive
-	}
-	if err := c.beginRealtimeWriteLocked(); err != nil {
-		c.mu.Unlock()
+	err := c.withForegroundAdmission(ctx, func() error {
+		if c.state.ProgramStatus.IsActive() || c.run != nil {
+			return ErrProgramActive
+		}
+		return c.beginRealtimeWriteLocked()
+	})
+	if err != nil {
 		c.emitError(err)
 		return err
 	}
-	c.mu.Unlock()
 	defer c.endRealtimeWrite()
 	msg, err := grbl.BuildAction(grbl.ActionJogCancel)
 	if err != nil {
@@ -628,19 +636,29 @@ func (c *Controller) writeStatusPoll(ctx context.Context) error {
 
 func (c *Controller) writeStatusPollForGeneration(ctx context.Context, generation transport.ConnectionGeneration) error {
 	c.mu.Lock()
-	if !c.state.IsConnected() || generation == 0 || c.connectionGeneration != generation || c.statusMonitoringGeneration != generation {
-		c.mu.Unlock()
-		return nil
-	}
-	if err := c.beginRealtimeWriteForAdmissionLocked(admissionStatusPoll); err != nil {
-		c.mu.Unlock()
+	admitted, err := c.beginStatusPollForGenerationLocked(generation, admissionStatusPoll)
+	c.mu.Unlock()
+	if err != nil || !admitted {
 		return err
+	}
+	return c.writeAdmittedStatusPoll(ctx, generation)
+}
+
+func (c *Controller) beginStatusPollForGenerationLocked(generation transport.ConnectionGeneration, request admissionKind) (bool, error) {
+	if !c.state.IsConnected() || generation == 0 || c.connectionGeneration != generation || c.statusMonitoringGeneration != generation {
+		return false, nil
+	}
+	if err := c.beginRealtimeWriteForAdmissionLocked(request); err != nil {
+		return false, err
 	}
 	c.pendingQuietStatusReports++
 	if c.statusWatchdogStartedAt.IsZero() {
 		c.statusWatchdogStartedAt = c.now()
 	}
-	c.mu.Unlock()
+	return true, nil
+}
+
+func (c *Controller) writeAdmittedStatusPoll(ctx context.Context, generation transport.ConnectionGeneration) error {
 	defer c.endRealtimeWrite()
 	msg, err := grbl.BuildAction(grbl.ActionStatus)
 	if err != nil {
@@ -665,25 +683,41 @@ func (c *Controller) writeStatusPollForGeneration(ctx context.Context, generatio
 		if errors.Is(err, transport.ErrNotOpen) {
 			return nil
 		}
-		// Quiet polling leaves ordinary write-error reporting to transports that
-		// emit EventError. The health watchdog provides the single meaningful
-		// controller-level failure if valid status responses do not resume.
+		// Quiet heartbeat write failures are intentionally not surfaced directly.
+		// The watchdog owns the controller-level unresponsive failure if valid
+		// status responses do not resume.
 		return err
 	}
 	return nil
 }
 
 func (c *Controller) writeStatusPollWhenAvailable(ctx context.Context) error {
-	for {
-		err := c.writeStatusPoll(ctx)
-		if !errors.Is(err, ErrControllerIOActive) {
-			return err
+	if err := c.beginForegroundAdmission(ctx); err != nil {
+		return err
+	}
+	registered := true
+	defer func() {
+		if registered {
+			c.endForegroundAdmission()
 		}
-		c.mu.RLock()
+	}()
+	for {
+		c.mu.Lock()
+		generation := c.connectionGeneration
+		admitted, err := c.beginStatusPollForGenerationLocked(generation, admissionRealtime)
+		if err == nil {
+			c.endForegroundAdmissionLocked()
+			registered = false
+			c.mu.Unlock()
+			if !admitted {
+				return nil
+			}
+			return c.writeAdmittedStatusPoll(ctx, generation)
+		}
 		done := c.realtimeWriteDone
-		c.mu.RUnlock()
-		if done == nil {
-			continue
+		c.mu.Unlock()
+		if !errors.Is(err, ErrControllerIOActive) || done == nil {
+			return err
 		}
 		select {
 		case <-ctx.Done():
@@ -726,19 +760,20 @@ func (c *Controller) Action(ctx context.Context, action grbl.Action) error {
 		return err
 	}
 	if action == grbl.ActionSoftReset {
-		c.mu.Lock()
-		request := admissionRealtime
-		if c.state.EStopStatus == EStopRecovery {
-			request = admissionRecoveryRealtime
-		}
-		err = c.beginRealtimeWriteForAdmissionLocked(request)
-		if err == nil {
-			err = c.prepareSoftResetLocked()
-			if err != nil {
-				c.endRealtimeWriteLocked()
+		err = c.withForegroundAdmission(ctx, func() error {
+			request := admissionRealtime
+			if c.state.EStopStatus == EStopRecovery {
+				request = admissionRecoveryRealtime
 			}
-		}
-		c.mu.Unlock()
+			if err := c.beginRealtimeWriteForAdmissionLocked(request); err != nil {
+				return err
+			}
+			if err := c.prepareSoftResetLocked(); err != nil {
+				c.endRealtimeWriteLocked()
+				return err
+			}
+			return nil
+		})
 		if err != nil {
 			c.emitError(err)
 			return err
@@ -765,6 +800,10 @@ func (c *Controller) beginRealtimeWriteForAdmissionLocked(request admissionKind)
 	}
 	c.realtimeWriteActive = true
 	c.realtimeWriteDone = make(chan struct{})
+	c.realtimeWriteOwner = realtimeWriteOwnerForeground
+	if request == admissionStatusPoll {
+		c.realtimeWriteOwner = realtimeWriteOwnerStatusPoll
+	}
 	return nil
 }
 
@@ -775,6 +814,7 @@ func (c *Controller) endRealtimeWriteLocked() {
 	done := c.realtimeWriteDone
 	c.realtimeWriteActive = false
 	c.realtimeWriteDone = nil
+	c.realtimeWriteOwner = realtimeWriteOwnerNone
 	close(done)
 }
 
@@ -785,13 +825,10 @@ func (c *Controller) endRealtimeWrite() {
 }
 
 func (c *Controller) writeRealtimeMessage(ctx context.Context, msg transport.Message) error {
-	c.mu.Lock()
-	if err := c.beginRealtimeWriteLocked(); err != nil {
-		c.mu.Unlock()
+	if err := c.withForegroundAdmission(ctx, c.beginRealtimeWriteLocked); err != nil {
 		c.emitError(err)
 		return err
 	}
-	c.mu.Unlock()
 	defer c.endRealtimeWrite()
 	if err := c.transport.Write(ctx, msg); err != nil {
 		c.emitError(err)
@@ -857,61 +894,56 @@ func (c *Controller) LoadProgramFile(path string) error {
 }
 
 func (c *Controller) StartProgram(ctx context.Context) error {
-	c.mu.Lock()
-	if err := c.admissionErrorLocked(admissionRealtime); err != nil {
-		c.mu.Unlock()
+	var (
+		run      *programRun
+		runCtx   context.Context
+		snapshot versionedState
+	)
+	err := c.withForegroundAdmission(ctx, func() error {
+		if err := c.admissionErrorLocked(admissionRealtime); err != nil {
+			return err
+		}
+		if c.run != nil || c.state.ProgramStatus.IsActive() {
+			return errors.New("program is already running")
+		}
+		if err := c.admissionErrorLocked(admissionProgram); err != nil {
+			return err
+		}
+		if !c.state.IsConnected() {
+			return errors.New("connect to a machine before starting a program")
+		}
+		if len(c.loaded.Lines) == 0 {
+			return errors.New("load a program before starting")
+		}
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithCancel(ctx)
+		if err := runCtx.Err(); err != nil {
+			cancel()
+			return err
+		}
+		run = &programRun{
+			program:    c.loaded,
+			rxCh:       make(chan string, 64),
+			cancel:     cancel,
+			generation: c.connectionGeneration,
+		}
+		run.session = newResponseSession(run.rxCh)
+		if err := c.acquireResponseOwnerLocked(responseOwnerProgram, run.session); err != nil {
+			cancel()
+			return err
+		}
+		c.run = run
+		c.state.ProgramStatus = ProgramRunning
+		c.state.ProgramComplete = 0
+		c.state.LastError = ""
+		c.contour.Disable()
+		snapshot = c.captureEventStateLocked()
+		return nil
+	})
+	if err != nil {
 		c.emitError(err)
 		return err
 	}
-	if c.run != nil || c.state.ProgramStatus.IsActive() {
-		c.mu.Unlock()
-		err := errors.New("program is already running")
-		c.emitError(err)
-		return err
-	}
-	if err := c.admissionErrorLocked(admissionProgram); err != nil {
-		c.mu.Unlock()
-		c.emitError(err)
-		return err
-	}
-	if !c.state.IsConnected() {
-		c.mu.Unlock()
-		err := errors.New("connect to a machine before starting a program")
-		c.emitError(err)
-		return err
-	}
-	if len(c.loaded.Lines) == 0 {
-		c.mu.Unlock()
-		err := errors.New("load a program before starting")
-		c.emitError(err)
-		return err
-	}
-	runCtx, cancel := context.WithCancel(ctx)
-	if err := runCtx.Err(); err != nil {
-		cancel()
-		c.mu.Unlock()
-		c.emitError(err)
-		return err
-	}
-	run := &programRun{
-		program:    c.loaded,
-		rxCh:       make(chan string, 64),
-		cancel:     cancel,
-		generation: c.connectionGeneration,
-	}
-	run.session = newResponseSession(run.rxCh)
-	if err := c.acquireResponseOwnerLocked(responseOwnerProgram, run.session); err != nil {
-		c.mu.Unlock()
-		c.emitError(err)
-		return err
-	}
-	c.run = run
-	c.state.ProgramStatus = ProgramRunning
-	c.state.ProgramComplete = 0
-	c.state.LastError = ""
-	c.contour.Disable()
-	snapshot := c.captureEventStateLocked()
-	c.mu.Unlock()
 
 	c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: snapshot.state, StateRevision: snapshot.revision, Text: fmt.Sprintf("started program %s", run.program.Name)}
 	go c.runProgram(runCtx, run)
@@ -969,24 +1001,28 @@ func (c *Controller) ResumeProgram(ctx context.Context) error {
 }
 
 func (c *Controller) StopProgram(ctx context.Context) error {
-	c.mu.Lock()
-	run := c.run
-	if run == nil {
-		c.mu.Unlock()
-		err := errors.New("program is not running")
+	var (
+		run      *programRun
+		snapshot versionedState
+	)
+	err := c.withForegroundAdmission(ctx, func() error {
+		run = c.run
+		if run == nil {
+			return errors.New("program is not running")
+		}
+		if err := c.beginRealtimeWriteLocked(); err != nil {
+			return err
+		}
+		c.run = nil
+		c.releaseResponseOwnerLocked(responseOwnerProgram, run.responseSession())
+		c.state.ProgramStatus = ProgramStopped
+		snapshot = c.captureEventStateLocked()
+		return nil
+	})
+	if err != nil {
 		c.emitError(err)
 		return err
 	}
-	if err := c.beginRealtimeWriteLocked(); err != nil {
-		c.mu.Unlock()
-		c.emitError(err)
-		return err
-	}
-	c.run = nil
-	c.releaseResponseOwnerLocked(responseOwnerProgram, run.responseSession())
-	c.state.ProgramStatus = ProgramStopped
-	snapshot := c.captureEventStateLocked()
-	c.mu.Unlock()
 	defer c.endRealtimeWrite()
 
 	run.cancel()

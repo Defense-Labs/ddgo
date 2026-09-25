@@ -149,14 +149,14 @@ func TestControllerSoftResetWriteFailureLeavesInteractiveCanceled(t *testing.T) 
 
 func TestControllerResetCanceledSessionCleanupIsIdentitySafe(t *testing.T) {
 	c, _ := newConnectedResetController(t)
-	a, err := c.beginInteractiveSession()
+	a, err := c.beginInteractiveSession(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := func() error { c.mu.Lock(); defer c.mu.Unlock(); return c.prepareSoftResetLocked() }(); err != nil {
 		t.Fatal(err)
 	}
-	b, err := c.beginInteractiveSession()
+	b, err := c.beginInteractiveSession(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

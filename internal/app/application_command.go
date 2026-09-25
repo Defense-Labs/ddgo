@@ -60,14 +60,18 @@ func (c *Controller) executeApplicationCommand(ctx context.Context, runtime macr
 	return nil
 }
 
-func (c *Controller) beginInteractiveSession() (*responseSession, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *Controller) beginInteractiveSession(ctx context.Context) (*responseSession, error) {
 	session := newResponseSession(make(chan string, 64))
-	if err := c.acquireResponseOwnerLocked(responseOwnerInteractiveMacro, session); err != nil {
+	if err := c.acquireResponseOwnerForAdmission(ctx, responseOwnerInteractiveMacro, session, admissionInteractive); err != nil {
 		return nil, err
 	}
 	return session, nil
+}
+
+func (c *Controller) acquireResponseOwnerForAdmission(ctx context.Context, kind responseOwnerKind, session *responseSession, request admissionKind) error {
+	return c.withForegroundAdmission(ctx, func() error {
+		return c.acquireResponseOwnerForAdmissionLocked(kind, session, request)
+	})
 }
 
 func (c *Controller) acquireResponseOwnerLocked(kind responseOwnerKind, session *responseSession) error {
@@ -91,6 +95,64 @@ func (c *Controller) acquireResponseOwnerForAdmissionLocked(kind responseOwnerKi
 	return nil
 }
 
+// beginForegroundAdmission gives foreground work priority over automatic
+// status polling while it acquires controller admission. The waiter remains
+// registered after an active poll finishes so the next poll cannot jump ahead.
+func (c *Controller) beginForegroundAdmission(ctx context.Context) error {
+	c.mu.Lock()
+	c.foregroundAdmissionWaiters++
+	for {
+		if !c.realtimeWriteActive || c.realtimeWriteOwner != realtimeWriteOwnerStatusPoll {
+			c.mu.Unlock()
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			c.endForegroundAdmissionLocked()
+			c.mu.Unlock()
+			return err
+		}
+		done := c.realtimeWriteDone
+		c.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			c.mu.Lock()
+			c.endForegroundAdmissionLocked()
+			c.mu.Unlock()
+			return ctx.Err()
+		case <-done:
+		}
+		c.mu.Lock()
+		if err := ctx.Err(); err != nil {
+			c.endForegroundAdmissionLocked()
+			c.mu.Unlock()
+			return err
+		}
+	}
+}
+
+func (c *Controller) endForegroundAdmissionLocked() {
+	if c.foregroundAdmissionWaiters <= 0 {
+		panic("foreground admission waiter underflow")
+	}
+	c.foregroundAdmissionWaiters--
+}
+
+func (c *Controller) endForegroundAdmission() {
+	c.mu.Lock()
+	c.endForegroundAdmissionLocked()
+	c.mu.Unlock()
+}
+
+func (c *Controller) withForegroundAdmission(ctx context.Context, acquire func() error) error {
+	if err := c.beginForegroundAdmission(ctx); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	defer c.endForegroundAdmissionLocked()
+	return acquire()
+}
+
 // admissionErrorLocked is the single admission policy for lifecycle changes,
 // response-owning commands, and realtime operations. c.mu must be held.
 func (c *Controller) admissionErrorLocked(request admissionKind) error {
@@ -107,6 +169,9 @@ func (c *Controller) admissionErrorLocked(request admissionKind) error {
 		default:
 			return ErrEmergencyStopActive
 		}
+	}
+	if request == admissionStatusPoll && c.foregroundAdmissionWaiters > 0 {
+		return ErrControllerIOActive
 	}
 	if c.realtimeWriteActive {
 		// Disconnect first claims its transition and then drains the admitted
