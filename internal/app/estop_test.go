@@ -194,32 +194,6 @@ func TestStatusWatchdogTransientWriteFailureRecoversBeforeDeadline(t *testing.T)
 	}
 }
 
-func TestControllerTransportErrorSuppressLogPolicy(t *testing.T) {
-	c, fake := connectWatchdogController(t, true)
-	generation := fake.Generation()
-	originalLastError := c.Snapshot().LastError
-	quietErr := errors.New("quiet heartbeat write failed")
-	fake.InjectErrorWithSuppressLogForGeneration(generation, quietErr, true)
-	for _, event := range collectEventsFor(c.Events(), noExtraLifecycleEventWindow) {
-		if event.Kind == EventError && errors.Is(event.Err, quietErr) {
-			t.Fatalf("suppressed transport error became app error: %+v", event)
-		}
-	}
-	if got := c.Snapshot().LastError; got != originalLastError {
-		t.Fatalf("LastError after suppressed transport error = %q, want %q", got, originalLastError)
-	}
-
-	visibleErr := errors.New("manual write failed")
-	fake.InjectErrorWithSuppressLogForGeneration(generation, visibleErr, false)
-	event := waitForEvent(t, c.Events(), EventError)
-	if !errors.Is(event.Err, visibleErr) {
-		t.Fatalf("visible EventError = %v, want %v", event.Err, visibleErr)
-	}
-	if got := c.Snapshot().LastError; got != visibleErr.Error() {
-		t.Fatalf("LastError after visible transport error = %q, want %q", got, visibleErr)
-	}
-}
-
 func TestStatusWatchdogFailsRunningAndPausedPrograms(t *testing.T) {
 	for _, paused := range []bool{false, true} {
 		name := "running"

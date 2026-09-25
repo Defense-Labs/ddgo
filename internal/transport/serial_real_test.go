@@ -5,7 +5,6 @@ package transport
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -80,30 +79,18 @@ func (p *scriptedSerialPort) Write(payload []byte) (int, error) {
 	return len(payload), nil
 }
 
-func TestSerialTransportWriteErrorPreservesSuppressLog(t *testing.T) {
-	for _, suppressLog := range []bool{false, true} {
-		t.Run(fmt.Sprintf("suppress_%t", suppressLog), func(t *testing.T) {
-			port := newScriptedSerialPort()
-			boom := errors.New("write failed")
-			port.writeErr = boom
-			tr := newTestSerialTransport(port)
+func TestSerialTransportSynchronousWriteErrorDoesNotEmitEvent(t *testing.T) {
+	port := newScriptedSerialPort()
+	boom := errors.New("write failed")
+	port.writeErr = boom
+	tr := newTestSerialTransport(port)
 
-			msg := NewRawMessage([]byte("?"), "?")
-			msg.SuppressLog = suppressLog
-			if err := tr.Write(context.Background(), msg); !errors.Is(err, boom) {
-				t.Fatalf("Write() error = %v, want %v", err, boom)
-			}
-			event := waitForNextSerialTransportEvent(t, tr.events)
-			if event.Kind != EventError || !errors.Is(event.Err, boom) {
-				t.Fatalf("write-error event = %+v", event)
-			}
-			if event.SuppressLog != suppressLog {
-				t.Fatalf("SuppressLog = %v, want %v", event.SuppressLog, suppressLog)
-			}
-			if err := tr.Close(); err != nil {
-				t.Fatalf("Close() error = %v", err)
-			}
-		})
+	if err := tr.Write(context.Background(), NewRawMessage([]byte("?"), "?")); !errors.Is(err, boom) {
+		t.Fatalf("Write() error = %v, want %v", err, boom)
+	}
+	assertNoTransportEvent(t, tr.events, noUnexpectedTransportEventWindow)
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
 	}
 }
 

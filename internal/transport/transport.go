@@ -66,6 +66,9 @@ type Event struct {
 type Transport interface {
 	Open(ctx context.Context, cfg PortConfig) (ConnectionGeneration, error)
 	Close() error
+	// Write returns synchronous failures directly. Implementations must not
+	// also emit EventError for the same failure; EventError is reserved for
+	// asynchronous transport failures.
 	Write(ctx context.Context, msg Message) error
 	Events() <-chan Event
 }
