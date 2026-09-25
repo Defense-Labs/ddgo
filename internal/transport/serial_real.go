@@ -112,7 +112,7 @@ func (t *SerialTransport) Write(ctx context.Context, msg Message) error {
 		}
 		n, err := port.Write(msg.Payload)
 		if err != nil {
-			t.events <- Event{Kind: EventError, Generation: generation, When: time.Now(), Err: err}
+			t.events <- Event{Kind: EventError, Generation: generation, When: time.Now(), Err: err, SuppressLog: suppressLog}
 			return err
 		}
 		msg.Payload = msg.Payload[n:]

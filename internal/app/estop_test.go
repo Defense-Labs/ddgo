@@ -149,6 +149,23 @@ func TestStatusWatchdogWriteFailuresEnterEStopWithoutDisconnect(t *testing.T) {
 	if state.ConnectionStatus != ConnectionConnected || !fake.IsOpen() {
 		t.Fatalf("write failure disconnected transport: state=%+v open=%v", state, fake.IsOpen())
 	}
+	wantLastError := state.LastError
+	events := collectEventsFor(c.Events(), 6*testStatusPollInterval)
+	emergencyStopErrors := 0
+	for _, event := range events {
+		if event.Kind == EventError {
+			if !errors.Is(event.Err, ErrEmergencyStop) {
+				t.Fatalf("quiet heartbeat write surfaced raw error: %+v", event)
+			}
+			emergencyStopErrors++
+		}
+	}
+	if emergencyStopErrors != 1 {
+		t.Fatalf("emergency-stop error events = %d, want 1; events=%+v", emergencyStopErrors, events)
+	}
+	if got := c.Snapshot().LastError; got != wantLastError || !strings.Contains(got, "emergency stop: controller stopped responding") {
+		t.Fatalf("LastError after continued failed polls = %q, want %q", got, wantLastError)
+	}
 }
 
 func TestStatusWatchdogTransientWriteFailureRecoversBeforeDeadline(t *testing.T) {
@@ -172,8 +189,34 @@ func TestStatusWatchdogTransientWriteFailureRecoversBeforeDeadline(t *testing.T)
 		time.Sleep(remaining)
 	}
 	state := c.Snapshot()
-	if state.ConnectionStatus != ConnectionConnected || state.EStopStatus != EStopClear {
+	if state.ConnectionStatus != ConnectionConnected || state.EStopStatus != EStopClear || state.LastError != "" {
 		t.Fatalf("transient write failure latched e-stop: %+v", state)
+	}
+}
+
+func TestControllerTransportErrorSuppressLogPolicy(t *testing.T) {
+	c, fake := connectWatchdogController(t, true)
+	generation := fake.Generation()
+	originalLastError := c.Snapshot().LastError
+	quietErr := errors.New("quiet heartbeat write failed")
+	fake.InjectErrorWithSuppressLogForGeneration(generation, quietErr, true)
+	for _, event := range collectEventsFor(c.Events(), noExtraLifecycleEventWindow) {
+		if event.Kind == EventError && errors.Is(event.Err, quietErr) {
+			t.Fatalf("suppressed transport error became app error: %+v", event)
+		}
+	}
+	if got := c.Snapshot().LastError; got != originalLastError {
+		t.Fatalf("LastError after suppressed transport error = %q, want %q", got, originalLastError)
+	}
+
+	visibleErr := errors.New("manual write failed")
+	fake.InjectErrorWithSuppressLogForGeneration(generation, visibleErr, false)
+	event := waitForEvent(t, c.Events(), EventError)
+	if !errors.Is(event.Err, visibleErr) {
+		t.Fatalf("visible EventError = %v, want %v", event.Err, visibleErr)
+	}
+	if got := c.Snapshot().LastError; got != visibleErr.Error() {
+		t.Fatalf("LastError after visible transport error = %q, want %q", got, visibleErr)
 	}
 }
 

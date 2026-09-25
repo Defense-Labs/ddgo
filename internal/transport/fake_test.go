@@ -109,11 +109,38 @@ func TestFakeTransport_ConfiguredErrors(t *testing.T) {
 	if err := f.Write(context.Background(), NewLineMessage("G0 X1")); !errors.Is(err, writeErr) {
 		t.Fatalf("Write() error = %v, want %v", err, writeErr)
 	}
+	writeEvent := waitForTransportEvent(t, f.Events(), EventError)
+	if !errors.Is(writeEvent.Err, writeErr) || writeEvent.SuppressLog {
+		t.Fatalf("normal write-error event = %+v", writeEvent)
+	}
 
 	closeErr := errors.New("close failed")
 	f.SetCloseError(closeErr)
 	if err := f.Close(); !errors.Is(err, closeErr) {
 		t.Fatalf("Close() error = %v, want %v", err, closeErr)
+	}
+}
+
+func TestFakeTransport_QuietWriteErrorPreservesSuppressLog(t *testing.T) {
+	t.Parallel()
+
+	f := NewFakeTransport()
+	if _, err := f.Open(context.Background(), DefaultPortConfig("/dev/ttyACM0")); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	writeErr := errors.New("quiet write failed")
+	f.SetWriteError(writeErr)
+	msg := NewRawMessage([]byte("?"), "?")
+	msg.SuppressLog = true
+	if err := f.Write(context.Background(), msg); !errors.Is(err, writeErr) {
+		t.Fatalf("Write() error = %v, want %v", err, writeErr)
+	}
+	event := waitForTransportEvent(t, f.Events(), EventError)
+	if !errors.Is(event.Err, writeErr) || !event.SuppressLog {
+		t.Fatalf("quiet write-error event = %+v", event)
+	}
+	if !f.IsOpen() {
+		t.Fatal("write error closed fake transport")
 	}
 }
 

@@ -1583,7 +1583,7 @@ func (c *Controller) runTransportEventBridge() {
 			}
 			accepted := c.acceptsTransportEventLocked(ev)
 			c.mu.Unlock()
-			if !accepted {
+			if !accepted || ev.SuppressLog {
 				continue
 			}
 			c.emitError(ev.Err)

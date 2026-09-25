@@ -5,6 +5,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -45,9 +46,10 @@ type scriptedSerialPort struct {
 	readCh  chan scriptedRead
 	writeCh chan []byte
 
-	mu     sync.Mutex
-	closed bool
-	once   sync.Once
+	mu       sync.Mutex
+	closed   bool
+	writeErr error
+	once     sync.Once
 }
 
 func newScriptedSerialPort() *scriptedSerialPort {
@@ -67,9 +69,42 @@ func (p *scriptedSerialPort) Read(buf []byte) (int, error) {
 }
 
 func (p *scriptedSerialPort) Write(payload []byte) (int, error) {
+	p.mu.Lock()
+	err := p.writeErr
+	p.mu.Unlock()
+	if err != nil {
+		return 0, err
+	}
 	cp := append([]byte(nil), payload...)
 	p.writeCh <- cp
 	return len(payload), nil
+}
+
+func TestSerialTransportWriteErrorPreservesSuppressLog(t *testing.T) {
+	for _, suppressLog := range []bool{false, true} {
+		t.Run(fmt.Sprintf("suppress_%t", suppressLog), func(t *testing.T) {
+			port := newScriptedSerialPort()
+			boom := errors.New("write failed")
+			port.writeErr = boom
+			tr := newTestSerialTransport(port)
+
+			msg := NewRawMessage([]byte("?"), "?")
+			msg.SuppressLog = suppressLog
+			if err := tr.Write(context.Background(), msg); !errors.Is(err, boom) {
+				t.Fatalf("Write() error = %v, want %v", err, boom)
+			}
+			event := waitForNextSerialTransportEvent(t, tr.events)
+			if event.Kind != EventError || !errors.Is(event.Err, boom) {
+				t.Fatalf("write-error event = %+v", event)
+			}
+			if event.SuppressLog != suppressLog {
+				t.Fatalf("SuppressLog = %v, want %v", event.SuppressLog, suppressLog)
+			}
+			if err := tr.Close(); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+		})
+	}
 }
 
 func (p *scriptedSerialPort) Close() error {

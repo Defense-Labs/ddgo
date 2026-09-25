@@ -107,6 +107,14 @@ func (f *FakeTransport) Write(_ context.Context, msg Message) error {
 		return ErrNotOpen
 	}
 	if f.writeErr != nil {
+		f.events <- Event{
+			Kind:        EventError,
+			Generation:  f.generation,
+			When:        time.Now(),
+			Err:         f.writeErr,
+			Text:        f.writeErr.Error(),
+			SuppressLog: msg.SuppressLog,
+		}
 		return f.writeErr
 	}
 	handshake := f.handshakeOpen && msg.Display == "$$"
@@ -155,7 +163,13 @@ func (f *FakeTransport) InjectError(err error) {
 }
 
 func (f *FakeTransport) InjectErrorForGeneration(generation ConnectionGeneration, err error) {
-	f.events <- Event{Kind: EventError, Generation: generation, When: time.Now(), Err: err, Text: err.Error()}
+	f.InjectErrorWithSuppressLogForGeneration(generation, err, false)
+}
+
+// InjectErrorWithSuppressLogForGeneration emits a generation-tagged transport
+// error with the same logging policy carried by real write-error events.
+func (f *FakeTransport) InjectErrorWithSuppressLogForGeneration(generation ConnectionGeneration, err error, suppressLog bool) {
+	f.events <- Event{Kind: EventError, Generation: generation, When: time.Now(), Err: err, Text: err.Error(), SuppressLog: suppressLog}
 }
 
 func (f *FakeTransport) InjectDisconnected() {
