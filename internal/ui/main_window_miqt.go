@@ -63,6 +63,7 @@ type MainWindow struct {
 	resumeActBtn      *qt.QPushButton
 	statusButton      *qt.QPushButton
 	connStatus        *qt.QLabel
+	safetyStatus      *qt.QLabel
 	machineStatus     *qt.QLabel
 	machinePos        *qt.QLabel
 	workPos           *qt.QLabel
@@ -315,6 +316,7 @@ func (w *MainWindow) build() {
 	statusGroup := groupBox("Status")
 	rowActionsStatusLayout.AddWidget2(statusGroup.QWidget, 1)
 	w.connStatus = qt.NewQLabel(nil)
+	w.safetyStatus = qt.NewQLabel(nil)
 	w.machineStatus = qt.NewQLabel(nil)
 	w.machinePos = qt.NewQLabel(nil)
 	w.workPos = qt.NewQLabel(nil)
@@ -322,7 +324,7 @@ func (w *MainWindow) build() {
 	w.programStatus = qt.NewQLabel(nil)
 	w.programProgress = qt.NewQLabel(nil)
 	w.lastErrorLabel = qt.NewQLabel(nil)
-	for _, lbl := range []*qt.QLabel{w.connStatus, w.machineStatus, w.machinePos, w.workPos, w.feedSpindle, w.programStatus, w.programProgress, w.lastErrorLabel} {
+	for _, lbl := range []*qt.QLabel{w.connStatus, w.safetyStatus, w.machineStatus, w.machinePos, w.workPos, w.feedSpindle, w.programStatus, w.programProgress, w.lastErrorLabel} {
 		statusGroup.Layout().AddWidget(lbl.QWidget)
 	}
 
@@ -600,6 +602,18 @@ func (w *MainWindow) applyState(state app.State) {
 		w.connStatus.SetText("Connection: disconnected")
 		w.connectButton.SetText("Connect")
 	}
+	switch state.EStopStatus {
+	case app.EStopActive:
+		if state.EStopSource == app.EStopSourceAlarm50 {
+			w.safetyStatus.SetText("Safety: E-STOP — controller reported emergency stop")
+		} else {
+			w.safetyStatus.SetText("Safety: E-STOP — controller not responding")
+		}
+	case app.EStopRecovery:
+		w.safetyStatus.SetText("Safety: E-STOP — controller responding; reset/unlock required")
+	default:
+		w.safetyStatus.SetText("Safety: ready")
+	}
 	machine := state.MachineState
 	if machine == "" {
 		machine = "unknown"
@@ -635,9 +649,11 @@ func (w *MainWindow) applyState(state app.State) {
 
 	programActive := state.ProgramStatus.IsActive()
 	connected := state.IsConnected()
+	safetyClear := state.EStopStatus == app.EStopClear
+	recovering := state.EStopStatus == app.EStopRecovery
 	loaded := state.ProgramTotal > 0
-	canManual := connected && !programActive
-	canRun := connected && loaded && !programActive
+	canManual := connected && safetyClear && !programActive
+	canRun := connected && safetyClear && loaded && !programActive
 
 	w.refreshButton.SetEnabled(!programActive)
 	w.connectButton.SetEnabled(!programActive && !state.IsConnecting())
@@ -656,9 +672,11 @@ func (w *MainWindow) applyState(state app.State) {
 	for _, input := range []*qt.QLineEdit{w.xTravel, w.yTravel, w.zTravel} {
 		input.SetEnabled(canManual)
 	}
-	for _, btn := range []*qt.QPushButton{w.jogXPButton, w.jogXMButton, w.jogYPButton, w.jogYMButton, w.jogZPButton, w.jogZMButton, w.unlockButton, w.homeButton, w.resetButton, w.holdButton, w.resumeActBtn, w.statusButton} {
+	for _, btn := range []*qt.QPushButton{w.jogXPButton, w.jogXMButton, w.jogYPButton, w.jogYMButton, w.jogZPButton, w.jogZMButton, w.homeButton, w.holdButton, w.resumeActBtn, w.statusButton} {
 		btn.SetEnabled(canManual)
 	}
+	w.unlockButton.SetEnabled(canManual || (connected && recovering && !programActive))
+	w.resetButton.SetEnabled(canManual || (connected && recovering && !programActive))
 	canJogToEnd := canManual && state.HasMachinePosition
 	for _, btn := range []*qt.QPushButton{w.jogToXPButton, w.jogToXMButton, w.jogToYPButton, w.jogToYMButton, w.jogToZPButton, w.jogToZMButton} {
 		btn.SetEnabled(canJogToEnd)

@@ -22,6 +22,16 @@ The controller owns status-poll cancellation and waits for the polling goroutine
 
 Connection establishment has an explicit public lifecycle: `disconnected -> connecting -> connected`. The `connecting` phase covers opening the transport, observing a GRBL startup banner, allowing startup output to settle, and validating a `$$` settings response. The physical transport generation is committed and normal status polling begins only after that initialization succeeds.
 
+## Controller health and emergency stop
+
+A transport disconnect and a connected-but-unresponsive controller are separate states. Loss of the serial transport follows normal disconnect cleanup. While the transport remains open, controller-owned `?` polling runs every 500 ms and valid parsed realtime status reports act as the heartbeat. Once at least one status request has been issued, roughly two seconds without a valid status response enters the explicit e-stop state while keeping the connection and its transport generation committed. A parsed `ALARM:50` enters the same state immediately; other GRBL alarm codes do not.
+
+Entering e-stop cancels the current response session, fails and cancels active or paused program work, disables contour execution, and invalidates cached machine position, work position, offset, feed, spindle, and status telemetry. Ordinary machine commands are rejected by controller admission while e-stop is active. Status probing continues independently so a command goroutine blocked waiting for `ok` cannot prevent timeout detection. A fresh valid status proves that communication recovered: an `Alarm` or other non-Idle status advances to recovery, where reset and unlock are allowed, while a fresh `Idle` status clears the e-stop state. A failed program is never resumed automatically.
+
+The watchdog and all health transitions are tied to the exact committed transport generation, so delayed activity from an older connection cannot affect a replacement connection. A real transport disconnect clears e-stop state and wins any race with watchdog detection. Serial writes remain synchronous at the transport boundary; the watchdog can still update controller state while a write is blocked, although an operating-system write that never returns can delay that writer's cleanup and an explicit disconnect waiting for its I/O reservation.
+
+The behavior is informed by the legacy research in [`docs/ddcut estop detection temp reference.md`](ddcut%20estop%20detection%20temp%20reference.md), without adopting DDCut's synchronous response-loop timeout design or its manual-operation timeout exception.
+
 ## Program execution
 
 Current program execution flow:

@@ -77,6 +77,10 @@ func (c *Controller) acquireResponseOwnerLocked(kind responseOwnerKind, session 
 	} else if kind == responseOwnerInteractiveMacro {
 		request = admissionInteractive
 	}
+	return c.acquireResponseOwnerForAdmissionLocked(kind, session, request)
+}
+
+func (c *Controller) acquireResponseOwnerForAdmissionLocked(kind responseOwnerKind, session *responseSession, request admissionKind) error {
 	if err := c.admissionErrorLocked(request); err != nil {
 		return err
 	}
@@ -92,6 +96,17 @@ func (c *Controller) acquireResponseOwnerLocked(kind responseOwnerKind, session 
 func (c *Controller) admissionErrorLocked(request admissionKind) error {
 	if c.connectionTransition != connectionStable {
 		return ErrConnectionTransition
+	}
+	if c.state.EStopStatus != EStopClear {
+		switch request {
+		case admissionDisconnect, admissionStatusPoll, admissionConnect:
+		case admissionRecoveryManual, admissionRecoveryRealtime:
+			if c.state.EStopStatus != EStopRecovery {
+				return ErrEmergencyStopActive
+			}
+		default:
+			return ErrEmergencyStopActive
+		}
 	}
 	if c.realtimeWriteActive {
 		// Disconnect first claims its transition and then drains the admitted
@@ -116,7 +131,7 @@ func (c *Controller) admissionErrorLocked(request admissionKind) error {
 		}
 		return nil
 	}
-	if request == admissionRealtime {
+	if request == admissionRealtime || request == admissionStatusPoll || request == admissionRecoveryRealtime {
 		return nil
 	}
 	requested := responseOwnerManualLine

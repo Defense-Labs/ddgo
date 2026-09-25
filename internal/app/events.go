@@ -15,6 +15,10 @@ type ProgramStatus string
 
 type ConnectionStatus string
 
+type EStopStatus string
+
+type EStopSource string
+
 const (
 	EventStateChanged   EventKind = "state_changed"
 	EventPortsRefreshed EventKind = "ports_refreshed"
@@ -27,6 +31,18 @@ const (
 	ConnectionDisconnected ConnectionStatus = "disconnected"
 	ConnectionConnecting   ConnectionStatus = "connecting"
 	ConnectionConnected    ConnectionStatus = "connected"
+)
+
+const (
+	EStopClear    EStopStatus = "clear"
+	EStopActive   EStopStatus = "active"
+	EStopRecovery EStopStatus = "recovery"
+)
+
+const (
+	EStopSourceNone         EStopSource = ""
+	EStopSourceAlarm50      EStopSource = "alarm50"
+	EStopSourceUnresponsive EStopSource = "unresponsive"
 )
 
 const (
@@ -50,6 +66,8 @@ func (s ProgramStatus) IsActive() bool {
 
 type State struct {
 	ConnectionStatus        ConnectionStatus
+	EStopStatus             EStopStatus
+	EStopSource             EStopSource
 	PortName                string
 	MachineState            string
 	MachinePosition         [3]float64

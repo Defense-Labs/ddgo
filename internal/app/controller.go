@@ -27,6 +27,8 @@ var ErrConnectionTransition = errors.New("connection transition in progress")
 var ErrAlreadyConnected = errors.New("controller is already connected")
 var ErrConnectionInvariant = errors.New("controller connection invariant violated")
 var ErrControllerIOActive = errors.New("controller transport operation in progress")
+var ErrEmergencyStop = errors.New("emergency stop")
+var ErrEmergencyStopActive = errors.New("emergency stop is active; machine commands are disabled")
 
 const defaultStatusPollInterval = 500 * time.Millisecond
 
@@ -76,6 +78,9 @@ const (
 	admissionInteractive
 	admissionManual
 	admissionRealtime
+	admissionStatusPoll
+	admissionRecoveryManual
+	admissionRecoveryRealtime
 	admissionConnect
 	admissionDisconnect
 )
@@ -120,6 +125,10 @@ type Controller struct {
 	statusPollCancel                        context.CancelFunc
 	statusPollDone                          chan struct{}
 	statusPollInterval                      time.Duration
+	controllerResponseTimeout               time.Duration
+	statusMonitoringGeneration              transport.ConnectionGeneration
+	statusWatchdogStartedAt                 time.Time
+	lastStatusResponseTime                  time.Time
 	macroEngine                             *macro.Engine
 	motionRewriter                          macro.MotionRewriter
 	variables                               *macro.VariableStore
@@ -139,9 +148,12 @@ func NewController(t transport.Transport, listPorts ports.ListFunc) *Controller 
 		events:    make(chan Event, 1024),
 		state: State{
 			ConnectionStatus: ConnectionDisconnected,
+			EStopStatus:      EStopClear,
+			EStopSource:      EStopSourceNone,
 			ProgramStatus:    ProgramNotLoaded,
 		},
 		statusPollInterval:             defaultStatusPollInterval,
+		controllerResponseTimeout:      defaultControllerResponseTimeout,
 		portMonitorInterval:            defaultPortMonitorInterval,
 		connectionBannerTimeout:        defaultConnectionBannerTimeout,
 		connectionStartupQuietPeriod:   defaultConnectionStartupQuietPeriod,
@@ -285,6 +297,8 @@ func (c *Controller) connect(ctx context.Context, cfg transport.PortConfig, orig
 		return c.failConnectAttempt(attempt, generation, err, true, report)
 	}
 	c.state.ConnectionStatus = ConnectionConnected
+	c.state.EStopStatus = EStopClear
+	c.state.EStopSource = EStopSourceNone
 	c.connectionGeneration = generation
 	c.state.PortName = cfg.Name
 	c.state.LastError = ""
@@ -396,7 +410,9 @@ func (c *Controller) SendConsoleLine(ctx context.Context, text string) error {
 			err = c.executeApplicationCommand(ctx, runtime, line, engine)
 			c.endInteractiveSession(session, err)
 			if err != nil {
-				c.emitError(err)
+				if !errors.Is(err, ErrEmergencyStop) {
+					c.emitError(err)
+				}
 				return err
 			}
 			return nil
@@ -411,9 +427,13 @@ func (c *Controller) writeManualLine(ctx context.Context, text string) error {
 }
 
 func (c *Controller) writeManualResponseMessage(ctx context.Context, msg transport.Message) error {
+	return c.writeManualResponseMessageForAdmission(ctx, msg, admissionManual)
+}
+
+func (c *Controller) writeManualResponseMessageForAdmission(ctx context.Context, msg transport.Message, request admissionKind) error {
 	session := newResponseSession(make(chan string, 1))
 	c.mu.Lock()
-	if err := c.acquireResponseOwnerLocked(responseOwnerManualLine, session); err != nil {
+	if err := c.acquireResponseOwnerForAdmissionLocked(responseOwnerManualLine, session, request); err != nil {
 		c.mu.Unlock()
 		c.emitError(err)
 		return err
@@ -522,12 +542,20 @@ func (c *Controller) startStatusPollingLocked() {
 	if c.statusPollCancel != nil || !c.state.IsConnected() {
 		return
 	}
+	generation := c.connectionGeneration
+	if generation == 0 {
+		return
+	}
 	pollCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	c.statusPollCancel = cancel
 	c.statusPollDone = done
+	c.statusMonitoringGeneration = generation
+	c.statusWatchdogStartedAt = time.Time{}
+	c.lastStatusResponseTime = time.Time{}
 	interval := c.statusPollInterval
-	go c.pollStatusLoop(pollCtx, done, interval)
+	timeout := c.controllerResponseTimeout
+	go c.statusMonitoringLoop(pollCtx, done, generation, interval, timeout)
 }
 
 func (c *Controller) stopStatusPolling() {
@@ -536,6 +564,7 @@ func (c *Controller) stopStatusPolling() {
 	done := c.statusPollDone
 	c.statusPollCancel = nil
 	c.statusPollDone = nil
+	c.resetControllerHealthLocked()
 	c.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -545,16 +574,30 @@ func (c *Controller) stopStatusPolling() {
 	}
 }
 
-func (c *Controller) pollStatusLoop(ctx context.Context, done chan struct{}, interval time.Duration) {
+func (c *Controller) statusMonitoringLoop(ctx context.Context, done chan struct{}, generation transport.ConnectionGeneration, interval, timeout time.Duration) {
 	defer close(done)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		c.pollStatusLoop(ctx, generation, interval)
+	}()
+	go func() {
+		defer workers.Done()
+		c.statusWatchdogLoop(ctx, generation, timeout)
+	}()
+	workers.Wait()
+}
+
+func (c *Controller) pollStatusLoop(ctx context.Context, generation transport.ConnectionGeneration, interval time.Duration) {
+	pollTicker := time.NewTicker(interval)
+	defer pollTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			if err := c.writeStatusPoll(ctx); err != nil {
+		case <-pollTicker.C:
+			if err := c.writeStatusPollForGeneration(ctx, generation); err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return
 				}
@@ -563,17 +606,43 @@ func (c *Controller) pollStatusLoop(ctx context.Context, done chan struct{}, int
 	}
 }
 
+func (c *Controller) statusWatchdogLoop(ctx context.Context, generation transport.ConnectionGeneration, timeout time.Duration) {
+	ticker := time.NewTicker(statusWatchdogInterval(timeout))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.checkStatusWatchdog(generation, c.now())
+		}
+	}
+}
+
 func (c *Controller) writeStatusPoll(ctx context.Context) error {
+	c.mu.RLock()
+	generation := c.connectionGeneration
+	c.mu.RUnlock()
+	return c.writeStatusPollForGeneration(ctx, generation)
+}
+
+func (c *Controller) writeStatusPollForGeneration(ctx context.Context, generation transport.ConnectionGeneration) error {
 	c.mu.Lock()
-	if !c.state.IsConnected() {
+	if !c.state.IsConnected() || generation == 0 || c.connectionGeneration != generation || c.statusMonitoringGeneration != generation {
 		c.mu.Unlock()
 		return nil
 	}
-	if err := c.beginRealtimeWriteLocked(); err != nil {
+	if err := c.beginRealtimeWriteForAdmissionLocked(admissionStatusPoll); err != nil {
 		c.mu.Unlock()
 		return err
 	}
 	c.pendingQuietStatusReports++
+	startedWatchdog := c.statusWatchdogStartedAt.IsZero()
+	var watchdogStart time.Time
+	if startedWatchdog {
+		watchdogStart = c.now()
+		c.statusWatchdogStartedAt = watchdogStart
+	}
 	c.mu.Unlock()
 	defer c.endRealtimeWrite()
 	msg, err := grbl.BuildAction(grbl.ActionStatus)
@@ -585,6 +654,9 @@ func (c *Controller) writeStatusPoll(ctx context.Context) error {
 		c.mu.Lock()
 		if c.pendingQuietStatusReports > 0 {
 			c.pendingQuietStatusReports--
+		}
+		if startedWatchdog && c.statusWatchdogStartedAt == watchdogStart && c.connectionGeneration == generation {
+			c.statusWatchdogStartedAt = time.Time{}
 		}
 		c.mu.Unlock()
 		if errors.Is(err, transport.ErrNotOpen) {
@@ -623,7 +695,15 @@ func (c *Controller) Action(ctx context.Context, action grbl.Action) error {
 			c.emitError(err)
 			return err
 		}
-		return c.writeManualResponseMessage(ctx, msg)
+		request := admissionManual
+		if action == grbl.ActionUnlock {
+			c.mu.RLock()
+			if c.state.EStopStatus == EStopRecovery {
+				request = admissionRecoveryManual
+			}
+			c.mu.RUnlock()
+		}
+		return c.writeManualResponseMessageForAdmission(ctx, msg, request)
 	}
 	if action == grbl.ActionStatus {
 		c.mu.RLock()
@@ -642,7 +722,11 @@ func (c *Controller) Action(ctx context.Context, action grbl.Action) error {
 	}
 	if action == grbl.ActionSoftReset {
 		c.mu.Lock()
-		err = c.beginRealtimeWriteLocked()
+		request := admissionRealtime
+		if c.state.EStopStatus == EStopRecovery {
+			request = admissionRecoveryRealtime
+		}
+		err = c.beginRealtimeWriteForAdmissionLocked(request)
 		if err == nil {
 			err = c.prepareSoftResetLocked()
 			if err != nil {
@@ -667,7 +751,11 @@ func (c *Controller) Action(ctx context.Context, action grbl.Action) error {
 }
 
 func (c *Controller) beginRealtimeWriteLocked() error {
-	if err := c.admissionErrorLocked(admissionRealtime); err != nil {
+	return c.beginRealtimeWriteForAdmissionLocked(admissionRealtime)
+}
+
+func (c *Controller) beginRealtimeWriteForAdmissionLocked(request admissionKind) error {
+	if err := c.admissionErrorLocked(request); err != nil {
 		return err
 	}
 	c.realtimeWriteActive = true
@@ -1210,6 +1298,12 @@ func (c *Controller) finishProgramFailure(run *programRun, err error) {
 }
 
 func (c *Controller) handleTransportDisconnected(generation transport.ConnectionGeneration) {
+	c.mu.RLock()
+	current := generation != 0 && c.connectionGeneration == generation
+	c.mu.RUnlock()
+	if !current {
+		return
+	}
 	c.stopStatusPolling()
 
 	err := ErrTransportDisconnected
@@ -1253,6 +1347,8 @@ func (c *Controller) handleTransportDisconnected(generation transport.Connection
 
 func (c *Controller) clearConnectionStateLocked() bool {
 	changed := c.state.ConnectionStatus != ConnectionDisconnected ||
+		c.state.EStopStatus != EStopClear ||
+		c.state.EStopSource != EStopSourceNone ||
 		c.state.MachineState != "" ||
 		c.state.HasMachinePosition ||
 		c.state.HasWorkPosition ||
@@ -1260,14 +1356,12 @@ func (c *Controller) clearConnectionStateLocked() bool {
 		c.state.HasFeedSpindle ||
 		c.state.LastStatusRaw != ""
 	c.state.ConnectionStatus = ConnectionDisconnected
+	c.state.EStopStatus = EStopClear
+	c.state.EStopSource = EStopSourceNone
 	c.connectionGeneration = 0
-	c.state.MachineState = ""
-	c.state.HasMachinePosition = false
-	c.state.HasWorkPosition = false
-	c.state.WorkCoordinateOffset = [3]float64{}
-	c.state.HasWorkCoordinateOffset = false
-	c.state.HasFeedSpindle = false
-	c.state.LastStatusRaw = ""
+	c.invalidateMachineTelemetryLocked()
+	c.pendingQuietStatusReports = 0
+	c.resetControllerHealthLocked()
 	return changed
 }
 
@@ -1414,6 +1508,13 @@ func (c *Controller) runTransportEventBridge() {
 			}
 			suppressRXLog := false
 			statusReport := false
+			var eStopResult eStopTransitionResult
+			if alarmCode, ok := grbl.ParseAlarm(ev.Text); ok && alarmCode == 50 {
+				eStopResult = c.enterEStopLocked(EStopSourceAlarm50, ev.Generation)
+			}
+			var recoveryChanged bool
+			var recoverySnapshot versionedState
+			var recoveryText string
 			if report, ok := grbl.ParseStatusReport(ev.Text); ok {
 				statusReport = true
 				if c.pendingQuietStatusReports > 0 {
@@ -1442,18 +1543,29 @@ func (c *Controller) runTransportEventBridge() {
 				c.statusReportRevision++
 				close(c.statusReportChanged)
 				c.statusReportChanged = make(chan struct{})
+				recoveryChanged, recoverySnapshot, recoveryText = c.noteStatusResponseLocked(ev.Generation, report.State)
 			}
 			var overflowRun *programRun
-			if !statusReport {
+			if !statusReport && !eStopResult.entered {
 				overflowRun = c.deliverResponseLocked(ev.Generation, ev.Text)
 			}
 			var snapshot versionedState
 			if !suppressRXLog {
-				snapshot = c.captureEventStateLocked()
+				if eStopResult.entered {
+					snapshot = eStopResult.snapshot
+				} else if recoveryChanged {
+					snapshot = recoverySnapshot
+				} else {
+					snapshot = c.captureEventStateLocked()
+				}
 			}
 			c.mu.Unlock()
+			c.finishEStopTransition(eStopResult)
 			if overflowRun != nil {
 				c.finishProgramFailure(overflowRun, errors.New("program response backlog full"))
+			}
+			if recoveryChanged {
+				c.events <- Event{Kind: EventStateChanged, When: ev.When, State: recoverySnapshot.state, StateRevision: recoverySnapshot.revision, Text: recoveryText}
 			}
 			if !suppressRXLog {
 				c.events <- Event{Kind: EventConsoleRX, When: ev.When, Text: ev.Text, State: snapshot.state, StateRevision: snapshot.revision, Raw: ev}

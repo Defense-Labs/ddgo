@@ -20,10 +20,17 @@ type FakeTransport struct {
 	autoHandshake   bool
 	handshakeOpen   bool
 	handshakeWrites int
+	responseModeSet bool
+	responding      bool
+	statusResponse  string
 }
 
 func NewFakeTransport() *FakeTransport {
-	return &FakeTransport{events: make(chan Event, 256), autoHandshake: true}
+	return &FakeTransport{
+		events:         make(chan Event, 256),
+		autoHandshake:  true,
+		statusResponse: "<Idle|MPos:0.000,0.000,0.000|WPos:0.000,0.000,0.000|FS:0,0>",
+	}
 }
 
 func (f *FakeTransport) SetOpenError(err error)  { f.mu.Lock(); f.openErr = err; f.mu.Unlock() }
@@ -35,6 +42,23 @@ func (f *FakeTransport) SetAutoHandshake(enabled bool) {
 	if !enabled {
 		f.handshakeOpen = false
 	}
+	f.mu.Unlock()
+}
+
+// SetResponding enables controlled status-query responses. When false, writes
+// continue to succeed while ? produces no RX or disconnect event. Calling it
+// with true restores replies using the configured status response.
+func (f *FakeTransport) SetResponding(responding bool) {
+	f.mu.Lock()
+	f.responseModeSet = true
+	f.responding = responding
+	f.mu.Unlock()
+}
+
+// SetStatusResponse changes the realtime status line emitted while responding.
+func (f *FakeTransport) SetStatusResponse(line string) {
+	f.mu.Lock()
+	f.statusResponse = line
 	f.mu.Unlock()
 }
 
@@ -104,6 +128,9 @@ func (f *FakeTransport) Write(_ context.Context, msg Message) error {
 		for _, line := range []string{"$0=10", "$1=25", "$100=40.000", "ok"} {
 			f.events <- Event{Kind: EventRX, Generation: generation, When: time.Now(), Text: line, Payload: []byte(line)}
 		}
+	} else if f.responseModeSet && f.responding && string(msg.Payload) == "?" {
+		line := f.statusResponse
+		f.events <- Event{Kind: EventRX, Generation: generation, When: time.Now(), Text: line, Payload: []byte(line)}
 	}
 	return nil
 }
@@ -167,4 +194,11 @@ func (f *FakeTransport) HandshakeWrites() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.handshakeWrites
+}
+
+// IsOpen reports whether the fake's current physical generation remains open.
+func (f *FakeTransport) IsOpen() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.open
 }
