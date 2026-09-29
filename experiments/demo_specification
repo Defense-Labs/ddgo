@@ -1,0 +1,214 @@
+# DDGO 3D UI Toolkit Capability Test
+
+## Purpose
+
+Create several completely independent experimental applications to determine which UI toolkits can support the core graphical requirement for DDGO:
+
+**An ordinary desktop UI containing an interactive 3D toolpath view.**
+
+These applications are experiments only. They are not part of DDGO's production application architecture and should not depend on DDGO application code.
+
+The same basic program should be implemented with several toolkits and, where useful, several languages.
+
+## Repository Location
+
+Keep all experiments under one isolated directory:
+
+```text
+experiments/ui3d/
+```
+
+Each implementation gets its own self-contained directory:
+
+```text
+experiments/ui3d/
+├── qt/
+├── <toolkit-2>/
+├── <toolkit-3>/
+└── ...
+```
+
+Each implementation should:
+
+- be independently buildable
+- contain its own dependency/build configuration
+- not import code from another UI experiment
+- not require changes to DDGO's production code
+- not become a dependency of the main DDGO application
+- not be included in normal DDGO builds or tests unless explicitly requested
+
+Duplicating small amounts of test code between experiments is preferable to creating a shared abstraction layer.
+
+The objective is to evaluate the toolkits, not design a portable UI abstraction.
+
+## Application
+
+Each experiment consists of **one desktop window**.
+
+The window contains:
+
+1. A 3D viewport occupying most of the window.
+2. A small ordinary UI area containing a few controls.
+
+An acceptable layout is:
+
+```text
+┌────────────────────────────────────────────┐
+│                                            │
+│                                            │
+│              3D VIEWPORT                   │
+│                                            │
+│                                            │
+├────────────────────────────────────────────┤
+│ [ Reset View ] [ Animate ]   Status/FPS    │
+└────────────────────────────────────────────┘
+```
+
+The exact layout and styling should follow what is natural for the toolkit.
+
+Pixel-identical implementations are not required.
+
+## 3D Scene
+
+The viewport displays a synthetic CNC-style toolpath.
+
+No G-code parser or DDGO program format is involved.
+
+Generate the path programmatically at startup.
+
+The path should contain enough geometry to unmistakably demonstrate three-dimensional motion, including:
+
+- straight XY cutting moves
+- Z changes
+- several different cutting depths
+- at least one curved or circular feature
+- rapid/repositioning moves
+- a final retract
+
+The test path should be deterministic and substantially identical between implementations.
+
+### Scene Reference Features
+
+Also display:
+
+- X, Y, and Z axes
+- an XY grid
+- the toolpath
+- a marker showing the current simulated tool position
+
+Rapid moves and cutting moves should be visually distinguishable.
+
+No stock model, cutter model, lighting effects, textures, or material-removal simulation are required.
+
+## View Interaction
+
+The user must be able to:
+
+- orbit the camera
+- zoom
+- pan
+
+The 3D view must resize correctly when the application window is resized.
+
+The specific mouse controls may follow the toolkit or 3D library's conventions.
+
+## UI Controls
+
+Provide at least two normal UI controls outside the 3D renderer.
+
+### Reset View
+
+Returns the camera to the initial useful view of the complete toolpath.
+
+### Animate / Stop
+
+Starts and stops a simple traversal of the generated toolpath.
+
+While animation is running:
+
+- the tool-position marker moves along the path
+- the 3D view remains interactive
+- the rest of the UI remains responsive
+
+The static path should not be regenerated every animation frame.
+
+A small text label may display current segment number, FPS, or another useful diagnostic value.
+
+## Minimum Rendering Requirement
+
+The initial capability test does **not** need to render millions of segments.
+
+Use enough geometry to demonstrate that a real collection of toolpath geometry is being rendered rather than a trivial three-line demonstration.
+
+Approximately 1,000–10,000 generated line segments is sufficient for the first implementation.
+
+More demanding datasets belong in the comparison stage after the toolkit has demonstrated basic capability.
+
+## Success Criteria
+
+A toolkit passes the initial test if:
+
+- the application builds and launches reproducibly
+- the 3D viewport is embedded in the same window as normal UI controls
+- the generated path renders correctly in three dimensions
+- depth relationships are displayed correctly
+- orbit, pan, and zoom work
+- Reset View works
+- the animated position marker works
+- normal UI remains responsive during rendering and animation
+- resizing the window correctly resizes the viewport
+- the implementation does not require an obviously unreasonable workaround to combine the UI and 3D renderer
+
+## Information to Record
+
+Each implementation should contain a short README recording:
+
+- language
+- UI toolkit
+- 3D/rendering library or API
+- graphics backend where known
+- build instructions
+- runtime dependencies
+- whether CGO or another foreign-language interface is required
+- platforms the implementation should theoretically support
+- problems or limitations encountered
+- any toolkit-specific workaround required to host the 3D viewport
+
+Do not attempt detailed performance comparisons during this first stage.
+
+## Explicitly Out of Scope
+
+Do not implement:
+
+- DDGO integration
+- machine communication
+- G-code parsing
+- DD/DDD parsing
+- file loading
+- multiple windows
+- document architecture
+- path selection/picking
+- docking
+- preferences
+- stock simulation
+- collision detection
+- production styling
+- production error handling
+- installers
+- large-scale performance optimization
+
+These experiments exist only to establish whether each candidate provides a viable foundation for a DDGO UI with interactive 3D graphics.
+
+## Stage 2
+
+Toolkits that pass this test can then be subjected to a common comparison program with:
+
+- large path datasets
+- rendering performance measurements
+- path selection
+- more substantial normal UI
+- packaging tests
+- cross-platform testing
+- implementation complexity comparison
+
+Do not add Stage 2 requirements to an implementation until its Stage 1 capability test works.
