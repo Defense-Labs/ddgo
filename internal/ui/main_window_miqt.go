@@ -546,7 +546,7 @@ func (w *MainWindow) action(action grbl.Action) {
 	go func() { _ = w.controller.Action(context.Background(), action) }()
 }
 
-func (w *MainWindow) applyEvent(ev app.Event) {
+func (w *MainWindow) ApplyEvent(ev app.Event) {
 	switch ev.Kind {
 	case app.EventConsoleTX:
 		w.appendConsole("TX", ev.Text)
@@ -591,7 +591,7 @@ func (w *MainWindow) populatePorts(list []ports.Info) {
 	}
 }
 
-func (w *MainWindow) applyState(state app.State) {
+func (w *MainWindow) ApplyState(state app.State) {
 	switch state.ConnectionStatus {
 	case app.ConnectionConnecting:
 		w.connStatus.SetText("Connection: connecting...")

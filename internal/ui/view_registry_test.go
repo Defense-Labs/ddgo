@@ -13,11 +13,11 @@ type recordingView struct {
 	calls  []string
 }
 
-func (v *recordingView) applyState(state app.State) {
+func (v *recordingView) ApplyState(state app.State) {
 	v.states = append(v.states, state)
 	v.calls = append(v.calls, "state")
 }
-func (v *recordingView) applyEvent(event app.Event) {
+func (v *recordingView) ApplyEvent(event app.Event) {
 	v.events = append(v.events, event)
 	v.calls = append(v.calls, "event")
 }

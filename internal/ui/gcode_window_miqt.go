@@ -52,5 +52,5 @@ func newGCodeWindow(document gcode.Document, onOpen func()) *GCodeWindow {
 
 func (w *GCodeWindow) show()                { w.window.Show() }
 func (w *GCodeWindow) setOnClose(fn func()) { w.onClose = fn }
-func (w *GCodeWindow) applyState(app.State) {}
-func (w *GCodeWindow) applyEvent(app.Event) {}
+func (w *GCodeWindow) ApplyState(app.State) {}
+func (w *GCodeWindow) ApplyEvent(app.Event) {}
