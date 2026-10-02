@@ -1,8 +1,8 @@
-package ui
+package frontend
 
 import "github.com/ianbruene/ddgo/internal/app"
 
-// eventView is a UI surface that presents application state and reacts to
+// EventView is a UI surface that presents application state and reacts to
 // application events. Implementations may be backed by any UI toolkit; the
 // registry deliberately is not.
 //
@@ -11,30 +11,40 @@ import "github.com/ianbruene/ddgo/internal/app"
 //
 // ApplyEvent handles event-specific behavior. Every event is delivered even
 // when its attached State snapshot is older than the state already presented.
-type eventView interface {
+type EventView interface {
 	ApplyState(app.State)
 	ApplyEvent(app.Event)
 }
 
-// viewDispatcher owns the state that has entered the UI event stream and
+// ViewDispatcher owns the state that has entered the UI event stream and
 // distributes state and event-specific behavior to every registered view.
-type viewDispatcher struct {
+type ViewDispatcher struct {
 	state    app.State
 	revision app.StateRevision
 	views    viewRegistry
 }
 
-func (d *viewDispatcher) register(view eventView) viewID {
+// NewViewDispatcher returns a dispatcher initialized with the current state
+// and its revision.
+func NewViewDispatcher(state app.State, revision app.StateRevision) *ViewDispatcher {
+	return &ViewDispatcher{state: state, revision: revision}
+}
+
+// Register adds a view and immediately applies the dispatcher's current state.
+func (d *ViewDispatcher) Register(view EventView) ViewID {
 	id := d.views.add(view)
 	view.ApplyState(d.state)
 	return id
 }
 
-func (d *viewDispatcher) unregister(id viewID) {
+// Unregister removes a view from future state and event broadcasts.
+func (d *ViewDispatcher) Unregister(id ViewID) {
 	d.views.remove(id)
 }
 
-func (d *viewDispatcher) dispatch(event app.Event) {
+// Dispatch applies a newer state before delivering the event to every view.
+// Events are delivered even when their attached state is stale.
+func (d *ViewDispatcher) Dispatch(event app.Event) {
 	if event.StateRevision > d.revision {
 		d.state = event.State
 		d.revision = event.StateRevision
@@ -43,23 +53,24 @@ func (d *viewDispatcher) dispatch(event app.Event) {
 	d.views.applyEvent(event)
 }
 
-type viewID uint64
+// ViewID identifies a registered view for later unregistration.
+type ViewID uint64
 
 type viewRegistry struct {
-	nextID viewID
-	views  map[viewID]eventView
+	nextID ViewID
+	views  map[ViewID]EventView
 }
 
-func (r *viewRegistry) add(view eventView) viewID {
+func (r *viewRegistry) add(view EventView) ViewID {
 	if r.views == nil {
-		r.views = make(map[viewID]eventView)
+		r.views = make(map[ViewID]EventView)
 	}
 	r.nextID++
 	r.views[r.nextID] = view
 	return r.nextID
 }
 
-func (r *viewRegistry) remove(id viewID) {
+func (r *viewRegistry) remove(id ViewID) {
 	delete(r.views, id)
 }
 

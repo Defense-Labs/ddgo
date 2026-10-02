@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/ianbruene/ddgo/internal/app"
+	"github.com/ianbruene/ddgo/internal/frontend"
 	"github.com/ianbruene/ddgo/internal/gcode"
 	qt "github.com/mappu/miqt/qt"
 )
@@ -18,14 +19,12 @@ type Application struct {
 	controller *app.Controller
 
 	pollTimer  *qt.QTimer
-	dispatcher viewDispatcher
+	dispatcher *frontend.ViewDispatcher
 	windows    windowManager
 }
 
 func newApplication(controller *app.Controller) *Application {
-	a := &Application{controller: controller}
-	a.windows.dispatcher = &a.dispatcher
-	return a
+	return &Application{controller: controller}
 }
 
 // Run creates and runs the UI application.
@@ -37,8 +36,8 @@ func (a *Application) Run() error {
 	qt.NewQApplication(os.Args)
 
 	state, revision := a.controller.SnapshotWithRevision()
-	a.dispatcher.state = state
-	a.dispatcher.revision = revision
+	a.dispatcher = frontend.NewViewDispatcher(state, revision)
+	a.windows.dispatcher = a.dispatcher
 	mainWindow := newMainWindow(a.controller, func() { a.openGCodeFile() })
 	a.windows.add(mainWindow)
 	mainWindow.show()
@@ -78,7 +77,7 @@ func (a *Application) drainControllerEvents() {
 	for {
 		select {
 		case event := <-a.controller.Events():
-			a.dispatcher.dispatch(event)
+			a.dispatcher.Dispatch(event)
 		default:
 			return
 		}

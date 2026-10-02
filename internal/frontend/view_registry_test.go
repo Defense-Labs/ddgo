@@ -1,4 +1,4 @@
-package ui
+package frontend
 
 import (
 	"reflect"
@@ -54,14 +54,14 @@ func TestViewDispatcherDispatchesStateBeforeEventToEveryView(t *testing.T) {
 
 	initial := app.State{PortName: "initial"}
 	next := app.State{ConnectionStatus: app.ConnectionConnected, PortName: "next"}
-	dispatcher := viewDispatcher{state: initial}
+	dispatcher := NewViewDispatcher(initial, 0)
 	first, second := &recordingView{}, &recordingView{}
-	dispatcher.register(first)
-	dispatcher.register(second)
+	dispatcher.Register(first)
+	dispatcher.Register(second)
 	first.calls, second.calls = nil, nil
 
 	event := app.Event{Kind: app.EventStateChanged, State: next, StateRevision: 1}
-	dispatcher.dispatch(event)
+	dispatcher.Dispatch(event)
 
 	for name, view := range map[string]*recordingView{"first": first, "second": second} {
 		if !reflect.DeepEqual(view.calls, []string{"state", "event"}) {
@@ -81,20 +81,20 @@ func TestViewDispatcherLateRegistrationUsesDispatchedState(t *testing.T) {
 
 	initial := app.State{PortName: "initial"}
 	next := app.State{ConnectionStatus: app.ConnectionConnected, PortName: "next"}
-	dispatcher := viewDispatcher{state: initial}
+	dispatcher := NewViewDispatcher(initial, 0)
 	first := &recordingView{}
-	dispatcher.register(first)
+	dispatcher.Register(first)
 	if !reflect.DeepEqual(first.states, []app.State{initial}) {
 		t.Fatalf("initial view states = %#v, want %#v", first.states, []app.State{initial})
 	}
 
-	dispatcher.dispatch(app.Event{Kind: app.EventStateChanged, State: next, StateRevision: 1})
+	dispatcher.Dispatch(app.Event{Kind: app.EventStateChanged, State: next, StateRevision: 1})
 	if !reflect.DeepEqual(dispatcher.state, next) {
 		t.Fatalf("dispatcher state = %#v, want %#v", dispatcher.state, next)
 	}
 
 	late := &recordingView{}
-	dispatcher.register(late)
+	dispatcher.Register(late)
 	if !reflect.DeepEqual(late.states, []app.State{next}) {
 		t.Fatalf("late view states = %#v, want %#v", late.states, []app.State{next})
 	}
@@ -106,14 +106,14 @@ func TestViewDispatcherLateRegistrationUsesDispatchedState(t *testing.T) {
 func TestViewDispatcherRejectsStaleStateButDeliversEveryEvent(t *testing.T) {
 	t.Parallel()
 
-	dispatcher := viewDispatcher{state: app.State{ProgramComplete: 10}, revision: 10}
+	dispatcher := NewViewDispatcher(app.State{ProgramComplete: 10}, 10)
 	view := &recordingView{}
-	dispatcher.register(view)
+	dispatcher.Register(view)
 
 	newer := app.Event{State: app.State{ProgramComplete: 12}, StateRevision: 12}
 	stale := app.Event{State: app.State{ProgramComplete: 11}, StateRevision: 11}
-	dispatcher.dispatch(newer)
-	dispatcher.dispatch(stale)
+	dispatcher.Dispatch(newer)
+	dispatcher.Dispatch(stale)
 
 	if got := dispatcher.state.ProgramComplete; got != 12 {
 		t.Fatalf("dispatcher progress = %d, want 12", got)
@@ -129,12 +129,12 @@ func TestViewDispatcherRejectsStaleStateButDeliversEveryEvent(t *testing.T) {
 func TestViewDispatcherEqualRevisionAppliesStateOnce(t *testing.T) {
 	t.Parallel()
 
-	dispatcher := viewDispatcher{}
+	dispatcher := NewViewDispatcher(app.State{}, 0)
 	view := &recordingView{}
-	dispatcher.register(view)
+	dispatcher.Register(view)
 	state := app.State{ProgramStatus: app.ProgramFailed}
-	dispatcher.dispatch(app.Event{Kind: app.EventStateChanged, State: state, StateRevision: 15})
-	dispatcher.dispatch(app.Event{Kind: app.EventError, State: state, StateRevision: 15})
+	dispatcher.Dispatch(app.Event{Kind: app.EventStateChanged, State: state, StateRevision: 15})
+	dispatcher.Dispatch(app.Event{Kind: app.EventError, State: state, StateRevision: 15})
 
 	if got := len(view.states); got != 2 { // registration plus the accepted snapshot
 		t.Fatalf("applyState called %d times, want 2", got)
@@ -150,11 +150,11 @@ func TestViewDispatcherEqualRevisionAppliesStateOnce(t *testing.T) {
 func TestViewDispatcherAdvancesAfterStaleState(t *testing.T) {
 	t.Parallel()
 
-	dispatcher := viewDispatcher{}
+	dispatcher := NewViewDispatcher(app.State{}, 0)
 	view := &recordingView{}
-	dispatcher.register(view)
+	dispatcher.Register(view)
 	for _, revision := range []app.StateRevision{20, 18, 21} {
-		dispatcher.dispatch(app.Event{State: app.State{ProgramComplete: int(revision)}, StateRevision: revision})
+		dispatcher.Dispatch(app.Event{State: app.State{ProgramComplete: int(revision)}, StateRevision: revision})
 	}
 
 	got := []int{view.states[1].ProgramComplete, view.states[2].ProgramComplete}
@@ -169,12 +169,12 @@ func TestViewDispatcherAdvancesAfterStaleState(t *testing.T) {
 func TestViewDispatcherLateRegistrationUsesNewestAcceptedRevision(t *testing.T) {
 	t.Parallel()
 
-	dispatcher := viewDispatcher{state: app.State{ProgramComplete: 5}, revision: 5}
-	dispatcher.dispatch(app.Event{State: app.State{ProgramComplete: 7}, StateRevision: 7})
-	dispatcher.dispatch(app.Event{State: app.State{ProgramComplete: 6}, StateRevision: 6})
+	dispatcher := NewViewDispatcher(app.State{ProgramComplete: 5}, 5)
+	dispatcher.Dispatch(app.Event{State: app.State{ProgramComplete: 7}, StateRevision: 7})
+	dispatcher.Dispatch(app.Event{State: app.State{ProgramComplete: 6}, StateRevision: 6})
 
 	late := &recordingView{}
-	dispatcher.register(late)
+	dispatcher.Register(late)
 	if got := late.states[0].ProgramComplete; got != 7 {
 		t.Fatalf("late view progress = %d, want 7", got)
 	}
