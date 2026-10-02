@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/ianbruene/ddgo/internal/app"
+	"github.com/ianbruene/ddgo/internal/frontend"
 	"github.com/ianbruene/ddgo/internal/grbl"
 	"github.com/ianbruene/ddgo/internal/ports"
 	"github.com/ianbruene/ddgo/internal/transport"
@@ -27,7 +28,7 @@ type MainWindow struct {
 	console        *qt.QPlainTextEdit
 	commandEntry   *qt.QLineEdit
 	sendButton     *qt.QPushButton
-	commandHistory commandHistory
+	commandHistory frontend.CommandHistory
 
 	portCombo         *qt.QComboBox
 	refreshButton     *qt.QPushButton
@@ -362,15 +363,15 @@ func (w *MainWindow) bind() {
 	w.commandEntry.OnKeyPressEvent(func(super func(*qt.QKeyEvent), event *qt.QKeyEvent) {
 		switch qt.Key(event.Key()) {
 		case qt.Key_Up:
-			if w.commandHistory.canPrevious() {
-				text := w.commandHistory.previous(w.commandEntry.Text())
+			if w.commandHistory.CanPrevious() {
+				text := w.commandHistory.Previous(w.commandEntry.Text())
 				w.commandEntry.SetText(text)
 				w.commandEntry.SetCursorPosition(len(text))
 			}
 		case qt.Key_Down:
 			// At the live position, preserve the QLineEdit's current contents.
-			if w.commandHistory.browsing() {
-				text := w.commandHistory.next()
+			if w.commandHistory.Browsing() {
+				text := w.commandHistory.Next()
 				w.commandEntry.SetText(text)
 				w.commandEntry.SetCursorPosition(len(text))
 			}
@@ -452,7 +453,7 @@ func (w *MainWindow) sendCommand() {
 	if line == "" {
 		return
 	}
-	w.commandHistory.add(line)
+	w.commandHistory.Add(line)
 	w.commandEntry.SetText("")
 	go func() { _ = w.controller.SendConsoleLine(context.Background(), line) }()
 }

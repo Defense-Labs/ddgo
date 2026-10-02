@@ -1,31 +1,32 @@
-package ui
+// Package frontend contains toolkit-independent frontend behavior.
+package frontend
 
-// commandHistory keeps the commands submitted from the manual command entry
+// CommandHistory keeps the commands submitted from the manual command entry
 // and the transient navigation state for that entry.
-type commandHistory struct {
+type CommandHistory struct {
 	entries []string
 	index   int
 	draft   string
 }
 
-func (h *commandHistory) canPrevious() bool {
+func (h *CommandHistory) CanPrevious() bool {
 	return len(h.entries) > 0
 }
 
-func (h *commandHistory) browsing() bool {
+func (h *CommandHistory) Browsing() bool {
 	return h.index < len(h.entries)
 }
 
-// add records a submitted command and returns navigation to the live input.
-func (h *commandHistory) add(command string) {
+// Add records a submitted command and returns navigation to the live input.
+func (h *CommandHistory) Add(command string) {
 	h.entries = append(h.entries, command)
 	h.index = len(h.entries)
 	h.draft = ""
 }
 
-// previous moves to an older command. When leaving the live input, current is
+// Previous moves to an older command. When leaving the live input, current is
 // saved so it can be restored after navigating forward through the history.
-func (h *commandHistory) previous(current string) string {
+func (h *CommandHistory) Previous(current string) string {
 	if len(h.entries) == 0 {
 		return current
 	}
@@ -39,8 +40,8 @@ func (h *commandHistory) previous(current string) string {
 	return h.entries[h.index]
 }
 
-// next moves to a newer command, restoring the saved draft at the live input.
-func (h *commandHistory) next() string {
+// Next moves to a newer command, restoring the saved draft at the live input.
+func (h *CommandHistory) Next() string {
 	if h.index >= len(h.entries) {
 		return h.draft
 	}
