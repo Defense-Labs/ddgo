@@ -20,7 +20,7 @@ type Application struct {
 
 	pollTimer  *qt.QTimer
 	dispatcher *frontend.ViewDispatcher
-	windows    windowManager
+	windows    *frontend.WindowManager
 }
 
 func newApplication(controller *app.Controller) *Application {
@@ -37,9 +37,9 @@ func (a *Application) Run() error {
 
 	state, revision := a.controller.SnapshotWithRevision()
 	a.dispatcher = frontend.NewViewDispatcher(state, revision)
-	a.windows.dispatcher = a.dispatcher
+	a.windows = frontend.NewWindowManager(a.dispatcher)
 	mainWindow := newMainWindow(a.controller, func() { a.openGCodeFile() })
-	a.windows.add(mainWindow)
+	a.windows.Add(mainWindow)
 	mainWindow.show()
 
 	a.pollTimer = qt.NewQTimer()
@@ -69,7 +69,7 @@ func (a *Application) openGCodeFile() {
 
 func (a *Application) openGCodeDocument(document gcode.Document) {
 	window := newGCodeWindow(document, func() { a.openGCodeFile() })
-	a.windows.add(window)
+	a.windows.Add(window)
 	window.show()
 }
 

@@ -1,11 +1,10 @@
-package ui
+package frontend
 
 import (
 	"reflect"
 	"testing"
 
 	"github.com/ianbruene/ddgo/internal/app"
-	"github.com/ianbruene/ddgo/internal/frontend"
 )
 
 type fakeApplicationWindow struct {
@@ -19,9 +18,9 @@ func (w *fakeApplicationWindow) ApplyEvent(event app.Event) { w.events = append(
 func (w *fakeApplicationWindow) SetOnClose(fn func())       { w.onClose = fn }
 func (w *fakeApplicationWindow) close()                     { w.onClose() }
 
-func newTestWindowManager(state app.State) (*windowManager, *frontend.ViewDispatcher) {
-	dispatcher := frontend.NewViewDispatcher(state, 0)
-	return &windowManager{dispatcher: dispatcher}, dispatcher
+func newTestWindowManager(state app.State) (*WindowManager, *ViewDispatcher) {
+	dispatcher := NewViewDispatcher(state, 0)
+	return NewWindowManager(dispatcher), dispatcher
 }
 
 func TestWindowManagerRegistersWindowAndSuppliesInitialState(t *testing.T) {
