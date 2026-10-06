@@ -7,7 +7,7 @@ import "github.com/ianbruene/ddgo/internal/frontend"
 // without constructing a GUI.
 type applicationWindow interface {
 	frontend.EventView
-	setOnClose(func())
+	SetOnClose(func())
 }
 
 type windowID uint64
@@ -35,7 +35,7 @@ func (m *windowManager) add(window applicationWindow) windowID {
 	id := m.nextID
 	viewID := m.dispatcher.Register(window)
 	m.windows[id] = managedWindow{window: window, viewID: viewID}
-	window.setOnClose(func() { m.remove(id) })
+	window.SetOnClose(func() { m.remove(id) })
 	return id
 }
 

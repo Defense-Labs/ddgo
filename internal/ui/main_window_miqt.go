@@ -355,7 +355,7 @@ func (w *MainWindow) build() {
 
 func (w *MainWindow) show() { w.window.Show() }
 
-func (w *MainWindow) setOnClose(fn func()) { w.onClose = fn }
+func (w *MainWindow) SetOnClose(fn func()) { w.onClose = fn }
 
 func (w *MainWindow) bind() {
 	w.sendButton.OnClicked(func() { w.sendCommand() })

@@ -16,7 +16,7 @@ type fakeApplicationWindow struct {
 
 func (w *fakeApplicationWindow) ApplyState(state app.State) { w.states = append(w.states, state) }
 func (w *fakeApplicationWindow) ApplyEvent(event app.Event) { w.events = append(w.events, event) }
-func (w *fakeApplicationWindow) setOnClose(fn func())       { w.onClose = fn }
+func (w *fakeApplicationWindow) SetOnClose(fn func())       { w.onClose = fn }
 func (w *fakeApplicationWindow) close()                     { w.onClose() }
 
 func newTestWindowManager(state app.State) (*windowManager, *frontend.ViewDispatcher) {
