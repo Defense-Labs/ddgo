@@ -234,6 +234,10 @@ func (c *Controller) Connect(ctx context.Context, cfg transport.PortConfig) erro
 	return c.connect(ctx, cfg, connectOriginManual)
 }
 
+func (c *Controller) ConnectPort(ctx context.Context, name string) error {
+	return c.Connect(ctx, transport.DefaultPortConfig(name))
+}
+
 // connect preserves the normal connection admission and transport path while
 // making the policy origin of the attempt explicit.
 func (c *Controller) connect(ctx context.Context, cfg transport.PortConfig, origin connectOrigin) error {

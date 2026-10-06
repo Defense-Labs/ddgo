@@ -13,7 +13,6 @@ import (
 	"github.com/ianbruene/ddgo/internal/frontend"
 	"github.com/ianbruene/ddgo/internal/grbl"
 	"github.com/ianbruene/ddgo/internal/ports"
-	"github.com/ianbruene/ddgo/internal/transport"
 	qt "github.com/mappu/miqt/qt"
 )
 
@@ -431,8 +430,8 @@ func (w *MainWindow) toggleConnection() {
 		go func() { _ = w.controller.Disconnect() }()
 		return
 	}
-	cfg := transport.DefaultPortConfig(strings.TrimSpace(w.portCombo.CurrentText()))
-	go func() { _ = w.controller.Connect(context.Background(), cfg) }()
+	port := strings.TrimSpace(w.portCombo.CurrentText())
+	go func() { _ = w.controller.ConnectPort(context.Background(), port) }()
 }
 
 func (w *MainWindow) browseAndLoadProgram() {

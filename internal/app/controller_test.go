@@ -48,6 +48,22 @@ func TestControllerRefreshPorts(t *testing.T) {
 	}
 }
 
+func TestControllerConnectPort(t *testing.T) {
+	fake := transport.NewFakeTransport()
+	controller := NewController(fake, nil)
+	controller.statusPollInterval = time.Hour
+	t.Cleanup(func() { _ = controller.Disconnect() })
+
+	const port = "/dev/ttyACM-test"
+	if err := controller.ConnectPort(context.Background(), port); err != nil {
+		t.Fatalf("ConnectPort() error = %v", err)
+	}
+	state := controller.Snapshot()
+	if !fake.IsOpen() || !state.IsConnected() || state.PortName != port {
+		t.Fatalf("connected state = %+v, transport open = %t; want connected to %q", state, fake.IsOpen(), port)
+	}
+}
+
 func TestControllerHandlesTransportDisconnectedWhileIdle(t *testing.T) {
 	fake := transport.NewFakeTransport()
 	controller := NewController(fake, nil)
