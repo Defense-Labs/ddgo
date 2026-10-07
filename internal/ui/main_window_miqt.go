@@ -5,7 +5,6 @@ package ui
 import (
 	"context"
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 
@@ -482,73 +481,24 @@ func (w *MainWindow) jog(axis string, direction float64) {
 }
 
 func (w *MainWindow) jogToEnd(axis string, direction float64) {
-	feed, ok := w.parsePositiveFloat(w.feedCombo.CurrentText(), "feed")
-	if !ok {
-		return
-	}
-	travel, ok := w.axisTravel(axis)
-	if !ok {
-		return
-	}
-	idx := axisIndex(axis)
-	if idx < 0 {
-		w.appendConsole("ERR", fmt.Sprintf("unsupported jog axis %q", axis))
-		return
-	}
-	state := w.controller.Snapshot()
-	if !state.HasMachinePosition {
-		w.appendConsole("ERR", "machine position is unknown; wait for a status report before jog-to-end")
-		return
-	}
-	target := -travel
-	if direction > 0 {
-		target = 0
-	}
-	if math.Abs(state.MachinePosition[idx]-target) <= 0.001 {
-		w.appendConsole("SYS", fmt.Sprintf("%s axis is already at %.3f mm", strings.ToUpper(axis), target))
-		return
-	}
-	go func() { _ = w.controller.JogTo(context.Background(), axis, target, feed) }()
-}
-
-func (w *MainWindow) parsePositiveFloat(text, name string) (float64, bool) {
-	value, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+	plan, err := frontend.PlanJogToEnd(frontend.JogToEndInput{
+		Axis:        axis,
+		Direction:   direction,
+		FeedText:    w.feedCombo.CurrentText(),
+		XTravelText: w.xTravel.Text(),
+		YTravelText: w.yTravel.Text(),
+		ZTravelText: w.zTravel.Text(),
+		State:       w.controller.Snapshot(),
+	})
 	if err != nil {
-		w.appendConsole("ERR", fmt.Sprintf("invalid %s: %v", name, err))
-		return 0, false
+		w.appendConsole("ERR", err.Error())
+		return
 	}
-	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
-		w.appendConsole("ERR", fmt.Sprintf("invalid %s: must be a finite value greater than zero", name))
-		return 0, false
+	if plan.AlreadyAtTarget {
+		w.appendConsole("SYS", plan.Message)
+		return
 	}
-	return value, true
-}
-
-func (w *MainWindow) axisTravel(axis string) (float64, bool) {
-	switch strings.ToUpper(strings.TrimSpace(axis)) {
-	case "X":
-		return w.parsePositiveFloat(w.xTravel.Text(), "X travel")
-	case "Y":
-		return w.parsePositiveFloat(w.yTravel.Text(), "Y travel")
-	case "Z":
-		return w.parsePositiveFloat(w.zTravel.Text(), "Z travel")
-	default:
-		w.appendConsole("ERR", fmt.Sprintf("unsupported jog axis %q", axis))
-		return 0, false
-	}
-}
-
-func axisIndex(axis string) int {
-	switch strings.ToUpper(strings.TrimSpace(axis)) {
-	case "X":
-		return 0
-	case "Y":
-		return 1
-	case "Z":
-		return 2
-	default:
-		return -1
-	}
+	go func() { _ = w.controller.JogTo(context.Background(), plan.Axis, plan.Target, plan.Feed) }()
 }
 
 func (w *MainWindow) ApplyEvent(ev app.Event) {
