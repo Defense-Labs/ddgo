@@ -645,7 +645,7 @@ func (w *MainWindow) ApplyState(state app.State) {
 	if state.ProgramPath != "" && strings.TrimSpace(w.programPath.Text()) == "" {
 		w.programPath.SetText(state.ProgramPath)
 	}
-	w.programStatus.SetText("Program: " + formatProgramStatus(state))
+	w.programStatus.SetText("Program: " + frontend.FormatProgramStatus(state))
 	w.programProgress.SetText(fmt.Sprintf("Progress: %d / %d", state.ProgramComplete, state.ProgramTotal))
 	if state.LastError != "" {
 		w.lastErrorLabel.SetText("Last error: " + state.LastError)
@@ -696,27 +696,6 @@ func (w *MainWindow) ApplyState(state app.State) {
 
 func (w *MainWindow) appendConsole(prefix string, text string) {
 	w.console.AppendPlainText(fmt.Sprintf("[%s] %s", prefix, text))
-}
-
-func formatProgramStatus(state app.State) string {
-	switch state.ProgramStatus {
-	case app.ProgramNotLoaded:
-		return "not loaded"
-	case app.ProgramLoaded:
-		return fmt.Sprintf("loaded (%s)", state.ProgramName)
-	case app.ProgramRunning:
-		return fmt.Sprintf("running (%s)", state.ProgramName)
-	case app.ProgramPaused:
-		return fmt.Sprintf("paused (%s)", state.ProgramName)
-	case app.ProgramStopped:
-		return fmt.Sprintf("stopped (%s)", state.ProgramName)
-	case app.ProgramCompleted:
-		return fmt.Sprintf("completed (%s)", state.ProgramName)
-	case app.ProgramFailed:
-		return fmt.Sprintf("failed (%s)", state.ProgramName)
-	default:
-		return string(state.ProgramStatus)
-	}
 }
 
 func label(text string) *qt.QLabel {
