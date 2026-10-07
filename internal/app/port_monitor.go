@@ -155,10 +155,18 @@ func (c *Controller) scanPorts(ctx context.Context, explicit bool) error {
 	}
 	c.mu.Unlock()
 	if emit {
-		c.events <- Event{Kind: EventPortsRefreshed, When: c.portMonitorNow(), Text: formatPortChanges(previous, list, explicit), Ports: clonePorts(list), State: snapshot.state, StateRevision: snapshot.revision}
+		c.events <- Event{Kind: EventPortsRefreshed, When: c.portMonitorNow(), Text: formatPortChanges(previous, list, explicit), Ports: availablePorts(list), State: snapshot.state, StateRevision: snapshot.revision}
 	}
 	c.considerAutoConnect(ctx, list)
 	return nil
+}
+
+func availablePorts(list []ports.Info) []AvailablePort {
+	out := make([]AvailablePort, len(list))
+	for i, port := range list {
+		out[i] = AvailablePort{Name: port.Name}
+	}
+	return out
 }
 
 func (c *Controller) considerAutoConnect(ctx context.Context, list []ports.Info) {

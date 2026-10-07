@@ -3,7 +3,6 @@ package app
 import (
 	"time"
 
-	"github.com/ianbruene/ddgo/internal/ports"
 	"github.com/ianbruene/ddgo/internal/transport"
 )
 
@@ -18,6 +17,10 @@ type ConnectionStatus string
 type EStopStatus string
 
 type EStopSource string
+
+type AvailablePort struct {
+	Name string
+}
 
 const (
 	EventStateChanged   EventKind = "state_changed"
@@ -103,6 +106,6 @@ type Event struct {
 	Err           error
 	State         State
 	StateRevision StateRevision
-	Ports         []ports.Info
+	Ports         []AvailablePort
 	Raw           transport.Event
 }

@@ -11,7 +11,6 @@ import (
 
 	"github.com/ianbruene/ddgo/internal/app"
 	"github.com/ianbruene/ddgo/internal/frontend"
-	"github.com/ianbruene/ddgo/internal/ports"
 	qt "github.com/mappu/miqt/qt"
 )
 
@@ -574,7 +573,7 @@ func (w *MainWindow) ApplyEvent(ev app.Event) {
 	}
 }
 
-func (w *MainWindow) populatePorts(list []ports.Info) {
+func (w *MainWindow) populatePorts(list []app.AvailablePort) {
 	selected := strings.TrimSpace(w.portCombo.CurrentText())
 	if state := w.controller.Snapshot(); state.IsConnected() {
 		selected = state.PortName
