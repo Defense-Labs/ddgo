@@ -11,7 +11,6 @@ import (
 
 	"github.com/ianbruene/ddgo/internal/app"
 	"github.com/ianbruene/ddgo/internal/frontend"
-	"github.com/ianbruene/ddgo/internal/grbl"
 	"github.com/ianbruene/ddgo/internal/ports"
 	qt "github.com/mappu/miqt/qt"
 )
@@ -331,7 +330,7 @@ func (w *MainWindow) build() {
 	spindleGroup := groupBox("Spindle")
 	rightLayout.AddWidget(spindleGroup.QWidget)
 	w.spindleRPM = qt.NewQSpinBox(nil)
-	w.spindleRPM.SetRange(grbl.MinSpindleRPM, grbl.MaxSpindleRPM)
+	w.spindleRPM.SetRange(app.SpindleMinRPM, app.SpindleMaxRPM)
 	w.spindleRPM.SetValue(5000)
 	w.spindleRPM.SetSuffix(" RPM")
 	spindleGroup.Layout().AddWidget(w.spindleRPM.QWidget)
