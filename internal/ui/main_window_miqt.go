@@ -400,12 +400,24 @@ func (w *MainWindow) bind() {
 	w.jogToZPButton.OnClicked(func() { w.jogToEnd("Z", +1) })
 	w.jogToZMButton.OnClicked(func() { w.jogToEnd("Z", -1) })
 	w.stopMotionButton.OnClicked(func() { go func() { _ = w.controller.StopMotion(context.Background()) }() })
-	w.unlockButton.OnClicked(func() { w.action(grbl.ActionUnlock) })
-	w.homeButton.OnClicked(func() { w.action(grbl.ActionHome) })
-	w.resetButton.OnClicked(func() { w.action(grbl.ActionSoftReset) })
-	w.holdButton.OnClicked(func() { w.action(grbl.ActionHold) })
-	w.resumeActBtn.OnClicked(func() { w.action(grbl.ActionResume) })
-	w.statusButton.OnClicked(func() { w.action(grbl.ActionStatus) })
+	w.unlockButton.OnClicked(func() {
+		go func() { _ = w.controller.Unlock(context.Background()) }()
+	})
+	w.homeButton.OnClicked(func() {
+		go func() { _ = w.controller.Home(context.Background()) }()
+	})
+	w.resetButton.OnClicked(func() {
+		go func() { _ = w.controller.SoftReset(context.Background()) }()
+	})
+	w.holdButton.OnClicked(func() {
+		go func() { _ = w.controller.Hold(context.Background()) }()
+	})
+	w.resumeActBtn.OnClicked(func() {
+		go func() { _ = w.controller.ResumeMotion(context.Background()) }()
+	})
+	w.statusButton.OnClicked(func() {
+		go func() { _ = w.controller.RequestStatus(context.Background()) }()
+	})
 	w.spindleCWButton.OnClicked(func() {
 		rpm := float64(w.spindleRPM.Value())
 		go func() { _ = w.controller.StartSpindleCW(context.Background(), rpm) }()
@@ -539,10 +551,6 @@ func axisIndex(axis string) int {
 	default:
 		return -1
 	}
-}
-
-func (w *MainWindow) action(action grbl.Action) {
-	go func() { _ = w.controller.Action(context.Background(), action) }()
 }
 
 func (w *MainWindow) ApplyEvent(ev app.Event) {

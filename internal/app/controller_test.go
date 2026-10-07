@@ -434,6 +434,49 @@ func TestControllerConnectSendJogActionAndReceive(t *testing.T) {
 	}
 }
 
+func TestControllerSemanticActions(t *testing.T) {
+	tests := []struct {
+		name        string
+		call        func(*Controller, context.Context) error
+		wantPayload []byte
+		wantDisplay string
+	}{
+		{name: "unlock", call: (*Controller).Unlock, wantPayload: []byte("$X\n"), wantDisplay: "$X"},
+		{name: "home", call: (*Controller).Home, wantPayload: []byte("$H\n"), wantDisplay: "$H"},
+		{name: "soft reset", call: (*Controller).SoftReset, wantPayload: []byte{0x18}, wantDisplay: "Ctrl-X"},
+		{name: "hold", call: (*Controller).Hold, wantPayload: []byte("!"), wantDisplay: "!"},
+		{name: "resume motion", call: (*Controller).ResumeMotion, wantPayload: []byte("~"), wantDisplay: "~"},
+		{name: "request status", call: (*Controller).RequestStatus, wantPayload: []byte("?"), wantDisplay: "?"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := transport.NewFakeTransport()
+			controller := NewController(fake, nil)
+			controller.statusPollInterval = time.Hour
+			t.Cleanup(func() { _ = controller.Disconnect() })
+
+			if err := controller.Connect(context.Background(), transport.DefaultPortConfig("fake")); err != nil {
+				t.Fatalf("Connect() error = %v", err)
+			}
+			if err := tt.call(controller, context.Background()); err != nil {
+				t.Fatalf("semantic action error = %v", err)
+			}
+
+			written := fake.Written()
+			if len(written) != 1 {
+				t.Fatalf("len(Written()) = %d, want 1", len(written))
+			}
+			if got := written[0].Payload; !reflect.DeepEqual(got, tt.wantPayload) {
+				t.Errorf("payload = %v, want %v", got, tt.wantPayload)
+			}
+			if got := written[0].Display; got != tt.wantDisplay {
+				t.Errorf("display = %q, want %q", got, tt.wantDisplay)
+			}
+		})
+	}
+}
+
 func TestControllerJogToWritesMachineJog(t *testing.T) {
 	t.Parallel()
 

@@ -794,6 +794,30 @@ func (c *Controller) Action(ctx context.Context, action grbl.Action) error {
 	return c.writeRealtimeMessage(ctx, msg)
 }
 
+func (c *Controller) Unlock(ctx context.Context) error {
+	return c.Action(ctx, grbl.ActionUnlock)
+}
+
+func (c *Controller) Home(ctx context.Context) error {
+	return c.Action(ctx, grbl.ActionHome)
+}
+
+func (c *Controller) SoftReset(ctx context.Context) error {
+	return c.Action(ctx, grbl.ActionSoftReset)
+}
+
+func (c *Controller) Hold(ctx context.Context) error {
+	return c.Action(ctx, grbl.ActionHold)
+}
+
+func (c *Controller) ResumeMotion(ctx context.Context) error {
+	return c.Action(ctx, grbl.ActionResume)
+}
+
+func (c *Controller) RequestStatus(ctx context.Context) error {
+	return c.Action(ctx, grbl.ActionStatus)
+}
+
 func (c *Controller) beginRealtimeWriteLocked() error {
 	return c.beginRealtimeWriteForAdmissionLocked(admissionRealtime)
 }
