@@ -653,44 +653,37 @@ func (w *MainWindow) ApplyState(state app.State) {
 		w.lastErrorLabel.SetText("Last error: none")
 	}
 
-	programActive := state.ProgramStatus.IsActive()
-	connected := state.IsConnected()
-	safetyClear := state.EStopStatus == app.EStopClear
-	recovering := state.EStopStatus == app.EStopRecovery
-	loaded := state.ProgramTotal > 0
-	canManual := connected && safetyClear && !programActive
-	canRun := connected && safetyClear && loaded && !programActive
+	controls := frontend.MainWindowControls(state)
 
-	w.refreshButton.SetEnabled(!programActive)
-	w.connectButton.SetEnabled(!programActive && !state.IsConnecting())
-	w.portCombo.SetEnabled(!programActive)
-	w.programPath.SetEnabled(!programActive)
-	w.browseButton.SetEnabled(!programActive)
-	w.runButton.SetEnabled(canRun)
-	w.pauseButton.SetEnabled(state.ProgramStatus == app.ProgramRunning)
-	w.resumeButton.SetEnabled(state.ProgramStatus == app.ProgramPaused)
-	w.stopButton.SetEnabled(programActive)
+	w.refreshButton.SetEnabled(controls.RefreshPortsEnabled)
+	w.connectButton.SetEnabled(controls.ConnectEnabled)
+	w.portCombo.SetEnabled(controls.PortSelectionEnabled)
+	w.programPath.SetEnabled(controls.ProgramPathEnabled)
+	w.browseButton.SetEnabled(controls.BrowseProgramEnabled)
+	w.runButton.SetEnabled(controls.RunProgramEnabled)
+	w.pauseButton.SetEnabled(controls.PauseProgramEnabled)
+	w.resumeButton.SetEnabled(controls.ResumeProgramEnabled)
+	w.stopButton.SetEnabled(controls.StopProgramEnabled)
 
-	w.sendButton.SetEnabled(canManual)
-	w.commandEntry.SetEnabled(canManual)
-	w.stepCombo.SetEnabled(canManual)
-	w.feedCombo.SetEnabled(canManual)
+	w.sendButton.SetEnabled(controls.ManualControlsEnabled)
+	w.commandEntry.SetEnabled(controls.ManualControlsEnabled)
+	w.stepCombo.SetEnabled(controls.ManualControlsEnabled)
+	w.feedCombo.SetEnabled(controls.ManualControlsEnabled)
 	for _, input := range []*qt.QLineEdit{w.xTravel, w.yTravel, w.zTravel} {
-		input.SetEnabled(canManual)
+		input.SetEnabled(controls.ManualControlsEnabled)
 	}
 	for _, btn := range []*qt.QPushButton{w.jogXPButton, w.jogXMButton, w.jogYPButton, w.jogYMButton, w.jogZPButton, w.jogZMButton, w.homeButton, w.holdButton, w.resumeActBtn, w.statusButton} {
-		btn.SetEnabled(canManual)
+		btn.SetEnabled(controls.ManualControlsEnabled)
 	}
-	w.unlockButton.SetEnabled(canManual || (connected && recovering && !programActive))
-	w.resetButton.SetEnabled(canManual || (connected && recovering && !programActive))
-	canJogToEnd := canManual && state.HasMachinePosition
+	w.unlockButton.SetEnabled(controls.UnlockEnabled)
+	w.resetButton.SetEnabled(controls.ResetEnabled)
 	for _, btn := range []*qt.QPushButton{w.jogToXPButton, w.jogToXMButton, w.jogToYPButton, w.jogToYMButton, w.jogToZPButton, w.jogToZMButton} {
-		btn.SetEnabled(canJogToEnd)
+		btn.SetEnabled(controls.JogToEndEnabled)
 	}
-	w.stopMotionButton.SetEnabled(canManual)
-	w.spindleRPM.SetEnabled(canManual)
+	w.stopMotionButton.SetEnabled(controls.ManualControlsEnabled)
+	w.spindleRPM.SetEnabled(controls.ManualControlsEnabled)
 	for _, btn := range []*qt.QPushButton{w.spindleCWButton, w.spindleCCWButton, w.spindleSetButton, w.spindleStopButton} {
-		btn.SetEnabled(canManual)
+		btn.SetEnabled(controls.ManualControlsEnabled)
 	}
 }
 
