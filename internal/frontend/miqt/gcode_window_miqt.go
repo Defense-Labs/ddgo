@@ -1,6 +1,6 @@
 //go:build miqt
 
-package ui
+package miqt
 
 import (
 	"github.com/ianbruene/ddgo/internal/app"

@@ -1,6 +1,6 @@
 //go:build miqt
 
-package ui
+package miqt
 
 import (
 	"path/filepath"
