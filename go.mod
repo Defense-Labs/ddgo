@@ -3,7 +3,7 @@ module github.com/ianbruene/ddgo
 go 1.23
 
 require (
-	github.com/mappu/miqt v0.13.0
+	github.com/mappu/miqt v0.14.0
 	go.bug.st/serial v1.6.4
 )
 
