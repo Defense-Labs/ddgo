@@ -1,12 +1,12 @@
 //go:build miqt
 
-package ui
+package main
 
 import (
 	"github.com/ianbruene/ddgo/internal/app"
 	frontendmiqt "github.com/ianbruene/ddgo/internal/frontend/miqt"
 )
 
-func Run(controller *app.Controller) error {
+func runUI(controller *app.Controller) error {
 	return frontendmiqt.Run(controller)
 }

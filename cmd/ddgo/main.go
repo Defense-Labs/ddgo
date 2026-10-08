@@ -7,7 +7,6 @@ import (
 	"github.com/ianbruene/ddgo/internal/app"
 	"github.com/ianbruene/ddgo/internal/ports"
 	"github.com/ianbruene/ddgo/internal/transport"
-	"github.com/ianbruene/ddgo/internal/ui"
 )
 
 func run(uiRunner func(*app.Controller) error) error {
@@ -16,7 +15,7 @@ func run(uiRunner func(*app.Controller) error) error {
 }
 
 func main() {
-	if err := run(ui.Run); err != nil {
+	if err := run(runUI); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
