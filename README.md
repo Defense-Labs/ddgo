@@ -36,7 +36,7 @@ DDGo is a Go-based GRBL-style CNC controller/operator UI. The repository is orga
 - `internal/macro`: macro interception framework, runtime interfaces, WCS helpers, variables, and contour state primitives.
 - `internal/transport`: serial transport interface, fake transport, and real/stub serial implementations.
 - `internal/ports`: serial port discovery seam and real/stub implementations.
-- `internal/ui`: optional MIQT/Qt Widgets UI and no-tag stub.
+- `internal/frontend`: toolkit-independent presentation logic and the optional MIQT/Qt Widgets implementation.
 - `cmd/ddgo`: application entrypoint.
 - `cmd/mockgrbl`: local GrblDD-style mock controller with PTY serial emulation and debug HTTP API.
 - `docs/architecture.md`: current architecture notes for contributors.
