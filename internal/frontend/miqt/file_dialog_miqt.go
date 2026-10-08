@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	qt "github.com/mappu/miqt/qt"
+	qt "github.com/mappu/miqt/qt6"
 )
 
 const (

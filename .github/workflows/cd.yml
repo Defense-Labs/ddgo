@@ -32,8 +32,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential \
             pkg-config \
-            qtbase5-dev \
-            qtbase5-dev-tools \
+            qt6-base-dev \
+            qt6-base-dev-tools \
             libxcb-xinerama0 \
             libxcb-xinput0 \
             libxcb-cursor0 \
@@ -111,21 +111,24 @@ jobs:
       - name: Install macOS dependencies
         run: |
           set -euo pipefail
-          brew install qt@5 pkg-config
+          brew install qt pkg-config
       - name: Determine macOS cache context
         id: cache-context
         shell: bash
         run: |
           set -euo pipefail
 
-          qt_prefix="$(brew --prefix qt@5)"
+          qt_prefix="$(brew --prefix qt)"
           export PATH="${qt_prefix}/bin:$PATH"
           export PKG_CONFIG_PATH="${qt_prefix}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
+          test -x "${qt_prefix}/bin/macdeployqt"
+          pkg-config --exists Qt6Core Qt6Widgets
+
           go_mod_cache="$(go env GOMODCACHE)"
           go_build_cache="$(go env GOCACHE)"
-          qt_formula_version="$(brew list --versions qt@5 | awk 'NR == 1 { print $2 }')"
-          qt_pkg_version="$(pkg-config --modversion Qt5Core)"
+          qt_formula_version="$(brew list --versions qt | awk 'NR == 1 { print $2 }')"
+          qt_pkg_version="$(pkg-config --modversion Qt6Core)"
 
           if [[ -z "$go_mod_cache" ]]; then
             echo "Unable to determine GOMODCACHE" >&2
@@ -138,12 +141,12 @@ jobs:
           fi
 
           if [[ -z "$qt_formula_version" ]]; then
-            echo "Unable to determine Homebrew qt@5 version" >&2
+            echo "Unable to determine Homebrew qt version" >&2
             exit 1
           fi
 
           if [[ -z "$qt_pkg_version" ]]; then
-            echo "Unable to determine Qt5Core version" >&2
+            echo "Unable to determine Qt6Core version" >&2
             exit 1
           fi
 
@@ -154,8 +157,8 @@ jobs:
 
           echo "GOMODCACHE=$go_mod_cache"
           echo "GOCACHE=$go_build_cache"
-          echo "Homebrew qt@5 version=$qt_formula_version"
-          echo "Qt5Core pkg-config version=$qt_pkg_version"
+          echo "Homebrew qt version=$qt_formula_version"
+          echo "Qt6Core pkg-config version=$qt_pkg_version"
       - name: Restore macOS Go module cache
         id: go-mod-cache
         uses: actions/cache/restore@v6
@@ -167,12 +170,12 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ steps.cache-context.outputs.go_build_cache }}
-          key: ddgo-macos-build-v1-${{ matrix.os }}-${{ matrix.arch }}-macos-${{ matrix.macos_min }}-go-${{ steps.setup-go.outputs.go-version }}-qt-${{ steps.cache-context.outputs.qt_formula_version }}-${{ steps.cache-context.outputs.qt_pkg_version }}-${{ hashFiles('go.mod', 'go.sum') }}
+          key: ddgo-macos-build-v1-${{ matrix.os }}-${{ matrix.arch }}-macos-${{ matrix.macos_min }}-go-${{ steps.setup-go.outputs.go-version }}-qt6-${{ steps.cache-context.outputs.qt_formula_version }}-${{ steps.cache-context.outputs.qt_pkg_version }}-${{ hashFiles('go.mod', 'go.sum') }}
       - name: Configure macOS build environment
         run: |
           set -euxo pipefail
           export MACOSX_DEPLOYMENT_TARGET="${{ matrix.macos_min }}"
-          qt_prefix="$(brew --prefix qt@5)"
+          qt_prefix="$(brew --prefix qt)"
           export PATH="${qt_prefix}/bin:$PATH"
           export PKG_CONFIG_PATH="${qt_prefix}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           export CGO_CFLAGS="-I${qt_prefix}/include ${CGO_CFLAGS:-}"
@@ -186,21 +189,22 @@ jobs:
           go version
           clang --version
           brew --prefix
-          brew --prefix qt@5
+          brew --prefix qt
           echo "CGO_CFLAGS=$CGO_CFLAGS"
           echo "CGO_CXXFLAGS=$CGO_CXXFLAGS"
           echo "CGO_LDFLAGS=$CGO_LDFLAGS"
-          pkg-config --modversion Qt5Core
-          pkg-config --modversion Qt5Widgets
-          qmake -query || true
-          qt_plugins_dir="$(qmake -query QT_INSTALL_PLUGINS || echo "$qt_prefix/plugins")"
+          pkg-config --modversion Qt6Core
+          pkg-config --modversion Qt6Widgets
+          test -x "$qt_prefix/bin/macdeployqt"
+          "$qt_prefix/bin/qmake" -query
+          qt_plugins_dir="$("$qt_prefix/bin/qmake" -query QT_INSTALL_PLUGINS)"
           ls -la "$qt_plugins_dir/platforms" || true
       - name: Build macOS app binary
         run: |
           set -euxo pipefail
           mkdir -p dist
           export MACOSX_DEPLOYMENT_TARGET="${{ matrix.macos_min }}"
-          qt_prefix="$(brew --prefix qt@5)"
+          qt_prefix="$(brew --prefix qt)"
           export PATH="${qt_prefix}/bin:$PATH"
           export PKG_CONFIG_PATH="${qt_prefix}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           export CGO_CFLAGS="-I${qt_prefix}/include ${CGO_CFLAGS:-}"
@@ -227,8 +231,8 @@ jobs:
         run: |
           set -euxo pipefail
           export MACOSX_DEPLOYMENT_TARGET="${{ matrix.macos_min }}"
-          export PATH="$(brew --prefix qt@5)/bin:$PATH"
-          export PKG_CONFIG_PATH="$(brew --prefix qt@5)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          export PATH="$(brew --prefix qt)/bin:$PATH"
+          export PKG_CONFIG_PATH="$(brew --prefix qt)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
           file dist/ddgo-darwin-${{ matrix.slice }}
           lipo -archs dist/ddgo-darwin-${{ matrix.slice }}
@@ -237,8 +241,8 @@ jobs:
         run: |
           set -euxo pipefail
           export MACOSX_DEPLOYMENT_TARGET="${{ matrix.macos_min }}"
-          export PATH="$(brew --prefix qt@5)/bin:$PATH"
-          export PKG_CONFIG_PATH="$(brew --prefix qt@5)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          export PATH="$(brew --prefix qt)/bin:$PATH"
+          export PKG_CONFIG_PATH="$(brew --prefix qt)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
           rm -rf dist/macos-${{ matrix.slice }}
           mkdir -p dist/macos-${{ matrix.slice }}
@@ -252,8 +256,8 @@ jobs:
         run: |
           set -euo pipefail
           export MACOSX_DEPLOYMENT_TARGET="${{ matrix.macos_min }}"
-          export PATH="$(brew --prefix qt@5)/bin:$PATH"
-          export PKG_CONFIG_PATH="$(brew --prefix qt@5)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          export PATH="$(brew --prefix qt)/bin:$PATH"
+          export PKG_CONFIG_PATH="$(brew --prefix qt)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
           bash scripts/verify-macos-app.sh dist/macos-${{ matrix.slice }}/DDGo.app ${{ matrix.lipo_arch }} 15.0
       - name: Archive macOS app slice
@@ -323,7 +327,7 @@ jobs:
           install: >-
             mingw-w64-x86_64-go
             mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-qt5-base
+            mingw-w64-x86_64-qt6-base
             mingw-w64-x86_64-pkgconf
             zip
           msystem: MINGW64
@@ -360,7 +364,7 @@ jobs:
             mingw-w64-x86_64-crt
             mingw-w64-x86_64-headers
             mingw-w64-x86_64-winpthreads
-            mingw-w64-x86_64-qt5-base
+            mingw-w64-x86_64-qt6-base
             mingw-w64-x86_64-pkgconf
           )
 

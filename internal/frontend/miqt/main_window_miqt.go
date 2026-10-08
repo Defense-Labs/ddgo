@@ -10,7 +10,7 @@ import (
 
 	"github.com/ianbruene/ddgo/internal/app"
 	"github.com/ianbruene/ddgo/internal/frontend"
-	qt "github.com/mappu/miqt/qt"
+	qt "github.com/mappu/miqt/qt6"
 )
 
 type MainWindow struct {
@@ -89,7 +89,7 @@ func (w *MainWindow) build() {
 	w.window.Resize(1180, 640)
 	w.window.SetAttribute(qt.WA_DeleteOnClose)
 	fileMenu := w.window.MenuBar().AddMenuWithTitle("File")
-	openAction := fileMenu.AddAction("Open…")
+	openAction := fileMenu.AddActionWithText("Open…")
 	openAction.OnTriggered(func() {
 		if w.onOpen != nil {
 			w.onOpen()

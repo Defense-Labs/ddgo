@@ -10,7 +10,8 @@ exe="$1"
 stage="$2"
 prefix="${MINGW_PREFIX:-/mingw64}"
 qt_bin="$prefix/bin"
-qt_plugins="$prefix/share/qt5/plugins"
+qt_plugins="$prefix/share/qt6/plugins"
+deploy_tool="$qt_bin/windeployqt6.exe"
 
 if [[ ! -f "$exe" ]]; then
   echo "input exe not found: $exe" >&2
@@ -20,19 +21,21 @@ if [[ ! -d "$qt_bin" ]]; then
   echo "Qt/MinGW bin directory not found: $qt_bin" >&2
   exit 1
 fi
+if [[ ! -x "$deploy_tool" ]]; then
+  echo "Qt 6 deployment tool not found or not executable: $deploy_tool" >&2
+  exit 1
+fi
 
 rm -rf "$stage"
 mkdir -p "$stage/platforms"
 cp "$exe" "$stage/DDGo.exe"
 
-if command -v windeployqt >/dev/null 2>&1; then
-  windeployqt --release "$stage/DDGo.exe"
-fi
+"$deploy_tool" --release "$stage/DDGo.exe"
 
 required_dlls=(
-  Qt5Core.dll
-  Qt5Gui.dll
-  Qt5Widgets.dll
+  Qt6Core.dll
+  Qt6Gui.dll
+  Qt6Widgets.dll
   libgcc_s_seh-1.dll
   libstdc++-6.dll
   libwinpthread-1.dll

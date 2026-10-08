@@ -37,14 +37,14 @@ jobs:
             go.sum
             .github/go-cache-version
 
-      - name: Install Qt 5 development dependencies
+      - name: Install Qt 6 development dependencies
         if: matrix.os == 'ubuntu-24.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config \
-            qtbase5-dev \
-            qtbase5-dev-tools
+            qt6-base-dev \
+            qt6-base-dev-tools
 
       - name: Build MIQT GUI
         if: matrix.os == 'ubuntu-24.04'

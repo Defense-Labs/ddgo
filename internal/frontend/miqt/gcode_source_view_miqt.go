@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"math"
 
-	qt "github.com/mappu/miqt/qt"
+	qt "github.com/mappu/miqt/qt6"
 )
 
 // GCodeSourceView presents faithful source text and a physical-line gutter.

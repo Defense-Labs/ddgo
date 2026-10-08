@@ -10,7 +10,7 @@ import (
 	"github.com/ianbruene/ddgo/internal/app"
 	"github.com/ianbruene/ddgo/internal/frontend"
 	"github.com/ianbruene/ddgo/internal/gcode"
-	qt "github.com/mappu/miqt/qt"
+	qt "github.com/mappu/miqt/qt6"
 )
 
 // Application owns the Qt lifetime, top-level windows, and the single UI-side

@@ -5,7 +5,7 @@ package miqt
 import (
 	"github.com/ianbruene/ddgo/internal/app"
 	"github.com/ianbruene/ddgo/internal/gcode"
-	qt "github.com/mappu/miqt/qt"
+	qt "github.com/mappu/miqt/qt6"
 )
 
 // GCodeWindow is a read-only top-level view of exactly one loaded document.
@@ -32,7 +32,7 @@ func newGCodeWindow(document gcode.Document, onOpen func()) *GCodeWindow {
 	w.window.SetCentralWidget(w.sourceView.editor.QWidget)
 
 	fileMenu := w.window.MenuBar().AddMenuWithTitle("File")
-	openAction := fileMenu.AddAction("Open…")
+	openAction := fileMenu.AddActionWithText("Open…")
 	openAction.OnTriggered(func() {
 		if w.onOpen != nil {
 			w.onOpen()

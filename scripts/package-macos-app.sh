@@ -21,7 +21,7 @@ if [[ ! -f "$bin_path" ]]; then
   exit 1
 fi
 
-qt_prefix="$(brew --prefix qt@5)"
+qt_prefix="$(brew --prefix qt)"
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 export PATH="$qt_prefix/bin:$PATH"
 export PKG_CONFIG_PATH="$qt_prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
@@ -70,6 +70,7 @@ echo "qt_prefix=$qt_prefix"
 echo "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
 echo "PATH=$PATH"
 echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
+test -x "$qt_prefix/bin/macdeployqt"
 "$qt_prefix/bin/macdeployqt" -version || true
 otool -L "$app_dir/Contents/MacOS/ddgo"
 

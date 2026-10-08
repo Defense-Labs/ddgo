@@ -24,16 +24,12 @@ if [[ ! -x "$mockgrbl_binary" ]]; then
   exit 1
 fi
 
-if command -v qmake >/dev/null 2>&1; then
-  qmake_cmd=qmake
-elif command -v qmake-qt5 >/dev/null 2>&1; then
-  qmake_cmd=qmake-qt5
-else
-  echo "qmake/qmake-qt5 is required to locate Qt plugins" >&2
+if ! command -v qmake6 >/dev/null 2>&1; then
+  echo "qmake6 is required to locate Qt plugins" >&2
   exit 1
 fi
 
-qt_plugins_dir="$($qmake_cmd -query QT_INSTALL_PLUGINS)"
+qt_plugins_dir="$(qmake6 -query QT_INSTALL_PLUGINS)"
 if [[ -z "$qt_plugins_dir" || ! -d "$qt_plugins_dir" ]]; then
   echo "Qt plugins directory not found: $qt_plugins_dir" >&2
   exit 1
