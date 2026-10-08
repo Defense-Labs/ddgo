@@ -179,7 +179,7 @@ jobs:
           export PATH="${qt_prefix}/bin:$PATH"
           export PKG_CONFIG_PATH="${qt_prefix}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           export CGO_CFLAGS="-I${qt_prefix}/include ${CGO_CFLAGS:-}"
-          export CGO_CXXFLAGS="-I${qt_prefix}/include ${CGO_CXXFLAGS:-}"
+          export CGO_CXXFLAGS="-std=c++17 -I${qt_prefix}/include ${CGO_CXXFLAGS:-}"
           export CGO_LDFLAGS="-F${qt_prefix}/lib -L${qt_prefix}/lib ${CGO_LDFLAGS:-}"
 
           echo "RUNNER_OS=$RUNNER_OS"
@@ -208,7 +208,7 @@ jobs:
           export PATH="${qt_prefix}/bin:$PATH"
           export PKG_CONFIG_PATH="${qt_prefix}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           export CGO_CFLAGS="-I${qt_prefix}/include ${CGO_CFLAGS:-}"
-          export CGO_CXXFLAGS="-I${qt_prefix}/include ${CGO_CXXFLAGS:-}"
+          export CGO_CXXFLAGS="-std=c++17 -I${qt_prefix}/include ${CGO_CXXFLAGS:-}"
           export CGO_LDFLAGS="-F${qt_prefix}/lib -L${qt_prefix}/lib ${CGO_LDFLAGS:-}"
 
           GOOS=darwin GOARCH=${{ matrix.arch }} CGO_ENABLED=1 \
