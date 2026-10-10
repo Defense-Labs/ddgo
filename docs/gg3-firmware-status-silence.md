@@ -171,10 +171,17 @@ and clears the pending status flag instead.
 
 The controller is therefore connected, receiving `?`, executing the realtime
 request, and transmitting a response, but that response is not a normal
-`<...>` status report. DDGo currently treats only a successfully parsed
-realtime status report as heartbeat proof. An ordinary Grbl alarm can
-consequently be followed by `EStopSourceUnresponsive` even though the firmware
-is actively communicating.
+`<...>` status report. DDGo originally treated only a successfully parsed
+realtime status report as heartbeat proof, so an ordinary Grbl alarm could be
+followed by `EStopSourceUnresponsive` even though the firmware was actively
+communicating.
+
+DDGo's first mitigation now counts any accepted RX from the committed,
+actively monitored transport generation as proof of liveness. This prevents a
+critical-event feedback line from being mistaken for total controller silence.
+It does not treat `[MSG:Reset to cont]` or another generic line as a parsed
+status report, and only a valid status report retains the stronger e-stop
+recovery semantics.
 
 This differs fundamentally from homing and leveling: those commands defer
 servicing the request, whereas the critical-alarm loop services it using a
@@ -274,21 +281,25 @@ known long-silence command.
 | `$E` | Short print-bound blind spot | Yes | Large synchronous output |
 
 "No normal status response" in this table must not be shortened to "no
-response": the critical-alarm case sends a response that DDGo does not
-currently recognize as heartbeat proof.
+response": the critical-alarm case sends a response. DDGo now recognizes that
+RX as heartbeat proof without assigning it normal status-report semantics.
 
 ## Implications for DDGo
 
 This inspection establishes constraints, not the final watchdog implementation:
 
 1. A global rule that "no valid status report for two seconds means e-stop" is
-   incorrect for this firmware.
+   incorrect for this firmware. Counting any accepted current-connection RX as
+   liveness corrects the response-form case, but not command-associated periods
+   with no output.
 2. A modest global timeout increase is insufficient. Legitimate silence can be
    around ten seconds or longer and varies with command, axis, machine
    position, and motion phase.
-3. DDGo will need to distinguish expected command-associated status silence,
-   genuine controller unresponsiveness, and active alarm communication that is
-   not a normal status report.
+3. DDGo must distinguish expected command-associated status silence, genuine
+   controller unresponsiveness, and active alarm communication that is not a
+   normal status report. Generic RX heartbeat accounting distinguishes the last
+   two for liveness purposes without giving generic lines machine-state or
+   e-stop recovery meaning.
 4. Expected silence cannot be unlimited because custom GG3 leveling loops may
    fail to reach their expected hardware transition.
 5. USB disappearance and serial-transport loss remain separate disconnect

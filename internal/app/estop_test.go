@@ -181,7 +181,7 @@ func TestStatusWatchdogTransientWriteFailureRecoversBeforeDeadline(t *testing.T)
 
 	waitForState(t, c, func(s State) bool {
 		c.mu.RLock()
-		responded := c.lastStatusResponseTime.After(started) && c.statusWatchdogStartedAt.IsZero()
+		responded := c.lastControllerActivityTime.After(started) && c.statusWatchdogStartedAt.IsZero()
 		c.mu.RUnlock()
 		return responded && s.EStopStatus == EStopClear
 	})
@@ -191,6 +191,108 @@ func TestStatusWatchdogTransientWriteFailureRecoversBeforeDeadline(t *testing.T)
 	state := c.Snapshot()
 	if state.ConnectionStatus != ConnectionConnected || state.EStopStatus != EStopClear || state.LastError != "" {
 		t.Fatalf("transient write failure latched e-stop: %+v", state)
+	}
+}
+
+func TestStatusWatchdogAcceptsAnyCurrentGenerationRXAsActivity(t *testing.T) {
+	c, fake := connectWatchdogController(t, true)
+	c.mu.Lock()
+	c.controllerResponseTimeout = 500 * time.Millisecond
+	c.mu.Unlock()
+	fake.SetResponding(false)
+
+	for _, line := range []string{
+		"ok",
+		"error:1",
+		"ALARM:1",
+		"[MSG:Reset to cont]",
+		"[PRB:1.000,2.000,3.000:1]",
+		"$100=40.000",
+	} {
+		started := waitForOutstandingHeartbeat(t, c)
+		fake.InjectRX(line)
+		waitForState(t, c, func(s State) bool {
+			c.mu.RLock()
+			activityRecorded := c.lastControllerActivityTime.After(started)
+			c.mu.RUnlock()
+			return activityRecorded && s.EStopStatus == EStopClear
+		})
+	}
+}
+
+func TestNoteControllerActivityUsesRXTimestamp(t *testing.T) {
+	c := NewController(transport.NewFakeTransport(), nil)
+	const generation transport.ConnectionGeneration = 7
+	started := time.Unix(100, 0)
+
+	c.mu.Lock()
+	c.connectionGeneration = generation
+	c.statusMonitoringGeneration = generation
+	c.statusWatchdogStartedAt = started
+
+	oldRX := started.Add(-time.Second)
+	c.noteControllerActivityLocked(generation, oldRX)
+	if c.lastControllerActivityTime != oldRX {
+		c.mu.Unlock()
+		t.Fatalf("last activity = %v, want %v", c.lastControllerActivityTime, oldRX)
+	}
+	if c.statusWatchdogStartedAt != started {
+		c.mu.Unlock()
+		t.Fatalf("old queued RX cleared heartbeat started at %v", started)
+	}
+
+	newRX := started.Add(time.Second)
+	c.noteControllerActivityLocked(generation, newRX)
+	if c.lastControllerActivityTime != newRX || !c.statusWatchdogStartedAt.IsZero() {
+		c.mu.Unlock()
+		t.Fatalf("new RX did not satisfy heartbeat: activity=%v heartbeat=%v", c.lastControllerActivityTime, c.statusWatchdogStartedAt)
+	}
+	c.mu.Unlock()
+}
+
+func TestNoteControllerActivityFallsBackToCurrentTime(t *testing.T) {
+	c := NewController(transport.NewFakeTransport(), nil)
+	const generation transport.ConnectionGeneration = 9
+	started := time.Unix(200, 0)
+	now := started.Add(time.Second)
+	c.now = func() time.Time { return now }
+
+	c.mu.Lock()
+	c.connectionGeneration = generation
+	c.statusMonitoringGeneration = generation
+	c.statusWatchdogStartedAt = started
+	c.noteControllerActivityLocked(generation, time.Time{})
+	activity := c.lastControllerActivityTime
+	heartbeat := c.statusWatchdogStartedAt
+	c.mu.Unlock()
+
+	if activity != now || !heartbeat.IsZero() {
+		t.Fatalf("zero-time RX fallback: activity=%v heartbeat=%v, want activity=%v and cleared heartbeat", activity, heartbeat, now)
+	}
+}
+
+func TestNoteControllerActivityRejectsOtherGenerations(t *testing.T) {
+	c := NewController(transport.NewFakeTransport(), nil)
+	const generation transport.ConnectionGeneration = 11
+	started := time.Unix(300, 0)
+
+	c.mu.Lock()
+	c.connectionGeneration = generation
+	c.statusMonitoringGeneration = generation
+	c.statusWatchdogStartedAt = started
+	c.noteControllerActivityLocked(generation+1, started.Add(time.Second))
+	if !c.lastControllerActivityTime.IsZero() || c.statusWatchdogStartedAt != started {
+		c.mu.Unlock()
+		t.Fatalf("stale generation changed health: activity=%v heartbeat=%v", c.lastControllerActivityTime, c.statusWatchdogStartedAt)
+	}
+	c.statusMonitoringGeneration = 0
+	c.noteControllerActivityLocked(generation, started.Add(2*time.Second))
+	activity := c.lastControllerActivityTime
+	heartbeat := c.statusWatchdogStartedAt
+	c.mu.Unlock()
+
+	if !activity.IsZero() || heartbeat != started {
+		t.Fatalf("unmonitored generation changed health: activity=%v heartbeat=%v", activity, heartbeat)
 	}
 }
 
@@ -320,6 +422,18 @@ func TestAlarm50RecoveryUsesRealtimeStatus(t *testing.T) {
 	state = waitForState(t, c, func(s State) bool { return s.EStopStatus == EStopClear })
 	if state.EStopSource != EStopSourceNone {
 		t.Fatalf("cleared source = %q", state.EStopSource)
+	}
+}
+
+func TestGenericRXDoesNotAdvanceEStopRecovery(t *testing.T) {
+	c, fake := connectWatchdogController(t, false)
+	waitForEStop(t, c, EStopSourceUnresponsive)
+
+	fake.InjectRX("[MSG:Reset to cont]")
+	waitForEventText(t, c.Events(), EventConsoleRX, "[MSG:Reset to cont]")
+	state := c.Snapshot()
+	if state.EStopStatus != EStopActive || state.EStopSource != EStopSourceUnresponsive {
+		t.Fatalf("generic RX changed e-stop recovery state: %+v", state)
 	}
 }
 

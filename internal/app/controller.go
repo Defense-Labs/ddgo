@@ -138,7 +138,7 @@ type Controller struct {
 	controllerResponseTimeout               time.Duration
 	statusMonitoringGeneration              transport.ConnectionGeneration
 	statusWatchdogStartedAt                 time.Time
-	lastStatusResponseTime                  time.Time
+	lastControllerActivityTime              time.Time
 	macroEngine                             *macro.Engine
 	motionRewriter                          macro.MotionRewriter
 	variables                               *macro.VariableStore
@@ -564,7 +564,7 @@ func (c *Controller) startStatusPollingLocked() {
 	c.statusPollDone = done
 	c.statusMonitoringGeneration = generation
 	c.statusWatchdogStartedAt = time.Time{}
-	c.lastStatusResponseTime = time.Time{}
+	c.lastControllerActivityTime = time.Time{}
 	interval := c.statusPollInterval
 	timeout := c.controllerResponseTimeout
 	go c.statusMonitoringLoop(pollCtx, done, generation, interval, timeout)
@@ -688,8 +688,8 @@ func (c *Controller) writeAdmittedStatusPoll(ctx context.Context, generation tra
 			return nil
 		}
 		// Quiet heartbeat write failures are intentionally not surfaced directly.
-		// The watchdog owns the controller-level unresponsive failure if valid
-		// status responses do not resume.
+		// The watchdog owns the controller-level unresponsive failure if
+		// controller RX activity does not resume.
 		return err
 	}
 	return nil
@@ -1575,6 +1575,7 @@ func (c *Controller) runTransportEventBridge() {
 				c.mu.Unlock()
 				continue
 			}
+			c.noteControllerActivityLocked(ev.Generation, ev.When)
 			suppressRXLog := false
 			statusReport := false
 			var eStopResult eStopTransitionResult

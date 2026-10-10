@@ -115,10 +115,6 @@ func (c *Controller) noteStatusResponseLocked(generation transport.ConnectionGen
 	if generation == 0 || generation != c.connectionGeneration || generation != c.statusMonitoringGeneration {
 		return false, versionedState{}, ""
 	}
-	c.lastStatusResponseTime = c.now()
-	// A valid status report satisfies the outstanding heartbeat request. A new
-	// deadline begins only after a later status poll is actually admitted.
-	c.statusWatchdogStartedAt = time.Time{}
 	if c.state.EStopStatus == EStopClear {
 		return false, versionedState{}, ""
 	}
@@ -135,10 +131,27 @@ func (c *Controller) noteStatusResponseLocked(generation transport.ConnectionGen
 	return false, versionedState{}, ""
 }
 
+func (c *Controller) noteControllerActivityLocked(generation transport.ConnectionGeneration, when time.Time) {
+	if generation == 0 || generation != c.connectionGeneration || generation != c.statusMonitoringGeneration {
+		return
+	}
+	if when.IsZero() {
+		when = c.now()
+	}
+	if when.After(c.lastControllerActivityTime) {
+		c.lastControllerActivityTime = when
+	}
+	// Only RX that occurred after the outstanding heartbeat began can satisfy
+	// it. This prevents an older queued event from clearing a newer deadline.
+	if !c.statusWatchdogStartedAt.IsZero() && when.After(c.statusWatchdogStartedAt) {
+		c.statusWatchdogStartedAt = time.Time{}
+	}
+}
+
 func (c *Controller) resetControllerHealthLocked() {
 	c.statusMonitoringGeneration = 0
 	c.statusWatchdogStartedAt = time.Time{}
-	c.lastStatusResponseTime = time.Time{}
+	c.lastControllerActivityTime = time.Time{}
 }
 
 func (c *Controller) checkStatusWatchdog(generation transport.ConnectionGeneration, now time.Time) {
