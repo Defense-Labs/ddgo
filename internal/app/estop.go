@@ -141,9 +141,10 @@ func (c *Controller) noteControllerActivityLocked(generation transport.Connectio
 	if when.After(c.lastControllerActivityTime) {
 		c.lastControllerActivityTime = when
 	}
-	// Only RX that occurred after the outstanding heartbeat began can satisfy
-	// it. This prevents an older queued event from clearing a newer deadline.
-	if !c.statusWatchdogStartedAt.IsZero() && when.After(c.statusWatchdogStartedAt) {
+	// Only RX that occurred at or after the outstanding heartbeat began can
+	// satisfy it. This prevents an older queued event from clearing a newer
+	// deadline while allowing timestamps from the same clock tick.
+	if !c.statusWatchdogStartedAt.IsZero() && !when.Before(c.statusWatchdogStartedAt) {
 		c.statusWatchdogStartedAt = time.Time{}
 	}
 }
@@ -155,18 +156,21 @@ func (c *Controller) resetControllerHealthLocked() {
 }
 
 func (c *Controller) checkStatusWatchdog(generation transport.ConnectionGeneration, now time.Time) {
-	c.mu.RLock()
+	c.mu.Lock()
 	if generation == 0 || generation != c.connectionGeneration || generation != c.statusMonitoringGeneration ||
 		!c.state.IsConnected() || c.statusWatchdogStartedAt.IsZero() || c.state.EStopStatus == EStopActive {
-		c.mu.RUnlock()
+		c.mu.Unlock()
 		return
 	}
 	deadlineBase := c.statusWatchdogStartedAt
 	timeout := c.controllerResponseTimeout
-	c.mu.RUnlock()
-	if timeout > 0 && now.Sub(deadlineBase) >= timeout {
-		c.enterEStop(EStopSourceUnresponsive, generation)
+	if timeout <= 0 || now.Sub(deadlineBase) < timeout {
+		c.mu.Unlock()
+		return
 	}
+	result := c.enterEStopLocked(EStopSourceUnresponsive, generation)
+	c.mu.Unlock()
+	c.finishEStopTransition(result)
 }
 
 func statusWatchdogInterval(timeout time.Duration) time.Duration {

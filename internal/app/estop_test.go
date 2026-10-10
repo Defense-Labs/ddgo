@@ -197,7 +197,7 @@ func TestStatusWatchdogTransientWriteFailureRecoversBeforeDeadline(t *testing.T)
 func TestStatusWatchdogAcceptsAnyCurrentGenerationRXAsActivity(t *testing.T) {
 	c, fake := connectWatchdogController(t, true)
 	c.mu.Lock()
-	c.controllerResponseTimeout = 500 * time.Millisecond
+	c.controllerResponseTimeout = 150 * time.Millisecond
 	c.mu.Unlock()
 	fake.SetResponding(false)
 
@@ -218,36 +218,122 @@ func TestStatusWatchdogAcceptsAnyCurrentGenerationRXAsActivity(t *testing.T) {
 			return activityRecorded && s.EStopStatus == EStopClear
 		})
 	}
+
+	waitForOutstandingHeartbeat(t, c)
+	state := waitForEStop(t, c, EStopSourceUnresponsive)
+	if state.EStopStatus != EStopActive || state.EStopSource != EStopSourceUnresponsive {
+		t.Fatalf("watchdog did not fire after RX activity stopped: %+v", state)
+	}
 }
 
 func TestNoteControllerActivityUsesRXTimestamp(t *testing.T) {
 	c := NewController(transport.NewFakeTransport(), nil)
 	const generation transport.ConnectionGeneration = 7
-	started := time.Unix(100, 0)
+	heartbeatStart := time.Unix(100, 0)
+	oldRX := heartbeatStart.Add(-time.Second)
+	newRX := heartbeatStart.Add(time.Second)
 
 	c.mu.Lock()
 	c.connectionGeneration = generation
 	c.statusMonitoringGeneration = generation
-	c.statusWatchdogStartedAt = started
+	c.statusWatchdogStartedAt = heartbeatStart
 
-	oldRX := started.Add(-time.Second)
 	c.noteControllerActivityLocked(generation, oldRX)
-	if c.lastControllerActivityTime != oldRX {
-		c.mu.Unlock()
-		t.Fatalf("last activity = %v, want %v", c.lastControllerActivityTime, oldRX)
-	}
-	if c.statusWatchdogStartedAt != started {
-		c.mu.Unlock()
-		t.Fatalf("old queued RX cleared heartbeat started at %v", started)
-	}
-
-	newRX := started.Add(time.Second)
+	heartbeatAfterOldRX := c.statusWatchdogStartedAt
+	activityAfterOldRX := c.lastControllerActivityTime
+	c.noteControllerActivityLocked(generation, heartbeatStart)
+	heartbeatAfterEqualRX := c.statusWatchdogStartedAt
+	c.statusWatchdogStartedAt = heartbeatStart
 	c.noteControllerActivityLocked(generation, newRX)
-	if c.lastControllerActivityTime != newRX || !c.statusWatchdogStartedAt.IsZero() {
-		c.mu.Unlock()
-		t.Fatalf("new RX did not satisfy heartbeat: activity=%v heartbeat=%v", c.lastControllerActivityTime, c.statusWatchdogStartedAt)
-	}
+	heartbeatAfterNewRX := c.statusWatchdogStartedAt
+	c.noteControllerActivityLocked(generation, oldRX)
+	finalActivity := c.lastControllerActivityTime
 	c.mu.Unlock()
+
+	if activityAfterOldRX != oldRX || heartbeatAfterOldRX != heartbeatStart {
+		t.Fatalf("old RX: activity=%v heartbeat=%v, want activity=%v heartbeat=%v", activityAfterOldRX, heartbeatAfterOldRX, oldRX, heartbeatStart)
+	}
+	if !heartbeatAfterEqualRX.IsZero() {
+		t.Fatalf("equal-timestamp RX did not satisfy heartbeat: %v", heartbeatAfterEqualRX)
+	}
+	if !heartbeatAfterNewRX.IsZero() {
+		t.Fatalf("newer RX did not satisfy heartbeat: %v", heartbeatAfterNewRX)
+	}
+	if finalActivity != newRX {
+		t.Fatalf("older queued RX regressed activity to %v, want %v", finalActivity, newRX)
+	}
+}
+
+func TestStatusWatchdogRXActivityWinsExpiredCheck(t *testing.T) {
+	c := NewController(transport.NewFakeTransport(), nil)
+	const generation transport.ConnectionGeneration = 13
+	heartbeatStart := time.Unix(400, 0)
+	expiredAt := heartbeatStart.Add(2 * time.Second)
+
+	c.mu.Lock()
+	c.connectionGeneration = generation
+	c.statusMonitoringGeneration = generation
+	c.state.ConnectionStatus = ConnectionConnected
+	c.state.EStopStatus = EStopClear
+	c.state.EStopSource = EStopSourceNone
+	c.statusWatchdogStartedAt = heartbeatStart
+	c.controllerResponseTimeout = time.Second
+
+	watchdogStarted := make(chan struct{})
+	watchdogDone := make(chan struct{})
+	go func() {
+		close(watchdogStarted)
+		c.checkStatusWatchdog(generation, expiredAt)
+		close(watchdogDone)
+	}()
+	<-watchdogStarted
+
+	// The RX path already owns the controller lock, so it deterministically
+	// clears the heartbeat before the contending watchdog can evaluate it.
+	c.noteControllerActivityLocked(generation, heartbeatStart)
+	c.mu.Unlock()
+	<-watchdogDone
+
+	c.mu.RLock()
+	state := c.state
+	heartbeat := c.statusWatchdogStartedAt
+	c.mu.RUnlock()
+	if state.EStopStatus != EStopClear || state.EStopSource != EStopSourceNone || !heartbeat.IsZero() {
+		t.Fatalf("stale watchdog decision won after RX: state=%+v heartbeat=%v", state, heartbeat)
+	}
+}
+
+func TestStatusWatchdogExpirationWinsLaterGenericRX(t *testing.T) {
+	c := NewController(transport.NewFakeTransport(), nil)
+	const generation transport.ConnectionGeneration = 15
+	heartbeatStart := time.Unix(500, 0)
+	expiredAt := heartbeatStart.Add(2 * time.Second)
+
+	c.mu.Lock()
+	c.connectionGeneration = generation
+	c.statusMonitoringGeneration = generation
+	c.state.ConnectionStatus = ConnectionConnected
+	c.state.EStopStatus = EStopClear
+	c.state.EStopSource = EStopSourceNone
+	c.statusWatchdogStartedAt = heartbeatStart
+	c.controllerResponseTimeout = time.Second
+	c.mu.Unlock()
+
+	c.checkStatusWatchdog(generation, expiredAt)
+
+	c.mu.Lock()
+	c.noteControllerActivityLocked(generation, expiredAt)
+	state := c.state
+	heartbeat := c.statusWatchdogStartedAt
+	activity := c.lastControllerActivityTime
+	c.mu.Unlock()
+
+	if state.EStopStatus != EStopActive || state.EStopSource != EStopSourceUnresponsive {
+		t.Fatalf("generic RX changed committed e-stop: %+v", state)
+	}
+	if !heartbeat.IsZero() || activity != expiredAt {
+		t.Fatalf("later RX health accounting: activity=%v heartbeat=%v", activity, heartbeat)
+	}
 }
 
 func TestNoteControllerActivityFallsBackToCurrentTime(t *testing.T) {
