@@ -316,7 +316,8 @@ operation teardown, and apply a policy-provided inactivity limit. DDGo can also
 canonically recognize `$H`, `$HX`, `$HY`, `$HZ`, `$L`, and `$LS` using the
 firmware's relevant input filtering, and it retains numeric settings from the
 connection `$$` handshake in a private generation-owned snapshot for later
-timing calculation.
+timing calculation. The classifier assumes DDGo's response-owning command
+boundary has already enforced one physical serial line per logical operation.
 
 Production expected-silence timing remains disabled pending follow-up work.
 That work must select timing policy and address snapshot coherence after

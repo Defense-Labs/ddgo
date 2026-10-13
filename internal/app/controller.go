@@ -29,6 +29,7 @@ var ErrConnectionInvariant = errors.New("controller connection invariant violate
 var ErrControllerIOActive = errors.New("controller transport operation in progress")
 var ErrEmergencyStop = errors.New("emergency stop")
 var ErrEmergencyStopActive = errors.New("emergency stop is active; machine commands are disabled")
+var ErrInvalidControllerLine = errors.New("controller command must contain exactly one physical line")
 
 const defaultStatusPollInterval = 500 * time.Millisecond
 
@@ -406,6 +407,10 @@ func (c *Controller) Disconnect() error {
 }
 
 func (c *Controller) SendConsoleLine(ctx context.Context, text string) error {
+	if err := validateControllerLine(text); err != nil {
+		c.emitError(err)
+		return err
+	}
 	if strings.TrimSpace(text) == "?" {
 		c.clearPendingQuietStatusReports()
 		msg, err := grbl.BuildAction(grbl.ActionStatus)
@@ -443,6 +448,10 @@ func (c *Controller) SendConsoleLine(ctx context.Context, text string) error {
 }
 
 func (c *Controller) writeManualLine(ctx context.Context, text string) error {
+	if err := validateControllerLine(text); err != nil {
+		c.emitError(err)
+		return err
+	}
 	return c.writeManualResponseMessage(ctx, transport.NewLineMessage(text))
 }
 
@@ -451,6 +460,10 @@ func (c *Controller) writeManualResponseMessage(ctx context.Context, msg transpo
 }
 
 func (c *Controller) writeManualResponseMessageForAdmission(ctx context.Context, msg transport.Message, request admissionKind) error {
+	if err := validateControllerLine(msg.Display); err != nil {
+		c.emitError(err)
+		return err
+	}
 	session := newResponseSession(make(chan string, 1))
 	if err := c.beginForegroundAdmission(ctx); err != nil {
 		c.emitError(err)
@@ -1154,6 +1167,9 @@ func (c *Controller) SendLineCollectingResponses(ctx context.Context, line strin
 }
 
 func (r *commandRuntime) sendLineAndWaitOK(ctx context.Context, line string, sourceLine int) error {
+	if err := validateControllerLine(line); err != nil {
+		return err
+	}
 	system := r.run != nil && isGRBLSystemCommand(line)
 	if system {
 		if err := r.waitForFreshIdle(ctx); err != nil {
@@ -1207,6 +1223,9 @@ func (r *commandRuntime) sendLineAndWaitOK(ctx context.Context, line string, sou
 }
 
 func (r *commandRuntime) sendLineCollectingResponses(ctx context.Context, line string) ([]string, error) {
+	if err := validateControllerLine(line); err != nil {
+		return nil, err
+	}
 	c := r.controller
 	// Preserve the query admission contract before doing any potentially
 	// blocking system-command barrier work. In particular, a concurrent query

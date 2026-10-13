@@ -33,7 +33,7 @@ func CanonicalizeSystemLine(line string) string {
 			return string(canonical)
 		case char == '(':
 			inParenthesesComment = true
-		case char == ')', char == '/', char <= ' ':
+		case char == '/', char <= ' ':
 			continue
 		case char >= 'a' && char <= 'z':
 			canonical = append(canonical, char-'a'+'A')
