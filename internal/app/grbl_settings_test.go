@@ -173,7 +173,7 @@ func TestSetGRBLSettingsLockedCopiesCandidateValues(t *testing.T) {
 	}
 }
 
-func TestProductionExpectedSilencePolicyRemainsDisabled(t *testing.T) {
+func TestProductionExpectedSilenceRequiresCompleteSettingsSnapshot(t *testing.T) {
 	fake := transport.NewFakeTransport()
 	c := NewController(fake, nil)
 	c.statusPollInterval = time.Hour
@@ -186,7 +186,7 @@ func TestProductionExpectedSilencePolicyRemainsDisabled(t *testing.T) {
 		t.Fatalf("SendConsoleLine($H) error = %v", err)
 	}
 	if lease := expectedSilenceSnapshot(c); lease.id != 0 {
-		t.Fatalf("production controller unexpectedly started silence lease: %+v", lease)
+		t.Fatalf("incomplete handshake settings unexpectedly started silence lease: %+v", lease)
 	}
 	fake.InjectRX("ok")
 }

@@ -120,6 +120,8 @@ type Controller struct {
 	expectedSilencePolicy                   expectedSilencePolicy
 	nextExpectedSilenceID                   expectedSilenceID
 	expectedSilence                         expectedSilenceLease
+	nextSettingsMutationID                  settingsMutationID
+	pendingSettingsMutation                 pendingSettingsMutation
 	connectionTransition                    connectionTransition
 	nextConnectAttempt                      connectAttemptID
 	activeConnectAttempt                    connectAttemptID
@@ -471,13 +473,11 @@ func (c *Controller) writeManualResponseMessageForAdmission(ctx context.Context,
 	}
 	c.mu.Lock()
 	err := c.acquireResponseOwnerForAdmissionLocked(responseOwnerManualLine, session, request)
-	var silenceID expectedSilenceID
+	var preparation commandPreparation
 	if err == nil {
-		if spec, silenceEnabled := expectedSilenceSpecForPolicy(c.expectedSilencePolicy, msg.Display); silenceEnabled {
-			silenceID, err = c.beginExpectedSilenceLocked(c.responseOwner, spec)
-			if err != nil {
-				c.releaseResponseOwnerLocked(responseOwnerManualLine, session)
-			}
+		preparation, err = c.prepareCommandLocked(c.responseOwner, msg.Display)
+		if err != nil {
+			c.releaseResponseOwnerLocked(responseOwnerManualLine, session)
 		}
 	}
 	c.endForegroundAdmissionLocked()
@@ -488,7 +488,8 @@ func (c *Controller) writeManualResponseMessageForAdmission(ctx context.Context,
 	}
 	if err := c.transport.Write(ctx, msg); err != nil {
 		c.mu.Lock()
-		c.endExpectedSilenceLocked(silenceID)
+		c.endExpectedSilenceLocked(preparation.silenceID)
+		c.clearSettingsMutationLocked(preparation.mutation)
 		c.releaseResponseOwnerLocked(responseOwnerManualLine, session)
 		c.mu.Unlock()
 		c.emitError(err)
@@ -1181,11 +1182,11 @@ func (r *commandRuntime) sendLineAndWaitOK(ctx context.Context, line string, sou
 	}
 	c := r.controller
 	msg := transport.NewLineMessage(line)
-	silenceID, err := r.beginExpectedSilenceForLine(ctx, msg.Display)
+	preparation, err := r.prepareCommandForLine(ctx, msg.Display)
 	if err != nil {
 		return err
 	}
-	defer func() { c.endExpectedSilence(silenceID) }()
+	defer func() { c.clearCommandPreparation(preparation) }()
 	if err := c.transport.Write(ctx, msg); err != nil {
 		if sourceLine > 0 {
 			return fmt.Errorf("send line %d: %w", sourceLine, err)
@@ -1204,15 +1205,19 @@ func (r *commandRuntime) sendLineAndWaitOK(ctx context.Context, line string, sou
 			case responseIgnore:
 				continue
 			case responseOK:
-				c.endExpectedSilence(silenceID)
-				silenceID = 0
+				c.commitSettingsMutation(preparation.mutation)
+				preparation.mutation = 0
+				c.endExpectedSilence(preparation.silenceID)
+				preparation.silenceID = 0
 				if system {
 					return r.waitForFreshIdle(ctx)
 				}
 				return nil
 			case responseFail:
-				c.endExpectedSilence(silenceID)
-				silenceID = 0
+				c.clearSettingsMutation(preparation.mutation)
+				preparation.mutation = 0
+				c.endExpectedSilence(preparation.silenceID)
+				preparation.silenceID = 0
 				if sourceLine > 0 {
 					return fmt.Errorf("program failed at line %d: %s", sourceLine, strings.TrimSpace(rx))
 				}
@@ -1264,11 +1269,11 @@ func (r *commandRuntime) sendLineCollectingResponses(ctx context.Context, line s
 	}()
 
 	msg := transport.NewLineMessage(line)
-	silenceID, err := r.beginExpectedSilenceForLine(ctx, msg.Display)
+	preparation, err := r.prepareCommandForLine(ctx, msg.Display)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { c.endExpectedSilence(silenceID) }()
+	defer func() { c.clearCommandPreparation(preparation) }()
 	if err := c.transport.Write(ctx, msg); err != nil {
 		return nil, fmt.Errorf("send query line: %w", err)
 	}
@@ -1282,8 +1287,10 @@ func (r *commandRuntime) sendLineCollectingResponses(ctx context.Context, line s
 		case rx := <-queryCh:
 			switch classifyProgramResponse(rx) {
 			case responseOK:
-				c.endExpectedSilence(silenceID)
-				silenceID = 0
+				c.commitSettingsMutation(preparation.mutation)
+				preparation.mutation = 0
+				c.endExpectedSilence(preparation.silenceID)
+				preparation.silenceID = 0
 				if system {
 					// Stop routing query payloads before the barrier, so unsolicited
 					// failures remain visible on the session's terminal channel.
@@ -1298,8 +1305,10 @@ func (r *commandRuntime) sendLineCollectingResponses(ctx context.Context, line s
 				}
 				return responses, nil
 			case responseFail:
-				c.endExpectedSilence(silenceID)
-				silenceID = 0
+				c.clearSettingsMutation(preparation.mutation)
+				preparation.mutation = 0
+				c.endExpectedSilence(preparation.silenceID)
+				preparation.silenceID = 0
 				return nil, fmt.Errorf("query command failed: %s", strings.TrimSpace(rx))
 			case responseIgnore:
 				if _, statusReport := grbl.ParseStatusReport(rx); statusReport {
@@ -1493,6 +1502,7 @@ func (c *Controller) clearConnectionStateLocked() bool {
 	c.state.EStopSource = EStopSourceNone
 	c.connectionGeneration = 0
 	c.clearGRBLSettingsLocked()
+	c.pendingSettingsMutation = pendingSettingsMutation{}
 	c.invalidateMachineTelemetryLocked()
 	c.clearExpectedSilenceLocked()
 	c.pendingQuietStatusReports = 0
@@ -1642,6 +1652,7 @@ func (c *Controller) runTransportEventBridge() {
 				continue
 			}
 			c.noteControllerActivityLocked(ev.Generation, ev.When)
+			c.noteExpectedSilenceProgressLocked(ev.Generation, ev.When, ev.Text)
 			suppressRXLog := false
 			statusReport := false
 			var eStopResult eStopTransitionResult
@@ -1765,7 +1776,12 @@ func (c *Controller) deliverResponseLocked(generation transport.ConnectionGenera
 	case responseOwnerNone:
 		return nil
 	case responseOwnerManualLine:
-		if isProgramResponse(line) {
+		switch classifyProgramResponse(line) {
+		case responseOK:
+			c.commitSettingsMutationForOwnerLocked(owner)
+			c.releaseResponseOwnerLocked(responseOwnerManualLine, owner.session)
+		case responseFail:
+			c.clearSettingsMutationForOwnerLocked(owner)
 			c.releaseResponseOwnerLocked(responseOwnerManualLine, owner.session)
 		}
 		return nil
@@ -1789,6 +1805,7 @@ func (c *Controller) deliverResponseLocked(generation transport.ConnectionGenera
 		return run
 	default:
 		c.endExpectedSilenceForOwnerLocked(owner)
+		c.clearSettingsMutationForOwnerLocked(owner)
 		c.responseOwner = responseOwner{}
 		c.state.LastError = ErrCommandSessionInvariant.Error()
 		return nil

@@ -232,6 +232,7 @@ func (c *Controller) releaseResponseOwnerLocked(kind responseOwnerKind, session 
 		return false
 	}
 	c.endExpectedSilenceForOwnerLocked(c.responseOwner)
+	c.clearSettingsMutationForOwnerLocked(c.responseOwner)
 	c.responseOwner = responseOwner{}
 	return true
 }
@@ -241,6 +242,7 @@ func (c *Controller) terminateResponseOwnerLocked(owner responseOwner, cause err
 		return false
 	}
 	c.endExpectedSilenceForOwnerLocked(owner)
+	c.clearSettingsMutationForOwnerLocked(owner)
 	c.responseOwner = responseOwner{}
 	if cause == nil {
 		cause = ErrCommandSessionCanceled

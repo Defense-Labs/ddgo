@@ -286,7 +286,8 @@ RX as heartbeat proof without assigning it normal status-report semantics.
 
 ## Implications for DDGo
 
-This inspection establishes constraints, not the final watchdog implementation:
+This inspection establishes the constraints implemented by DDGo's GG3 health
+policy:
 
 1. A global rule that "no valid status report for two seconds means e-stop" is
    incorrect for this firmware. Counting any accepted current-connection RX as
@@ -305,21 +306,43 @@ This inspection establishes constraints, not the final watchdog implementation:
 5. USB disappearance and serial-transport loss remain separate disconnect
    conditions rather than status-heartbeat classifications.
 
-These facts do not by themselves prescribe command exemptions, new timeout
-values, alarm parsing policy, or another watchdog architecture. Those choices
-require a separate design and implementation task.
-
 DDGo now has the private command-owned lease mechanism needed to represent
 expected command-associated silence: it can suppress background health probes,
 track current-connection RX activity, end on the command's terminal response or
-operation teardown, and apply a policy-provided inactivity limit. DDGo can also
-canonically recognize `$H`, `$HX`, `$HY`, `$HZ`, `$L`, and `$LS` using the
-firmware's relevant input filtering, and it retains numeric settings from the
-connection `$$` handshake in a private generation-owned snapshot for later
-timing calculation. The classifier assumes DDGo's response-owning command
+operation teardown, and apply a finite inactivity limit. DDGo canonically
+recognizes `$H`, `$HX`, `$HY`, `$HZ`, `$L`, and `$LS` using the firmware's
+relevant input filtering. The classifier assumes DDGo's response-owning command
 boundary has already enforced one physical serial line per logical operation.
 
-Production expected-silence timing remains disabled pending follow-up work.
-That work must select timing policy and address snapshot coherence after
-post-connect setting writes or settings resets. The homing and leveling
-false-positive case is therefore not yet fully mitigated in production.
+Production timing is calculated from the current connection generation's
+numeric `$$` snapshot. The model uses the reported homing feed, seek, debounce,
+pull-off, per-axis maximum rates, accelerations, and travels; DDGo does not
+substitute factory defaults when any required value is missing or unusable.
+Successful numeric setting writes update the snapshot after their matching
+`ok`. `$RST=$` and `$RST=*` invalidate it before transmission, while `$RST=#`
+does not affect it. Until a complete current snapshot exists, the six commands
+retain ordinary watchdog behavior.
+
+For homing and `$LS`, DDGo applies a conservative finite bound to the full
+firmware motion sequence plus a scheduling/firmware margin. `$L` instead starts
+with a bound through its first measurement. Each valid GG3 `[<adjustment> mm]`
+progress line refreshes activity and recalculates the next interval from the
+reported, travel-capped squaring distance. This avoids granting one unlimited
+or unnecessarily multi-minute allowance to the whole command. Automatic
+background `?` probes are suppressed during the lease: the blind firmware path
+cannot service them, and its pending status flag coalesces repeated requests.
+
+## Accepted e-stop observability tradeoff
+
+The host cannot eliminate the firmware's blind interval. A physical e-stop may
+occur during GG3 homing or leveling while USB remains connected and the
+firmware is not servicing serial realtime requests. During that interval DDGo
+cannot distinguish a legitimate motion phase from the e-stop. Expected-silence
+handling therefore increases worst-case detection latency, and the conservative
+timing margin can extend it somewhat beyond the modeled motion duration. This
+is an accepted compatibility limitation for existing GG3 machines.
+
+The allowance remains finite. If communication never resumes, its inactivity
+limit eventually enters `EStopSourceUnresponsive`. If communication resumes
+with `ALARM:50`, that explicit alarm immediately takes precedence. USB removal
+continues to be handled independently as a transport disconnect.

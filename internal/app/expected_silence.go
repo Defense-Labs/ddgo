@@ -1,10 +1,10 @@
 package app
 
 import (
-	"context"
 	"strings"
 	"time"
 
+	"github.com/ianbruene/ddgo/internal/grbl"
 	"github.com/ianbruene/ddgo/internal/transport"
 )
 
@@ -27,6 +27,7 @@ type expectedSilencePolicy func(line string) (expectedSilenceClass, time.Duratio
 type expectedSilenceSpec struct {
 	class           expectedSilenceClass
 	inactivityLimit time.Duration
+	levelPlan       expectedSilenceLevelPlan
 }
 
 type expectedSilenceLease struct {
@@ -37,13 +38,22 @@ type expectedSilenceLease struct {
 	startedAt       time.Time
 	lastActivity    time.Time
 	inactivityLimit time.Duration
+	levelPlan       expectedSilenceLevelPlan
+	adjustmentCount int
 }
 
-func (c *Controller) expectedSilenceSpecForLine(line string) (expectedSilenceSpec, bool) {
-	c.mu.RLock()
-	policy := c.expectedSilencePolicy
-	c.mu.RUnlock()
-	return expectedSilenceSpecForPolicy(policy, line)
+// expectedSilenceSpecForLineLocked resolves the policy against the settings
+// owned by the currently admitted generation. The caller must hold c.mu.
+func (c *Controller) expectedSilenceSpecForLineLocked(line string) (expectedSilenceSpec, bool) {
+	if c.expectedSilencePolicy != nil {
+		return expectedSilenceSpecForPolicy(c.expectedSilencePolicy, line)
+	}
+	command := grbl.ClassifySilentSystemCommand(line)
+	if command == grbl.SilentSystemNone || c.connectionGeneration == 0 ||
+		c.grblSettings.generation != c.connectionGeneration {
+		return expectedSilenceSpec{}, false
+	}
+	return gg3ExpectedSilenceSpec(command, c.grblSettings.values)
 }
 
 func expectedSilenceSpecForPolicy(policy expectedSilencePolicy, line string) (expectedSilenceSpec, bool) {
@@ -76,6 +86,7 @@ func (c *Controller) beginExpectedSilenceLocked(owner responseOwner, spec expect
 		class:           spec.class,
 		startedAt:       c.now(),
 		inactivityLimit: spec.inactivityLimit,
+		levelPlan:       spec.levelPlan,
 	}
 	c.statusWatchdogStartedAt = time.Time{}
 	c.pendingQuietStatusReports = 0
@@ -124,30 +135,30 @@ func (c *Controller) noteExpectedSilenceActivityLocked(generation transport.Conn
 	}
 }
 
-func (r *commandRuntime) beginExpectedSilenceForLine(ctx context.Context, line string) (expectedSilenceID, error) {
-	c := r.controller
-	spec, ok := c.expectedSilenceSpecForLine(line)
-	if !ok {
-		return 0, nil
+func (c *Controller) noteExpectedSilenceProgressLocked(generation transport.ConnectionGeneration, when time.Time, line string) {
+	if when.IsZero() {
+		when = c.now()
 	}
-	if err := c.beginForegroundAdmission(ctx); err != nil {
-		return 0, err
+	if !c.expectedSilenceActiveForGenerationLocked(generation) || c.expectedSilence.class != expectedSilenceLevel ||
+		when.Before(c.expectedSilence.startedAt) || when.Before(c.expectedSilence.lastActivity) ||
+		c.expectedSilence.adjustmentCount >= 3 {
+		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	defer c.endForegroundAdmissionLocked()
-	if err := ctx.Err(); err != nil {
-		return 0, err
+	adjustment, parsed := grbl.ParseGG3LevelAdjustment(line)
+	if !parsed && !grbl.IsGG3LevelAdjustmentLike(line) {
+		return
 	}
-	owner := c.responseOwner
-	expectedKind := responseOwnerInteractiveMacro
-	valid := owner.kind == expectedKind && owner.session == r.session
-	if r.run != nil {
-		expectedKind = responseOwnerProgram
-		valid = owner.kind == expectedKind && owner.session == r.session && c.run == r.run && owner.generation == r.run.generation
+	nextCount := c.expectedSilence.adjustmentCount + 1
+	var limit time.Duration
+	var ok bool
+	if parsed {
+		limit, ok = gg3LevelNextInactivityLimit(c.expectedSilence.levelPlan, adjustment, nextCount)
+	} else {
+		limit, ok = gg3LevelFallbackInactivityLimit(c.expectedSilence.levelPlan, nextCount)
 	}
-	if !valid {
-		return 0, ErrCommandSessionInvariant
+	if !ok || limit <= 0 {
+		return
 	}
-	return c.beginExpectedSilenceLocked(owner, spec)
+	c.expectedSilence.adjustmentCount = nextCount
+	c.expectedSilence.inactivityLimit = limit
 }
