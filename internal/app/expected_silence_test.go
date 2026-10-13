@@ -424,6 +424,116 @@ func TestExpectedSilenceInteractiveTerminalFailures(t *testing.T) {
 	}
 }
 
+func TestExpectedSilenceCollectingTerminalFailures(t *testing.T) {
+	for _, terminal := range []string{"error:1", "ALARM:1"} {
+		t.Run(terminal, func(t *testing.T) {
+			c, fake, _ := connectExpectedSilenceController(t, time.Hour, map[string]expectedSilenceClass{
+				"$#": expectedSilenceLevelSave,
+			})
+			fake.SetResponding(false)
+			session, err := c.beginInteractiveSession(context.Background())
+			if err != nil {
+				t.Fatalf("beginInteractiveSession() error = %v", err)
+			}
+			done := make(chan error, 1)
+			go func() {
+				_, err := c.runtimeForSession(session).sendLineCollectingResponses(context.Background(), "$#")
+				done <- err
+			}()
+			waitForExpectedSilence(t, c, true)
+			fake.InjectRX(terminal)
+			if err := <-done; err == nil || !strings.Contains(err.Error(), terminal) {
+				t.Fatalf("sendLineCollectingResponses() error = %v after %q", err, terminal)
+			}
+			if lease := expectedSilenceSnapshot(c); lease.id != 0 {
+				t.Fatalf("query terminal failure left lease active: %+v", lease)
+			}
+			c.endInteractiveSession(session, nil)
+		})
+	}
+}
+
+func TestDeliverResponseDoesNotClearPersistentOwnerLease(t *testing.T) {
+	c := NewController(transport.NewFakeTransport(), nil)
+	const generation transport.ConnectionGeneration = 16
+	session := newResponseSession(make(chan string, 1))
+	owner := responseOwner{kind: responseOwnerInteractiveMacro, session: session, generation: generation}
+
+	c.mu.Lock()
+	c.connectionGeneration = generation
+	c.statusMonitoringGeneration = generation
+	c.state.ConnectionStatus = ConnectionConnected
+	c.responseOwner = owner
+	id, err := c.beginExpectedSilenceLocked(owner, expectedSilenceSpec{class: expectedSilenceHomeAll})
+	if err != nil {
+		c.mu.Unlock()
+		t.Fatalf("beginExpectedSilenceLocked() error = %v", err)
+	}
+	c.deliverResponseLocked(generation, "ok")
+	lease := c.expectedSilence
+	c.mu.Unlock()
+
+	if lease.id != id {
+		t.Fatalf("deliverResponseLocked() cleared lease %d; active lease = %+v", id, lease)
+	}
+	select {
+	case got := <-session.rxCh:
+		if got != "ok" {
+			t.Fatalf("routed response = %q, want ok", got)
+		}
+	default:
+		t.Fatal("deliverResponseLocked() did not route terminal response")
+	}
+	c.endExpectedSilence(id)
+}
+
+func TestExpectedSilencePersistentOwnerRuntimeTokenIsolation(t *testing.T) {
+	c, fake, _ := connectExpectedSilenceController(t, time.Hour, map[string]expectedSilenceClass{
+		"$HX": expectedSilenceHomeX,
+		"$HY": expectedSilenceHomeY,
+	})
+	fake.SetResponding(false)
+	session, err := c.beginInteractiveSession(context.Background())
+	if err != nil {
+		t.Fatalf("beginInteractiveSession() error = %v", err)
+	}
+	runtime := c.runtimeForSession(session)
+
+	commandA := make(chan error, 1)
+	go func() { commandA <- runtime.sendLineAndWaitOK(context.Background(), "$HX", 0) }()
+	leaseA := waitForExpectedSilence(t, c, true)
+	fake.InjectRX("ok")
+	if err := <-commandA; err != nil {
+		t.Fatalf("command A error = %v", err)
+	}
+	if lease := expectedSilenceSnapshot(c); lease.id != 0 {
+		t.Fatalf("command A terminal response left lease active: %+v", lease)
+	}
+
+	commandB := make(chan error, 1)
+	go func() { commandB <- runtime.sendLineAndWaitOK(context.Background(), "$HY", 0) }()
+	leaseB := waitForExpectedSilence(t, c, true)
+	if leaseA.id == leaseB.id {
+		t.Fatalf("persistent owner reused lease ID %d", leaseA.id)
+	}
+
+	// This represents deferred or otherwise stale cleanup retained by command A.
+	// Exact-token cleanup must not affect command B despite the shared owner.
+	c.endExpectedSilence(leaseA.id)
+	if lease := expectedSilenceSnapshot(c); lease.id != leaseB.id || lease.class != expectedSilenceHomeY {
+		t.Fatalf("stale command A cleanup affected lease B: %+v", lease)
+	}
+
+	fake.InjectRX("ok")
+	if err := <-commandB; err != nil {
+		t.Fatalf("command B error = %v", err)
+	}
+	if lease := expectedSilenceSnapshot(c); lease.id != 0 {
+		t.Fatalf("command B terminal response left lease active: %+v", lease)
+	}
+	c.endInteractiveSession(session, nil)
+}
+
 func TestExpectedSilenceOperationTokenIsolation(t *testing.T) {
 	c := NewController(transport.NewFakeTransport(), nil)
 	const generation transport.ConnectionGeneration = 17
@@ -577,6 +687,71 @@ func TestExpectedSilenceProgramCompletionAndCancellation(t *testing.T) {
 			t.Fatalf("program cancellation left lease active: %+v", lease)
 		}
 	})
+}
+
+func TestExpectedSilenceSystemTerminalEndsLeaseBeforeFreshIdleBarrier(t *testing.T) {
+	fake := transport.NewFakeTransport()
+	observing := &expectedSilenceObservingTransport{FakeTransport: fake}
+	c := NewController(observing, nil)
+	c.statusPollInterval = time.Hour
+	c.controllerResponseTimeout = 5 * time.Second
+	c.connectionStartupQuietPeriod = 5 * time.Millisecond
+	c.expectedSilencePolicy = expectedSilenceTestPolicy(time.Hour, map[string]expectedSilenceClass{
+		"$H": expectedSilenceHomeAll,
+	})
+	if err := c.Connect(context.Background(), transport.DefaultPortConfig("fake")); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	t.Cleanup(func() { _ = fake.Close() })
+	fake.InjectRX("<Idle|MPos:0,0,0>")
+	waitForState(t, c, func(state State) bool {
+		return state.ConnectionStatus == ConnectionConnected && state.MachineState == "Idle"
+	})
+
+	var observerMu sync.Mutex
+	commandWritten := false
+	postCommandPollLease := make(chan expectedSilenceLease, 1)
+	observing.setWriteObserver(func(msg transport.Message) {
+		observerMu.Lock()
+		afterCommand := commandWritten
+		if msg.Display == "$H" {
+			commandWritten = true
+		}
+		observerMu.Unlock()
+		if msg.Display == "$H" {
+			fake.SetResponding(false)
+		}
+		if msg.Display == "?" && afterCommand {
+			select {
+			case postCommandPollLease <- expectedSilenceSnapshot(c):
+			default:
+			}
+		}
+	})
+
+	if err := c.LoadProgramFile(writeProgramFile(t, "silent-system.gcode", "$H\n")); err != nil {
+		t.Fatalf("LoadProgramFile() error = %v", err)
+	}
+	if err := c.StartProgram(context.Background()); err != nil {
+		t.Fatalf("StartProgram() error = %v", err)
+	}
+	waitForLineWrites(t, fake, "$H")
+	waitForExpectedSilence(t, c, true)
+	fake.InjectRX("ok")
+
+	select {
+	case lease := <-postCommandPollLease:
+		if lease.id != 0 {
+			t.Fatalf("post-command Idle poll was written with active lease: %+v", lease)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-command fresh Idle status poll was not written")
+	}
+	if lease := expectedSilenceSnapshot(c); lease.id != 0 {
+		t.Fatalf("terminal ok left lease active during Idle barrier: %+v", lease)
+	}
+	fake.InjectRX("<Idle|MPos:0,0,0>")
+	waitForState(t, c, func(state State) bool { return state.ProgramStatus == ProgramCompleted })
 }
 
 func TestExpectedSilenceGenerationIsolation(t *testing.T) {

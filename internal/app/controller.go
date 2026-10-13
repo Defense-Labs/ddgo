@@ -1166,7 +1166,7 @@ func (r *commandRuntime) sendLineAndWaitOK(ctx context.Context, line string, sou
 	if err != nil {
 		return err
 	}
-	defer c.endExpectedSilence(silenceID)
+	defer func() { c.endExpectedSilence(silenceID) }()
 	if err := c.transport.Write(ctx, msg); err != nil {
 		if sourceLine > 0 {
 			return fmt.Errorf("send line %d: %w", sourceLine, err)
@@ -1185,11 +1185,15 @@ func (r *commandRuntime) sendLineAndWaitOK(ctx context.Context, line string, sou
 			case responseIgnore:
 				continue
 			case responseOK:
+				c.endExpectedSilence(silenceID)
+				silenceID = 0
 				if system {
 					return r.waitForFreshIdle(ctx)
 				}
 				return nil
 			case responseFail:
+				c.endExpectedSilence(silenceID)
+				silenceID = 0
 				if sourceLine > 0 {
 					return fmt.Errorf("program failed at line %d: %s", sourceLine, strings.TrimSpace(rx))
 				}
@@ -1242,7 +1246,7 @@ func (r *commandRuntime) sendLineCollectingResponses(ctx context.Context, line s
 	if err != nil {
 		return nil, err
 	}
-	defer c.endExpectedSilence(silenceID)
+	defer func() { c.endExpectedSilence(silenceID) }()
 	if err := c.transport.Write(ctx, msg); err != nil {
 		return nil, fmt.Errorf("send query line: %w", err)
 	}
@@ -1256,6 +1260,8 @@ func (r *commandRuntime) sendLineCollectingResponses(ctx context.Context, line s
 		case rx := <-queryCh:
 			switch classifyProgramResponse(rx) {
 			case responseOK:
+				c.endExpectedSilence(silenceID)
+				silenceID = 0
 				if system {
 					// Stop routing query payloads before the barrier, so unsolicited
 					// failures remain visible on the session's terminal channel.
@@ -1270,6 +1276,8 @@ func (r *commandRuntime) sendLineCollectingResponses(ctx context.Context, line s
 				}
 				return responses, nil
 			case responseFail:
+				c.endExpectedSilence(silenceID)
+				silenceID = 0
 				return nil, fmt.Errorf("query command failed: %s", strings.TrimSpace(rx))
 			case responseIgnore:
 				if _, statusReport := grbl.ParseStatusReport(rx); statusReport {
@@ -1729,9 +1737,6 @@ func (c *Controller) deliverResponseLocked(generation transport.ConnectionGenera
 	owner := c.responseOwner
 	if owner.kind != responseOwnerNone && owner.generation != generation {
 		return nil
-	}
-	if classifyProgramResponse(line) != responseIgnore {
-		c.endExpectedSilenceForOwnerLocked(owner)
 	}
 	switch owner.kind {
 	case responseOwnerNone:
