@@ -231,6 +231,7 @@ func (c *Controller) releaseResponseOwnerLocked(kind responseOwnerKind, session 
 	if c.responseOwner.kind != kind || c.responseOwner.session != session {
 		return false
 	}
+	c.endExpectedSilenceForOwnerLocked(c.responseOwner)
 	c.responseOwner = responseOwner{}
 	return true
 }
@@ -239,6 +240,7 @@ func (c *Controller) terminateResponseOwnerLocked(owner responseOwner, cause err
 	if owner.kind == responseOwnerNone || c.responseOwner != owner {
 		return false
 	}
+	c.endExpectedSilenceForOwnerLocked(owner)
 	c.responseOwner = responseOwner{}
 	if cause == nil {
 		cause = ErrCommandSessionCanceled

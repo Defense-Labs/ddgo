@@ -59,6 +59,7 @@ func (c *Controller) enterEStopLocked(source EStopSource, generation transport.C
 		c.state.ProgramStatus = ProgramFailed
 	}
 	c.terminateResponseOwnerLocked(c.responseOwner, err)
+	c.clearExpectedSilenceLocked()
 	c.contour.Disable()
 	c.invalidateMachineTelemetryLocked()
 	c.state.EStopStatus = EStopActive
@@ -141,6 +142,7 @@ func (c *Controller) noteControllerActivityLocked(generation transport.Connectio
 	if when.After(c.lastControllerActivityTime) {
 		c.lastControllerActivityTime = when
 	}
+	c.noteExpectedSilenceActivityLocked(generation, when)
 	// Only RX that occurred at or after the outstanding heartbeat began can
 	// satisfy it. This prevents an older queued event from clearing a newer
 	// deadline while allowing timestamps from the same clock tick.
@@ -158,12 +160,22 @@ func (c *Controller) resetControllerHealthLocked() {
 func (c *Controller) checkStatusWatchdog(generation transport.ConnectionGeneration, now time.Time) {
 	c.mu.Lock()
 	if generation == 0 || generation != c.connectionGeneration || generation != c.statusMonitoringGeneration ||
-		!c.state.IsConnected() || c.statusWatchdogStartedAt.IsZero() || c.state.EStopStatus == EStopActive {
+		!c.state.IsConnected() || c.state.EStopStatus == EStopActive {
 		c.mu.Unlock()
 		return
 	}
 	deadlineBase := c.statusWatchdogStartedAt
 	timeout := c.controllerResponseTimeout
+	if c.expectedSilenceActiveForGenerationLocked(generation) {
+		deadlineBase = c.expectedSilence.startedAt
+		if !c.expectedSilence.lastActivity.IsZero() {
+			deadlineBase = c.expectedSilence.lastActivity
+		}
+		timeout = c.expectedSilence.inactivityLimit
+	} else if deadlineBase.IsZero() {
+		c.mu.Unlock()
+		return
+	}
 	if timeout <= 0 || now.Sub(deadlineBase) < timeout {
 		c.mu.Unlock()
 		return

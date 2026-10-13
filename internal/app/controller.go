@@ -116,6 +116,9 @@ type Controller struct {
 	loaded                                  gcode.Program
 	run                                     *programRun
 	responseOwner                           responseOwner
+	expectedSilencePolicy                   expectedSilencePolicy
+	nextExpectedSilenceID                   expectedSilenceID
+	expectedSilence                         expectedSilenceLease
 	connectionTransition                    connectionTransition
 	nextConnectAttempt                      connectAttemptID
 	activeConnectAttempt                    connectAttemptID
@@ -446,12 +449,30 @@ func (c *Controller) writeManualResponseMessage(ctx context.Context, msg transpo
 
 func (c *Controller) writeManualResponseMessageForAdmission(ctx context.Context, msg transport.Message, request admissionKind) error {
 	session := newResponseSession(make(chan string, 1))
-	if err := c.acquireResponseOwnerForAdmission(ctx, responseOwnerManualLine, session, request); err != nil {
+	if err := c.beginForegroundAdmission(ctx); err != nil {
+		c.emitError(err)
+		return err
+	}
+	c.mu.Lock()
+	err := c.acquireResponseOwnerForAdmissionLocked(responseOwnerManualLine, session, request)
+	var silenceID expectedSilenceID
+	if err == nil {
+		if spec, silenceEnabled := expectedSilenceSpecForPolicy(c.expectedSilencePolicy, msg.Display); silenceEnabled {
+			silenceID, err = c.beginExpectedSilenceLocked(c.responseOwner, spec)
+			if err != nil {
+				c.releaseResponseOwnerLocked(responseOwnerManualLine, session)
+			}
+		}
+	}
+	c.endForegroundAdmissionLocked()
+	c.mu.Unlock()
+	if err != nil {
 		c.emitError(err)
 		return err
 	}
 	if err := c.transport.Write(ctx, msg); err != nil {
 		c.mu.Lock()
+		c.endExpectedSilenceLocked(silenceID)
 		c.releaseResponseOwnerLocked(responseOwnerManualLine, session)
 		c.mu.Unlock()
 		c.emitError(err)
@@ -650,6 +671,9 @@ func (c *Controller) writeStatusPollForGeneration(ctx context.Context, generatio
 
 func (c *Controller) beginStatusPollForGenerationLocked(generation transport.ConnectionGeneration, request admissionKind) (bool, error) {
 	if !c.state.IsConnected() || generation == 0 || c.connectionGeneration != generation || c.statusMonitoringGeneration != generation {
+		return false, nil
+	}
+	if request == admissionStatusPoll && c.expectedSilenceActiveForGenerationLocked(generation) {
 		return false, nil
 	}
 	if err := c.beginRealtimeWriteForAdmissionLocked(request); err != nil {
@@ -1138,6 +1162,11 @@ func (r *commandRuntime) sendLineAndWaitOK(ctx context.Context, line string, sou
 	}
 	c := r.controller
 	msg := transport.NewLineMessage(line)
+	silenceID, err := r.beginExpectedSilenceForLine(ctx, msg.Display)
+	if err != nil {
+		return err
+	}
+	defer c.endExpectedSilence(silenceID)
 	if err := c.transport.Write(ctx, msg); err != nil {
 		if sourceLine > 0 {
 			return fmt.Errorf("send line %d: %w", sourceLine, err)
@@ -1209,6 +1238,11 @@ func (r *commandRuntime) sendLineCollectingResponses(ctx context.Context, line s
 	}()
 
 	msg := transport.NewLineMessage(line)
+	silenceID, err := r.beginExpectedSilenceForLine(ctx, msg.Display)
+	if err != nil {
+		return nil, err
+	}
+	defer c.endExpectedSilence(silenceID)
 	if err := c.transport.Write(ctx, msg); err != nil {
 		return nil, fmt.Errorf("send query line: %w", err)
 	}
@@ -1429,6 +1463,7 @@ func (c *Controller) clearConnectionStateLocked() bool {
 	c.state.EStopSource = EStopSourceNone
 	c.connectionGeneration = 0
 	c.invalidateMachineTelemetryLocked()
+	c.clearExpectedSilenceLocked()
 	c.pendingQuietStatusReports = 0
 	c.resetControllerHealthLocked()
 	return changed
@@ -1695,6 +1730,9 @@ func (c *Controller) deliverResponseLocked(generation transport.ConnectionGenera
 	if owner.kind != responseOwnerNone && owner.generation != generation {
 		return nil
 	}
+	if classifyProgramResponse(line) != responseIgnore {
+		c.endExpectedSilenceForOwnerLocked(owner)
+	}
 	switch owner.kind {
 	case responseOwnerNone:
 		return nil
@@ -1722,6 +1760,7 @@ func (c *Controller) deliverResponseLocked(generation transport.ConnectionGenera
 		}
 		return run
 	default:
+		c.endExpectedSilenceForOwnerLocked(owner)
 		c.responseOwner = responseOwner{}
 		c.state.LastError = ErrCommandSessionInvariant.Error()
 		return nil

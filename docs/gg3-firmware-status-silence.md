@@ -308,3 +308,11 @@ This inspection establishes constraints, not the final watchdog implementation:
 These facts do not by themselves prescribe command exemptions, new timeout
 values, alarm parsing policy, or another watchdog architecture. Those choices
 require a separate design and implementation task.
+
+DDGo now has the private command-owned lease mechanism needed to represent
+expected command-associated silence: it can suppress background health probes,
+track current-connection RX activity, end on the command's terminal response or
+operation teardown, and apply a policy-provided inactivity limit. Production
+classification and timing policy for `$H`, `$HX`, `$HY`, `$HZ`, `$L`, and `$LS`
+remain disabled pending follow-up work. The homing and leveling false-positive
+case is therefore not yet fully mitigated in production.
