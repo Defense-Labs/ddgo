@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ianbruene/ddgo/internal/grbl"
 	"github.com/ianbruene/ddgo/internal/transport"
 )
 
@@ -14,6 +15,7 @@ func TestConnectCommitsNumericGRBLSettingsSnapshot(t *testing.T) {
 	c := newManualHandshakeController(tr)
 	done := startManualHandshake(t, tr, c)
 	completeManualHandshake(t, tr, 1,
+		"$13=1 (report_inches)",
 		"$24=30.000 (homeFine)",
 		"$25=2000.000 (homeSeek)",
 		"$26=1 (homeDelay)",
@@ -32,6 +34,7 @@ func TestConnectCommitsNumericGRBLSettingsSnapshot(t *testing.T) {
 		t.Fatalf("settings generation = %d, want 1", snapshot.generation)
 	}
 	want := map[int]float64{
+		13:  1,
 		24:  30,
 		25:  2000,
 		26:  1,
@@ -53,6 +56,38 @@ func TestConnectCommitsNumericGRBLSettingsSnapshot(t *testing.T) {
 	snapshot.values[24] = 999
 	if got := c.grblSettingsSnapshotCopy().values[24]; got != 30 {
 		t.Fatalf("mutating copied snapshot changed controller setting $24 to %v", got)
+	}
+}
+
+func TestHandshakeReportUnitsConfigureGG3LevelPolicy(t *testing.T) {
+	for _, tt := range []struct {
+		setting    string
+		wantInches bool
+	}{
+		{"$13=0", false},
+		{"$13=1", true},
+	} {
+		t.Run(tt.setting, func(t *testing.T) {
+			tr := newBlockingOpenTransport()
+			c := newManualHandshakeController(tr)
+			done := startManualHandshake(t, tr, c)
+			completeManualHandshake(t, tr, 1,
+				tt.setting,
+				"$24=30", "$25=2000", "$26=1", "$27=0.5",
+				"$110=2540", "$111=3100", "$112=3100",
+				"$120=500", "$121=500", "$122=500",
+				"$130=86.5", "$131=241.5", "$132=78.5",
+				"ok",
+			)
+			if err := <-done; err != nil {
+				t.Fatalf("Connect() error = %v", err)
+			}
+			snapshot := c.grblSettingsSnapshotCopy()
+			spec, ok := gg3ExpectedSilenceSpec(grbl.SilentSystemLevel, snapshot.values)
+			if !ok || !spec.levelPlan.reportUnitsKnown || spec.levelPlan.reportInches != tt.wantInches {
+				t.Fatalf("handshake snapshot=%+v policy=%+v ok=%t, want inches=%t", snapshot, spec, ok, tt.wantInches)
+			}
+		})
 	}
 }
 

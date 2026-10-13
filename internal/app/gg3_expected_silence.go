@@ -16,6 +16,7 @@ const (
 	gg3HomingLocateCycles     = 2
 	gg3DistanceFirstPullaway  = 5.0 // mm
 	gg3MinimumFeedRate        = 1.0 // mm/min
+	gg3MillimetersPerInch     = 25.4
 )
 
 type gg3TimingSettings struct {
@@ -36,6 +37,8 @@ type expectedSilenceLevelPlan struct {
 	xFeedRate           float64
 	xMaxRate            float64
 	xAcceleration       float64
+	reportUnitsKnown    bool
+	reportInches        bool
 }
 
 func gg3TimingSettingsFromSnapshot(values map[int]float64) (gg3TimingSettings, bool) {
@@ -189,6 +192,11 @@ func gg3ExpectedSilenceSpec(command grbl.SilentSystemCommand, values map[int]flo
 		if !sumDurations(&base, homeZ, homeX, measurement) {
 			return expectedSilenceSpec{}, false
 		}
+		reportSetting, reportUnitsKnown := values[13]
+		reportInches := false
+		if reportUnitsKnown {
+			reportInches, reportUnitsKnown = gg3ReportInchesFromSetting(reportSetting)
+		}
 		plan = expectedSilenceLevelPlan{
 			valid:               true,
 			xHomeDuration:       homeX,
@@ -197,6 +205,8 @@ func gg3ExpectedSilenceSpec(command grbl.SilentSystemCommand, values map[int]flo
 			xFeedRate:           settings.homingFeed,
 			xMaxRate:            settings.maxRate[0],
 			xAcceleration:       settings.acceleration[0],
+			reportUnitsKnown:    reportUnitsKnown,
+			reportInches:        reportInches,
 		}
 	default:
 		return expectedSilenceSpec{}, false
@@ -209,10 +219,18 @@ func gg3ExpectedSilenceSpec(command grbl.SilentSystemCommand, values map[int]flo
 }
 
 func gg3LevelNextInactivityLimit(plan expectedSilenceLevelPlan, adjustment float64, adjustmentCount int) (time.Duration, bool) {
-	if !plan.valid || adjustmentCount < 1 || adjustmentCount > 3 || !isFinite(adjustment) {
+	adjustmentMM, ok := gg3LevelAdjustmentMillimeters(plan, adjustment)
+	if !ok {
 		return 0, false
 	}
-	distance := math.Min(math.Abs(adjustment), plan.xTravel)
+	return gg3LevelNextInactivityLimitMM(plan, adjustmentMM, adjustmentCount)
+}
+
+func gg3LevelNextInactivityLimitMM(plan expectedSilenceLevelPlan, adjustmentMM float64, adjustmentCount int) (time.Duration, bool) {
+	if !plan.valid || adjustmentCount < 1 || adjustmentCount > 3 || !isFinite(adjustmentMM) {
+		return 0, false
+	}
+	distance := math.Min(math.Abs(adjustmentMM), plan.xTravel)
 	square, ok := gg3SystemMotionDuration(distance, plan.xFeedRate, plan.xMaxRate, plan.xAcceleration)
 	if !ok {
 		return 0, false
@@ -229,7 +247,31 @@ func gg3LevelNextInactivityLimit(plan expectedSilenceLevelPlan, adjustment float
 }
 
 func gg3LevelFallbackInactivityLimit(plan expectedSilenceLevelPlan, adjustmentCount int) (time.Duration, bool) {
-	return gg3LevelNextInactivityLimit(plan, plan.xTravel, adjustmentCount)
+	return gg3LevelNextInactivityLimitMM(plan, plan.xTravel, adjustmentCount)
+}
+
+func gg3LevelAdjustmentMillimeters(plan expectedSilenceLevelPlan, rawAdjustment float64) (float64, bool) {
+	if !plan.reportUnitsKnown || !isFinite(rawAdjustment) {
+		return 0, false
+	}
+	// GG3 revision b42f8e461506e75b2d0b5d9014e64c323a49608d
+	// appends " mm" unconditionally, but printFloat_CoordValue() converts the
+	// numeric value to inches when $13 is enabled. Normalize to internal mm
+	// before taking the magnitude or applying the X-travel cap.
+	if plan.reportInches {
+		rawAdjustment *= gg3MillimetersPerInch
+	}
+	if !isFinite(rawAdjustment) {
+		return 0, false
+	}
+	return rawAdjustment, true
+}
+
+func gg3ReportInchesFromSetting(value float64) (reportInches, known bool) {
+	if !isFinite(value) {
+		return false, false
+	}
+	return math.Trunc(value) != 0, true
 }
 
 func gg3AddPolicyMargin(base time.Duration) (time.Duration, bool) {

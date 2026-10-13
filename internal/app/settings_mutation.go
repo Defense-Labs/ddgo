@@ -100,7 +100,20 @@ func (c *Controller) commitSettingsMutationLocked(id settingsMutationID) bool {
 		c.grblSettings.generation != mutation.generation || c.grblSettings.values == nil {
 		return false
 	}
-	c.grblSettings.values[mutation.number] = mutation.value
+	value := mutation.value
+	if mutation.number == 13 {
+		// GG3 truncates $13 before using it as its coordinate-report mode.
+		// Retain the effective firmware value, not a submitted fraction.
+		reportInches, known := gg3ReportInchesFromSetting(value)
+		if !known {
+			return false
+		}
+		value = 0
+		if reportInches {
+			value = 1
+		}
+	}
+	c.grblSettings.values[mutation.number] = value
 	return true
 }
 

@@ -76,6 +76,48 @@ func TestManualSettingsMutationCommitsOnlyOnOK(t *testing.T) {
 	}
 }
 
+func TestManualReportUnitsMutationUsesFirmwareIntegerSemantics(t *testing.T) {
+	for _, tt := range []struct {
+		line string
+		want float64
+	}{
+		{"$13=0", 0}, {"$13=1", 1}, {"$13=0.9", 0}, {"$13=1.9", 1},
+	} {
+		t.Run(tt.line, func(t *testing.T) {
+			c, fake := connectSettingsMutationController(t)
+			if err := c.SendConsoleLine(context.Background(), tt.line); err != nil {
+				t.Fatal(err)
+			}
+			fake.InjectRX("ok")
+			waitForNoResponseOwner(t, c)
+			if got := c.grblSettingsSnapshotCopy().values[13]; got != tt.want {
+				t.Fatalf("cached $13 = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestReportUnitsMutationFailureRetainsSnapshot(t *testing.T) {
+	c, fake := connectSettingsMutationController(t)
+	if err := c.SendConsoleLine(context.Background(), "$13=1"); err != nil {
+		t.Fatal(err)
+	}
+	fake.InjectRX("error:1")
+	waitForNoResponseOwner(t, c)
+	if got := c.grblSettingsSnapshotCopy().values[13]; got != 0 {
+		t.Fatalf("failed $13 mutation changed value to %v", got)
+	}
+
+	wantErr := errors.New("write failed")
+	fake.SetWriteError(wantErr)
+	if err := c.SendConsoleLine(context.Background(), "$13=1"); !errors.Is(err, wantErr) {
+		t.Fatalf("SendConsoleLine() error = %v, want %v", err, wantErr)
+	}
+	if got := c.grblSettingsSnapshotCopy().values[13]; got != 0 {
+		t.Fatalf("failed $13 write changed value to %v", got)
+	}
+}
+
 func TestSettingsMutationWriteFailureRetainsSnapshot(t *testing.T) {
 	c, fake := connectSettingsMutationController(t)
 	wantErr := errors.New("write failed")
@@ -156,6 +198,64 @@ func TestInteractiveSettingsMutationUsesExactCompletion(t *testing.T) {
 	if owner.kind != responseOwnerInteractiveMacro {
 		t.Fatalf("persistent owner was released: %+v", owner)
 	}
+}
+
+func TestInteractiveReportUnitsMutationNormalizesFraction(t *testing.T) {
+	c, fake := connectSettingsMutationController(t)
+	session, err := c.beginInteractiveSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.endInteractiveSession(session, nil) })
+	done := make(chan error, 1)
+	go func() { done <- c.runtimeForSession(session).sendLineAndWaitOK(context.Background(), "$13=1.9", 0) }()
+	waitForLineWrites(t, fake, "$13=1.9")
+	fake.InjectRX("ok")
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := c.grblSettingsSnapshotCopy().values[13]; got != 1 {
+		t.Fatalf("interactive $13 value = %v, want 1", got)
+	}
+}
+
+func waitForLevelAdjustmentCount(t *testing.T, c *Controller, want int) expectedSilenceLease {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		lease := expectedSilenceSnapshot(c)
+		if lease.adjustmentCount == want {
+			return lease
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("level adjustment count = %d, want %d", expectedSilenceSnapshot(c).adjustmentCount, want)
+	return expectedSilenceLease{}
+}
+
+func TestSuccessfulReportUnitsMutationChangesProductionLevelTiming(t *testing.T) {
+	c, fake := connectSettingsMutationController(t)
+	if err := c.SendConsoleLine(context.Background(), "$13=1"); err != nil {
+		t.Fatal(err)
+	}
+	fake.InjectRX("ok")
+	waitForSettingValue(t, c, 13, 1)
+
+	if err := c.SendConsoleLine(context.Background(), "$L"); err != nil {
+		t.Fatal(err)
+	}
+	lease := waitForExpectedSilence(t, c, true)
+	wantLimit, ok := gg3LevelNextInactivityLimit(lease.levelPlan, 1, 1)
+	if !ok || !lease.levelPlan.reportUnitsKnown || !lease.levelPlan.reportInches {
+		t.Fatalf("inch-report lease plan = %+v, calculation ok=%t", lease.levelPlan, ok)
+	}
+	fake.InjectRX("[1.0000 mm]")
+	updated := waitForLevelAdjustmentCount(t, c, 1)
+	if updated.id != lease.id || updated.inactivityLimit != wantLimit {
+		t.Fatalf("updated lease = %+v, want id=%d limit=%v", updated, lease.id, wantLimit)
+	}
+	fake.InjectRX("ok")
+	waitForExpectedSilence(t, c, false)
 }
 
 func TestSettingsResetInvalidatesSnapshotBeforeWrite(t *testing.T) {

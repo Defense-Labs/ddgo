@@ -153,7 +153,8 @@ func (c *Controller) noteExpectedSilenceProgressLocked(generation transport.Conn
 	var ok bool
 	if parsed {
 		limit, ok = gg3LevelNextInactivityLimit(c.expectedSilence.levelPlan, adjustment, nextCount)
-	} else {
+	}
+	if !parsed || !ok {
 		limit, ok = gg3LevelFallbackInactivityLimit(c.expectedSilence.levelPlan, nextCount)
 	}
 	if !ok || limit <= 0 {

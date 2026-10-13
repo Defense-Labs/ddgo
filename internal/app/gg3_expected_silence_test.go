@@ -12,11 +12,20 @@ import (
 
 func defaultGG3TimingValues() map[int]float64 {
 	return map[int]float64{
+		13: 0,
 		24: 30, 25: 2000, 26: 1, 27: 0.5,
 		110: 2540, 111: 3100, 112: 3100,
 		120: 500, 121: 500, 122: 500,
 		130: 86.5, 131: 241.5, 132: 78.5,
 	}
+}
+
+func durationNear(left, right, tolerance time.Duration) bool {
+	delta := left - right
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= tolerance
 }
 
 func TestGG3SystemMotionDuration(t *testing.T) {
@@ -123,6 +132,106 @@ func TestGG3LevelSaveRespondsToXAndZHomingSettings(t *testing.T) {
 		if !ok || spec.inactivityLimit == baseSpec.inactivityLimit {
 			t.Errorf("changing $%d did not alter LevelSave timing: got %+v, base %+v", number, spec, baseSpec)
 		}
+	}
+}
+
+func TestGG3ReportInchesUsesTruncatedSettingSemantics(t *testing.T) {
+	for _, tt := range []struct {
+		value      float64
+		wantInches bool
+		wantKnown  bool
+	}{
+		{0, false, true}, {0.9, false, true}, {1, true, true}, {1.9, true, true},
+		{math.NaN(), false, false}, {math.Inf(1), false, false},
+	} {
+		inches, known := gg3ReportInchesFromSetting(tt.value)
+		if inches != tt.wantInches || known != tt.wantKnown {
+			t.Errorf("gg3ReportInchesFromSetting(%v) = (%t, %t), want (%t, %t)", tt.value, inches, known, tt.wantInches, tt.wantKnown)
+		}
+	}
+}
+
+func TestGG3LevelAdjustmentReportUnitConversion(t *testing.T) {
+	mmValues := defaultGG3TimingValues()
+	mmValues[13] = 0
+	mmSpec, ok := gg3ExpectedSilenceSpec(grbl.SilentSystemLevel, mmValues)
+	if !ok {
+		t.Fatal("millimeter-report Level policy unavailable")
+	}
+	inchValues := defaultGG3TimingValues()
+	inchValues[13] = 1
+	inchSpec, ok := gg3ExpectedSilenceSpec(grbl.SilentSystemLevel, inchValues)
+	if !ok {
+		t.Fatal("inch-report Level policy unavailable")
+	}
+
+	mmAdjustment, parsedMM := grbl.ParseGG3LevelAdjustment("[25.400 mm]")
+	inchAdjustment, parsedInch := grbl.ParseGG3LevelAdjustment("[1.0000 mm]")
+	negativeInchAdjustment, parsedNegative := grbl.ParseGG3LevelAdjustment("[-1.0000 mm]")
+	mmLimit, ok := gg3LevelNextInactivityLimit(mmSpec.levelPlan, mmAdjustment, 1)
+	inchLimit, ok2 := gg3LevelNextInactivityLimit(inchSpec.levelPlan, inchAdjustment, 1)
+	negativeInchLimit, ok3 := gg3LevelNextInactivityLimit(inchSpec.levelPlan, negativeInchAdjustment, 1)
+	if !parsedMM || !parsedInch || !parsedNegative || !ok || !ok2 || !ok3 || !durationNear(mmLimit, inchLimit, time.Nanosecond) ||
+		!durationNear(inchLimit, negativeInchLimit, time.Nanosecond) {
+		t.Fatalf("unit conversion limits: mm=%v/%t inch=%v/%t negative-inch=%v/%t", mmLimit, ok, inchLimit, ok2, negativeInchLimit, ok3)
+	}
+}
+
+func TestGG3LevelAdjustmentConvertsBeforeTravelCap(t *testing.T) {
+	values := defaultGG3TimingValues()
+	values[13] = 1
+	spec, ok := gg3ExpectedSilenceSpec(grbl.SilentSystemLevel, values)
+	if !ok {
+		t.Fatal("inch-report Level policy unavailable")
+	}
+	rawAdjustment, parsed := grbl.ParseGG3LevelAdjustment("[10.0000 mm]")
+	convertedAndCapped, ok := gg3LevelNextInactivityLimit(spec.levelPlan, rawAdjustment, 1)
+	fullTravel, ok2 := gg3LevelNextInactivityLimitMM(spec.levelPlan, spec.levelPlan.xTravel, 1)
+	if !parsed || !ok || !ok2 || convertedAndCapped != fullTravel {
+		t.Fatalf("converted cap = %v/%t, full travel = %v/%t", convertedAndCapped, ok, fullTravel, ok2)
+	}
+}
+
+func TestGG3LevelMissingReportUnitsKeepsInitialLeaseAndFallsBack(t *testing.T) {
+	values := defaultGG3TimingValues()
+	knownSpec, ok := gg3ExpectedSilenceSpec(grbl.SilentSystemLevel, values)
+	if !ok {
+		t.Fatal("known-unit Level policy unavailable")
+	}
+	delete(values, 13)
+	spec, ok := gg3ExpectedSilenceSpec(grbl.SilentSystemLevel, values)
+	if !ok || spec.inactivityLimit != knownSpec.inactivityLimit || spec.levelPlan.reportUnitsKnown {
+		t.Fatalf("missing-$13 Level spec = %+v, ok=%t; known spec = %+v", spec, ok, knownSpec)
+	}
+
+	c := NewController(transport.NewFakeTransport(), nil)
+	started := time.Unix(75, 0)
+	c.now = func() time.Time { return started }
+	c.mu.Lock()
+	c.connectionGeneration = 1
+	c.statusMonitoringGeneration = 1
+	c.state.ConnectionStatus = ConnectionConnected
+	owner := responseOwner{kind: responseOwnerInteractiveMacro, session: newResponseSession(make(chan string, 1)), generation: 1}
+	c.responseOwner = owner
+	id, err := c.beginExpectedSilenceLocked(owner, spec)
+	if err != nil {
+		c.mu.Unlock()
+		t.Fatal(err)
+	}
+	when := started.Add(time.Second)
+	c.noteControllerActivityLocked(1, when)
+	c.noteExpectedSilenceProgressLocked(1, when, "[1.000 mm]")
+	lease := c.expectedSilence
+	c.mu.Unlock()
+	wantLimit, ok := gg3LevelFallbackInactivityLimit(spec.levelPlan, 1)
+	if !ok || lease.id != id || lease.adjustmentCount != 1 || lease.lastActivity != when || lease.inactivityLimit != wantLimit {
+		t.Fatalf("unknown-unit progress lease = %+v, want id=%d count=1 activity=%v limit=%v", lease, id, when, wantLimit)
+	}
+
+	values[13] = math.NaN()
+	nonFiniteSpec, ok := gg3ExpectedSilenceSpec(grbl.SilentSystemLevel, values)
+	if !ok || nonFiniteSpec.levelPlan.reportUnitsKnown {
+		t.Fatalf("non-finite $13 spec = %+v, ok=%t", nonFiniteSpec, ok)
 	}
 }
 

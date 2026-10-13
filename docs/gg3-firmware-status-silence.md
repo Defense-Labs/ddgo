@@ -332,6 +332,16 @@ or unnecessarily multi-minute allowance to the whole command. Automatic
 background `?` probes are suppressed during the lease: the blind firmware path
 cannot service them, and its pending status flag coalesces repeated requests.
 
+The apparent `mm` unit on that progress line is unreliable. Internally `$L`
+computes `squaring_mm2move` in millimeters, but revision
+`b42f8e461506e75b2d0b5d9014e64c323a49608d` prints it through
+`printFloat_CoordValue()`. When `$13=1`, that helper converts the numeric value
+to inches even though the firmware then appends the literal `" mm"`. DDGo uses
+the committed `$13` report mode to convert the number back to millimeters
+before applying its magnitude, X-travel cap, and timing calculation. If `$13`
+is missing or unusable, a valid progress line still advances the operation but
+uses the existing conservative full-X-travel timing fallback.
+
 ## Accepted e-stop observability tradeoff
 
 The host cannot eliminate the firmware's blind interval. A physical e-stop may
