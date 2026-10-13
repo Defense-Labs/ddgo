@@ -64,23 +64,23 @@ func (c *Controller) setConnectAttemptErrorLocked(err error) {
 	}
 }
 
-func (c *Controller) validateGRBLConnection(ctx context.Context, attempt connectAttemptID, generation transport.ConnectionGeneration) error {
+func (c *Controller) validateGRBLConnection(ctx context.Context, attempt connectAttemptID, generation transport.ConnectionGeneration) (map[int]float64, error) {
 	events, err := c.connectAttemptEventStream(attempt)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := c.waitForGRBLBanner(ctx, attempt, generation, events); err != nil {
-		return err
+		return nil, err
 	}
 	if err := c.waitForStartupQuiet(ctx, attempt, generation, events); err != nil {
-		return err
+		return nil, err
 	}
 
 	msg := transport.NewLineMessage("$$")
 	msg.SuppressLog = true
 	queryStarted := time.Now()
 	if err := c.transport.Write(ctx, msg); err != nil {
-		return fmt.Errorf("write GRBL settings query: %w", err)
+		return nil, fmt.Errorf("write GRBL settings query: %w", err)
 	}
 	return c.waitForSettingsResponse(ctx, attempt, generation, queryStarted, events)
 }
@@ -198,49 +198,53 @@ func (c *Controller) waitForStartupQuiet(ctx context.Context, attempt connectAtt
 	}
 }
 
-func (c *Controller) waitForSettingsResponse(ctx context.Context, attempt connectAttemptID, generation transport.ConnectionGeneration, queryStarted time.Time, events <-chan transport.Event) error {
+func (c *Controller) waitForSettingsResponse(ctx context.Context, attempt connectAttemptID, generation transport.ConnectionGeneration, queryStarted time.Time, events <-chan transport.Event) (map[int]float64, error) {
 	timer := time.NewTimer(c.connectionSettingsTimeout)
 	defer timer.Stop()
 	settingSeen := false
+	settings := make(map[int]float64)
 	lines := 0
 	for {
 		if err := c.currentConnectAttemptError(attempt); err != nil {
-			return err
+			return nil, err
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		case <-timer.C:
-			return errors.New("timed out waiting for GRBL settings response")
+			return nil, errors.New("timed out waiting for GRBL settings response")
 		case event := <-events:
 			if event.Generation != generation {
 				continue
 			}
 			switch event.Kind {
 			case transport.EventError:
-				return connectTransportEventError(event)
+				return nil, connectTransportEventError(event)
 			case transport.EventDisconnected:
-				return ErrTransportDisconnected
+				return nil, ErrTransportDisconnected
 			case transport.EventRX:
 				if !event.When.IsZero() && event.When.Before(queryStarted) {
 					continue
 				}
 				lines++
 				if lines > maxSettingsResponseLines {
-					return errors.New("GRBL settings response exceeded line limit")
+					return nil, errors.New("GRBL settings response exceeded line limit")
 				}
 				line := strings.TrimSpace(event.Text)
 				lower := strings.ToLower(line)
 				switch {
 				case grbl.IsSettingLine(line):
 					settingSeen = true
+					if number, value, ok := grbl.ParseSettingLine(line); ok {
+						settings[number] = value
+					}
 				case lower == "ok":
 					if !settingSeen {
-						return errors.New("GRBL settings response ended without any settings")
+						return nil, errors.New("GRBL settings response ended without any settings")
 					}
-					return nil
+					return settings, nil
 				case strings.HasPrefix(lower, "error"), strings.HasPrefix(lower, "alarm"):
-					return fmt.Errorf("GRBL settings query failed: %s", line)
+					return nil, fmt.Errorf("GRBL settings query failed: %s", line)
 				}
 			}
 		}

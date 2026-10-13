@@ -20,7 +20,7 @@ The controller coordinates these concerns but keeps lower-level details in focus
 
 The controller owns status-poll cancellation and waits for the polling goroutine to stop during either explicit or unexpected disconnect cleanup. The serial transport owns its read loop and line buffer; partial serial lines are scoped to one connection and are discarded before a replacement read loop starts.
 
-Connection establishment has an explicit public lifecycle: `disconnected -> connecting -> connected`. The `connecting` phase covers opening the transport, observing a GRBL startup banner, allowing startup output to settle, and validating a `$$` settings response. The physical transport generation is committed and normal status polling begins only after that initialization succeeds.
+Connection establishment has an explicit public lifecycle: `disconnected -> connecting -> connected`. The `connecting` phase covers opening the transport, observing a GRBL startup banner, allowing startup output to settle, and validating a `$$` settings response. Numeric settings are collected privately during validation and copied into a connection-generation-owned snapshot only when that candidate generation commits; disconnect clears the snapshot. The physical transport generation is committed and normal status polling begins only after initialization succeeds.
 
 ## Controller health and emergency stop
 

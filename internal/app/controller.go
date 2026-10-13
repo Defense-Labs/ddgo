@@ -127,6 +127,7 @@ type Controller struct {
 	connectAttemptEvents                    chan transport.Event
 	pendingDisconnectedGenerations          map[transport.ConnectionGeneration]error
 	connectionGeneration                    transport.ConnectionGeneration
+	grblSettings                            grblSettingsSnapshot
 	connectionBannerTimeout                 time.Duration
 	connectionStartupQuietPeriod            time.Duration
 	connectionStartupSettleTimeout          time.Duration
@@ -299,7 +300,8 @@ func (c *Controller) connect(ctx context.Context, cfg transport.PortConfig, orig
 		return c.failConnectAttempt(attempt, generation, serialOpenError(cfg.Name, err), openSucceeded || generation != 0, report)
 	}
 
-	if err := c.validateGRBLConnection(ctx, attempt, generation); err != nil {
+	settings, err := c.validateGRBLConnection(ctx, attempt, generation)
+	if err != nil {
 		return c.failConnectAttempt(attempt, generation, err, true, report)
 	}
 
@@ -317,6 +319,7 @@ func (c *Controller) connect(ctx context.Context, cfg transport.PortConfig, orig
 	c.state.EStopStatus = EStopClear
 	c.state.EStopSource = EStopSourceNone
 	c.connectionGeneration = generation
+	c.setGRBLSettingsLocked(generation, settings)
 	c.state.PortName = cfg.Name
 	c.state.LastError = ""
 	c.applySuccessfulConnectionPolicyLocked(origin, cfg)
@@ -1470,6 +1473,7 @@ func (c *Controller) clearConnectionStateLocked() bool {
 	c.state.EStopStatus = EStopClear
 	c.state.EStopSource = EStopSourceNone
 	c.connectionGeneration = 0
+	c.clearGRBLSettingsLocked()
 	c.invalidateMachineTelemetryLocked()
 	c.clearExpectedSilenceLocked()
 	c.pendingQuietStatusReports = 0

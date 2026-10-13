@@ -312,7 +312,13 @@ require a separate design and implementation task.
 DDGo now has the private command-owned lease mechanism needed to represent
 expected command-associated silence: it can suppress background health probes,
 track current-connection RX activity, end on the command's terminal response or
-operation teardown, and apply a policy-provided inactivity limit. Production
-classification and timing policy for `$H`, `$HX`, `$HY`, `$HZ`, `$L`, and `$LS`
-remain disabled pending follow-up work. The homing and leveling false-positive
-case is therefore not yet fully mitigated in production.
+operation teardown, and apply a policy-provided inactivity limit. DDGo can also
+canonically recognize `$H`, `$HX`, `$HY`, `$HZ`, `$L`, and `$LS` using the
+firmware's relevant input filtering, and it retains numeric settings from the
+connection `$$` handshake in a private generation-owned snapshot for later
+timing calculation.
+
+Production expected-silence timing remains disabled pending follow-up work.
+That work must select timing policy and address snapshot coherence after
+post-connect setting writes or settings resets. The homing and leveling
+false-positive case is therefore not yet fully mitigated in production.
