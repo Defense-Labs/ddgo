@@ -98,6 +98,9 @@ func (t *SerialTransport) Write(ctx context.Context, msg Message) error {
 	display := msg.Display
 	suppressLog := msg.SuppressLog
 	t.mu.Lock()
+	// Capture the physical handle for this whole write. Close removes and closes
+	// that handle before a later Open installs another one, so a delayed writer
+	// from an old generation cannot be redirected onto the replacement port.
 	port := t.port
 	generation := t.generation
 	t.mu.Unlock()

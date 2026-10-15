@@ -15,12 +15,47 @@ var errResetBannerNotObserved = errors.New("controller reset could not be confir
 var errPostResetIdleNotObserved = errors.New("controller reset was not followed by a fresh Idle status")
 
 type programStopOperation struct {
-	id         stopOperationID
-	run        *programRun
-	generation transport.ConnectionGeneration
-	done       chan struct{}
-	err        error
-	completed  bool
+	id                      stopOperationID
+	run                     *programRun
+	generation              transport.ConnectionGeneration
+	alarmBaseline           uint64
+	done                    chan struct{}
+	err                     error
+	completed               bool
+	invalidated             bool
+	verificationInvalidated bool
+	verificationErr         error
+}
+
+// noteStopVerificationAlarmLocked records every current-generation alarm,
+// including standalone ALARM:n feedback. A later Idle cannot prove readiness
+// for a reset attempt once the firmware has reported an alarm.
+func (c *Controller) noteStopVerificationAlarmLocked(generation transport.ConnectionGeneration, err error) {
+	if generation == 0 || generation != c.connectionGeneration {
+		return
+	}
+	c.alarmRevision++
+	close(c.alarmChanged)
+	c.alarmChanged = make(chan struct{})
+	if op := c.stopOperation; op != nil && !op.completed && op.generation == generation {
+		op.verificationInvalidated = true
+		if op.verificationErr == nil {
+			op.verificationErr = err
+		}
+	}
+}
+
+func (c *Controller) stopVerificationErrorLocked(op *programStopOperation) error {
+	if op == nil || c.stopOperation != op || op.completed || op.invalidated {
+		return ErrCommandSessionCanceled
+	}
+	if op.verificationInvalidated || c.alarmRevision > op.alarmBaseline {
+		if op.verificationErr != nil {
+			return op.verificationErr
+		}
+		return errors.New("controller alarm invalidated reset verification")
+	}
+	return nil
 }
 
 func (c *Controller) setMachineReadinessLocked(readiness MachineReadiness, reason string) {
@@ -121,7 +156,7 @@ func (c *Controller) executeProgramStop(op *programStopOperation) {
 		firstWriteErr = fmt.Errorf("write program hold: %w", err)
 	}
 	c.mu.RLock()
-	stopStillCurrent := c.stopOperation == op && c.run == op.run && c.connectionGeneration == op.generation
+	stopStillCurrent := c.stopOperation == op && c.run == op.run && c.connectionGeneration == op.generation && !op.invalidated
 	bannerBaseline := c.startupBannerRevision
 	resetStartedAt := c.now()
 	c.mu.RUnlock()
@@ -155,7 +190,7 @@ func (c *Controller) executeProgramStop(op *programStopOperation) {
 	}
 
 	c.mu.Lock()
-	if c.stopOperation != op || c.run != op.run || c.connectionGeneration != op.generation {
+	if c.stopOperation != op || c.run != op.run || c.connectionGeneration != op.generation || op.invalidated {
 		c.mu.Unlock()
 		return
 	}
@@ -165,7 +200,7 @@ func (c *Controller) executeProgramStop(op *programStopOperation) {
 	c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: verifying.state, StateRevision: verifying.revision, Text: "verifying controller after program reset"}
 
 	bannerCtx, cancelBanner := context.WithTimeout(context.Background(), c.stopResetBannerTimeout)
-	err = c.waitForStartupBannerAfter(bannerCtx, op.generation, bannerBaseline, resetStartedAt)
+	err = c.waitForStartupBannerAfter(bannerCtx, op, bannerBaseline, resetStartedAt)
 	cancelBanner()
 	if err != nil {
 		c.failProgramStop(op, fmt.Errorf("%w: %v", errResetBannerNotObserved, err))
@@ -173,7 +208,7 @@ func (c *Controller) executeProgramStop(op *programStopOperation) {
 	}
 
 	idleCtx, cancelIdle := context.WithTimeout(context.Background(), c.stopIdleTimeout)
-	err = c.verifyFreshIdle(idleCtx, op.generation)
+	err = c.verifyFreshIdle(idleCtx, op.generation, op.alarmBaseline, op)
 	cancelIdle()
 	if err != nil {
 		c.failProgramStop(op, fmt.Errorf("%w: %v", errPostResetIdleNotObserved, err))
@@ -200,16 +235,22 @@ func (c *Controller) writeStopActionBounded(ctx context.Context, action grbl.Act
 	}
 }
 
-func (c *Controller) waitForStartupBannerAfter(ctx context.Context, generation transport.ConnectionGeneration, baseline uint64, notBefore time.Time) error {
+func (c *Controller) waitForStartupBannerAfter(ctx context.Context, op *programStopOperation, baseline uint64, notBefore time.Time) error {
 	for {
 		c.mu.RLock()
+		generation := op.generation
 		if generation == 0 || c.connectionGeneration != generation || !c.state.IsConnected() {
 			c.mu.RUnlock()
 			return ErrTransportDisconnected
 		}
+		if err := c.stopVerificationErrorLocked(op); err != nil {
+			c.mu.RUnlock()
+			return err
+		}
 		revision := c.startupBannerRevision
 		bannerAt := c.lastStartupBannerAt
 		changed := c.startupBannerChanged
+		alarmChanged := c.alarmChanged
 		c.mu.RUnlock()
 		if revision > baseline && !bannerAt.Before(notBefore) {
 			return nil
@@ -218,17 +259,27 @@ func (c *Controller) waitForStartupBannerAfter(ctx context.Context, generation t
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-changed:
+		case <-alarmChanged:
 		}
 	}
 }
 
-func (c *Controller) verifyFreshIdle(ctx context.Context, generation transport.ConnectionGeneration) error {
+func (c *Controller) verifyFreshIdle(ctx context.Context, generation transport.ConnectionGeneration, alarmBaseline uint64, op *programStopOperation) error {
 	c.mu.RLock()
 	if generation == 0 || c.connectionGeneration != generation || !c.state.IsConnected() {
 		c.mu.RUnlock()
 		return ErrTransportDisconnected
 	}
 	baseline := c.statusReportRevision
+	if op != nil {
+		if err := c.stopVerificationErrorLocked(op); err != nil {
+			c.mu.RUnlock()
+			return err
+		}
+	} else if c.alarmRevision > alarmBaseline {
+		c.mu.RUnlock()
+		return errors.New("controller alarm invalidated readiness verification")
+	}
 	c.mu.RUnlock()
 	if err := c.writeStatusPollWhenAvailable(ctx); err != nil {
 		return err
@@ -239,9 +290,19 @@ func (c *Controller) verifyFreshIdle(ctx context.Context, generation transport.C
 			c.mu.RUnlock()
 			return ErrTransportDisconnected
 		}
+		if op != nil {
+			if err := c.stopVerificationErrorLocked(op); err != nil {
+				c.mu.RUnlock()
+				return err
+			}
+		} else if c.alarmRevision > alarmBaseline {
+			c.mu.RUnlock()
+			return errors.New("controller alarm invalidated readiness verification")
+		}
 		revision := c.statusReportRevision
 		machineState := c.state.MachineState
 		changed := c.statusReportChanged
+		alarmChanged := c.alarmChanged
 		c.mu.RUnlock()
 		if revision > baseline {
 			if strings.EqualFold(machineState, "Alarm") {
@@ -255,14 +316,24 @@ func (c *Controller) verifyFreshIdle(ctx context.Context, generation transport.C
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-changed:
+		case <-alarmChanged:
 		}
 	}
 }
 
 func (c *Controller) finishProgramStop(op *programStopOperation) {
 	c.mu.Lock()
-	if c.stopOperation != op || c.run != op.run || c.connectionGeneration != op.generation || c.state.EStopStatus != EStopClear {
+	if c.stopOperation != op || op.completed {
 		c.mu.Unlock()
+		return
+	}
+	if err := c.stopVerificationErrorLocked(op); err != nil || c.run != op.run || c.connectionGeneration != op.generation ||
+		c.state.EStopStatus != EStopClear || c.state.MachineReadiness != MachineReadinessVerifying {
+		if err == nil {
+			err = errors.New("controller reset readiness could not be finalized")
+		}
+		c.mu.Unlock()
+		c.failProgramStop(op, err)
 		return
 	}
 	c.run = nil
@@ -299,14 +370,17 @@ func (c *Controller) failProgramStop(op *programStopOperation, err error) {
 	c.events <- programErrorEvent(err, snapshot, op.run)
 }
 
-func (c *Controller) verifyReadinessAfterConnect(generation transport.ConnectionGeneration) {
+func (c *Controller) verifyReadinessAfterConnect(generation transport.ConnectionGeneration, alarmBaseline uint64) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.stopIdleTimeout)
-	err := c.verifyFreshIdle(ctx, generation)
+	err := c.verifyFreshIdle(ctx, generation, alarmBaseline, nil)
 	cancel()
 	c.mu.Lock()
 	if c.connectionGeneration != generation || c.state.MachineReadiness != MachineReadinessVerifying {
 		c.mu.Unlock()
 		return
+	}
+	if c.alarmRevision > alarmBaseline {
+		err = errors.New("controller alarm invalidated reconnect readiness verification")
 	}
 	if err != nil {
 		c.requireMachineRecoveryLocked("reconnected controller did not provide a fresh Idle status: " + err.Error())

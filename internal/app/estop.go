@@ -68,6 +68,11 @@ func (c *Controller) enterEStopLocked(source EStopSource, generation transport.C
 		c.requireMachineRecoveryLocked("emergency stop interrupted program execution; reconnect and verify controller Idle")
 	}
 	if c.stopOperation != nil {
+		c.stopOperation.invalidated = true
+		c.stopOperation.verificationInvalidated = true
+		if c.stopOperation.verificationErr == nil {
+			c.stopOperation.verificationErr = err
+		}
 		c.completeStopOperationLocked(c.stopOperation, err)
 	}
 	c.terminateResponseOwnerLocked(c.responseOwner, err)

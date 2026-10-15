@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ianbruene/ddgo/internal/grbl"
 	"github.com/ianbruene/ddgo/internal/transport"
 )
 
@@ -245,6 +246,166 @@ func TestBlockedStopWriteTimesOutFailClosedAndRecoveryDisconnectReturns(t *testi
 		t.Fatalf("disconnect did not retain recovery and retire reservation: active=%t state=%+v", writeActive, controller.Snapshot())
 	}
 	close(tr.release)
+}
+
+func TestDisconnectInvalidatesBlockedStopWriteBeforeTimeout(t *testing.T) {
+	fake := transport.NewFakeTransport()
+	tr := &blockingStopWriteTransport{fake: fake, started: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() {
+		select {
+		case <-tr.release:
+		default:
+			close(tr.release)
+		}
+	})
+	controller := NewController(tr, nil)
+	controller.statusPollInterval = time.Hour
+	controller.stopTransportTimeout = time.Second
+	if err := controller.Connect(context.Background(), transport.DefaultPortConfig("fake")); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	if _, err := controller.StartDocumentProgram(context.Background(), 91, documentProgram(t, "disconnect-blocked-stop.gcode", "M5\n")); err != nil {
+		t.Fatalf("StartDocumentProgram() error = %v", err)
+	}
+	waitForLineWrites(t, fake, "M5")
+	stopped := make(chan error, 1)
+	go func() { stopped <- controller.StopProgram(context.Background()) }()
+	<-tr.started
+
+	disconnected := make(chan error, 1)
+	go func() { disconnected <- controller.Disconnect() }()
+	select {
+	case err := <-disconnected:
+		if err != nil {
+			t.Fatalf("Disconnect() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Disconnect() waited for the blocked Stop write")
+	}
+	state := controller.Snapshot()
+	if state.ConnectionStatus != ConnectionDisconnected || state.MachineReadiness != MachineReadinessRecoveryRequired || state.ProgramStatus != ProgramFailed {
+		t.Fatalf("state after disconnected blocked Stop = %+v", state)
+	}
+	close(tr.release)
+	select {
+	case err := <-stopped:
+		if err == nil {
+			t.Fatal("StopProgram() error = nil after Disconnect")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked Stop did not finish after release")
+	}
+	if state := controller.Snapshot(); state.ProgramStatus == ProgramStopped || state.MachineReadiness == MachineReadinessNormal {
+		t.Fatalf("late old-generation write finalized Stop: %+v", state)
+	}
+}
+
+func TestMachineWideResumeCannotBypassPausedProgram(t *testing.T) {
+	controller, fake, runID := startSingleLineDocumentRun(t)
+	if err := controller.PauseProgram(context.Background()); err != nil {
+		t.Fatalf("PauseProgram() error = %v", err)
+	}
+	if state := controller.Snapshot(); state.ProgramStatus != ProgramPaused || state.ProgramRunID != runID {
+		t.Fatalf("paused state = %+v", state)
+	}
+	before := len(fake.Written())
+	if err := controller.ResumeMotion(context.Background()); !errors.Is(err, ErrProgramActive) {
+		t.Fatalf("ResumeMotion() error = %v, want %v", err, ErrProgramActive)
+	}
+	if err := controller.Action(context.Background(), grbl.ActionResume); !errors.Is(err, ErrProgramActive) {
+		t.Fatalf("Action(Resume) error = %v, want %v", err, ErrProgramActive)
+	}
+	for _, msg := range fake.Written()[before:] {
+		if msg.Display == "~" {
+			t.Fatalf("machine-wide Resume wrote %q while program owned execution", msg.Display)
+		}
+	}
+	if state := controller.Snapshot(); state.ProgramStatus != ProgramPaused || state.ProgramRunID != runID {
+		t.Fatalf("machine-wide Resume changed paused run: %+v", state)
+	}
+	if err := controller.ResumeProgram(context.Background()); err != nil {
+		t.Fatalf("ResumeProgram() error = %v", err)
+	}
+	waitForDisplayWrite(t, fake, "~")
+}
+
+func TestGenericSoftResetCannotOverlapProgramStop(t *testing.T) {
+	controller, fake, _ := startSingleLineDocumentRun(t)
+	fake.SetResponding(false)
+	done := make(chan error, 1)
+	go func() { done <- controller.StopProgram(context.Background()) }()
+	waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramStopping })
+	if err := controller.SoftReset(context.Background()); !errors.Is(err, ErrStopInProgress) {
+		t.Fatalf("SoftReset() during Stop error = %v, want %v", err, ErrStopInProgress)
+	}
+	resets := 0
+	for _, msg := range fake.Written() {
+		if msg.Display == "Ctrl-X" {
+			resets++
+		}
+	}
+	if resets > 1 {
+		t.Fatalf("generic reset overlapped Stop: %d Ctrl-X writes", resets)
+	}
+	waitForDisplayWrite(t, fake, "Ctrl-X")
+	before := countStatusWrites(fake.Written())
+	fake.InjectRX("Grbl 1.1g [help:'$']")
+	waitForStatusWritesAfter(t, fake, before)
+	fake.InjectRX("<Idle|MPos:0,0,0>")
+	if err := <-done; err != nil {
+		t.Fatalf("StopProgram() error = %v", err)
+	}
+}
+
+func TestStandaloneAlarmInvalidatesStopVerification(t *testing.T) {
+	controller, fake, runID := startSingleLineDocumentRun(t)
+	fake.SetResponding(false)
+	done := make(chan error, 1)
+	go func() { done <- controller.StopProgram(context.Background()) }()
+	waitForDisplayWrite(t, fake, "Ctrl-X")
+	fake.InjectRX("ALARM:1")
+	fake.InjectRX("Grbl 1.1g [help:'$']")
+	fake.InjectRX("<Idle|MPos:0,0,0>")
+	if err := <-done; err == nil {
+		t.Fatal("StopProgram() succeeded after standalone alarm")
+	}
+	state := controller.Snapshot()
+	if state.ProgramStatus != ProgramFailed || state.MachineReadiness != MachineReadinessRecoveryRequired || state.ProgramRunID != runID || state.ProgramError == "" {
+		t.Fatalf("standalone alarm state = %+v", state)
+	}
+}
+
+func TestAlarmStatusCannotBeErasedByLaterIdleDuringStopVerification(t *testing.T) {
+	controller, fake, _ := startSingleLineDocumentRun(t)
+	fake.SetResponding(false)
+	before := countStatusWrites(fake.Written())
+	done := make(chan error, 1)
+	go func() { done <- controller.StopProgram(context.Background()) }()
+	waitForDisplayWrite(t, fake, "Ctrl-X")
+	fake.InjectRX("Grbl 1.1g [help:'$']")
+	waitForStatusWritesAfter(t, fake, before)
+	fake.InjectRX("<Alarm|MPos:0,0,0>")
+	fake.InjectRX("<Idle|MPos:0,0,0>")
+	if err := <-done; err == nil {
+		t.Fatal("StopProgram() succeeded after Alarm status followed by Idle")
+	}
+	if state := controller.Snapshot(); state.ProgramStatus != ProgramFailed || state.MachineReadiness != MachineReadinessRecoveryRequired {
+		t.Fatalf("Alarm then Idle state = %+v", state)
+	}
+}
+
+func TestManualSoftResetDoesNotClearRecoveryRequired(t *testing.T) {
+	controller, fake := newConnectedResetController(t)
+	controller.mu.Lock()
+	controller.requireMachineRecoveryLocked("test recovery required")
+	controller.mu.Unlock()
+	if err := controller.SoftReset(context.Background()); err != nil {
+		t.Fatalf("SoftReset() in recovery error = %v", err)
+	}
+	waitForDisplayWrite(t, fake, "Ctrl-X")
+	if state := controller.Snapshot(); state.MachineReadiness != MachineReadinessRecoveryRequired {
+		t.Fatalf("manual reset cleared recovery state: %+v", state)
+	}
 }
 
 func TestMissingResetEvidenceFailsClosedAndReconnectRecovers(t *testing.T) {

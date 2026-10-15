@@ -183,6 +183,8 @@ type Controller struct {
 	startupBannerRevision                   uint64
 	lastStartupBannerAt                     time.Time
 	startupBannerChanged                    chan struct{}
+	alarmRevision                           uint64
+	alarmChanged                            chan struct{}
 	stopTransportTimeout                    time.Duration
 	stopResetBannerTimeout                  time.Duration
 	stopIdleTimeout                         time.Duration
@@ -213,6 +215,7 @@ func NewController(t transport.Transport, listPorts ports.ListFunc) *Controller 
 		contour:                        macro.NewContourState(),
 		statusReportChanged:            make(chan struct{}),
 		startupBannerChanged:           make(chan struct{}),
+		alarmChanged:                   make(chan struct{}),
 		stopTransportTimeout:           defaultStopTransportTimeout,
 		stopResetBannerTimeout:         defaultStopResetBannerTimeout,
 		stopIdleTimeout:                defaultStopIdleTimeout,
@@ -363,6 +366,7 @@ func (c *Controller) connect(ctx context.Context, cfg transport.PortConfig, orig
 	c.applySuccessfulConnectionPolicyLocked(origin, cfg)
 	c.finishConnectAttemptLocked(attempt)
 	recoveryVerification := c.state.MachineReadiness != MachineReadinessNormal
+	recoveryAlarmBaseline := c.alarmRevision
 	if recoveryVerification {
 		c.setMachineReadinessLocked(MachineReadinessVerifying, "connection validated; waiting for a fresh controller Idle status")
 	}
@@ -372,7 +376,7 @@ func (c *Controller) connect(ctx context.Context, cfg transport.PortConfig, orig
 
 	c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: snapshot.state, StateRevision: snapshot.revision, Text: fmt.Sprintf("connected to %s", cfg.Name)}
 	if recoveryVerification {
-		go c.verifyReadinessAfterConnect(generation)
+		go c.verifyReadinessAfterConnect(generation, recoveryAlarmBaseline)
 	}
 	return nil
 }
@@ -417,8 +421,21 @@ func (c *Controller) Disconnect() error {
 	suppressed := c.connectedMachineIdentityLocked()
 	c.connectionTransition = connectionDisconnecting
 	writeDone := c.realtimeWriteDone
-	forceCloseActiveWrite := writeDone != nil && c.state.MachineReadiness == MachineReadinessRecoveryRequired
+	// A Stop write may be blocked in an operating-system call which ignores its
+	// context. A successful Close retires the captured old physical handle, so
+	// its exact reservation can then be released without allowing that old
+	// writer to affect a replacement generation.
+	forceCloseActiveWrite := writeDone != nil &&
+		(c.stopOperation != nil || c.state.MachineReadiness == MachineReadinessRecoveryRequired)
 	var cancelRun context.CancelFunc
+	stopErr := errors.New("program stop interrupted by controller disconnect")
+	if c.stopOperation != nil {
+		c.stopOperation.invalidated = true
+		c.stopOperation.verificationInvalidated = true
+		if c.stopOperation.verificationErr == nil {
+			c.stopOperation.verificationErr = stopErr
+		}
+	}
 	if c.run != nil {
 		run := c.run
 		c.run = nil
@@ -426,9 +443,9 @@ func (c *Controller) Disconnect() error {
 		err := errors.New("program interrupted by controller disconnect")
 		c.recordProgramFailureLocked(run, err)
 		c.requireMachineRecoveryLocked("program was disconnected before machine readiness was confirmed; reconnect and verify controller Idle")
-		if c.stopOperation != nil {
-			c.completeStopOperationLocked(c.stopOperation, err)
-		}
+	}
+	if c.stopOperation != nil {
+		c.completeStopOperationLocked(c.stopOperation, stopErr)
 	}
 	c.terminateResponseOwnerLocked(c.responseOwner, ErrTransportDisconnected)
 	c.suppressTransportDisconnectedGeneration = c.connectionGeneration
@@ -444,6 +461,7 @@ func (c *Controller) Disconnect() error {
 		c.mu.Lock()
 		c.suppressTransportDisconnectedGeneration = 0
 		c.connectionTransition = connectionStable
+		c.requireMachineRecoveryLocked("controller disconnect failed while stop transport work was unresolved: " + err.Error())
 		c.mu.Unlock()
 		c.emitError(err)
 		return err
@@ -867,6 +885,9 @@ func (c *Controller) Action(ctx context.Context, action grbl.Action) error {
 	}
 	if action == grbl.ActionSoftReset {
 		err = c.withForegroundAdmission(ctx, func() error {
+			if c.stopOperation != nil {
+				return ErrStopInProgress
+			}
 			request := admissionSafetyRealtime
 			if c.state.EStopStatus == EStopRecovery {
 				request = admissionRecoveryRealtime
@@ -892,6 +913,9 @@ func (c *Controller) Action(ctx context.Context, action grbl.Action) error {
 			return err
 		}
 		return nil
+	}
+	if action == grbl.ActionResume {
+		return c.writeMachineResume(ctx, msg)
 	}
 	request := admissionRealtime
 	if action == grbl.ActionStatus {
@@ -920,6 +944,34 @@ func (c *Controller) Hold(ctx context.Context) error {
 
 func (c *Controller) ResumeMotion(ctx context.Context) error {
 	return c.Action(ctx, grbl.ActionResume)
+}
+
+// writeMachineResume keeps the machine-wide realtime Resume separate from a
+// program-owned Resume. The decision is repeated while acquiring the actual
+// reservation so a stale UI request cannot resume a paused or replacement run.
+func (c *Controller) writeMachineResume(ctx context.Context, msg transport.Message) error {
+	err := c.withForegroundAdmission(ctx, func() error {
+		if err := c.admissionErrorLocked(admissionRealtime); err != nil {
+			return err
+		}
+		if c.stopOperation != nil {
+			return ErrStopInProgress
+		}
+		if c.run != nil || c.state.ProgramStatus.IsActive() {
+			return ErrProgramActive
+		}
+		return c.beginRealtimeWriteLocked()
+	})
+	if err != nil {
+		c.emitError(err)
+		return err
+	}
+	defer c.endRealtimeWrite()
+	if err := c.transport.Write(ctx, msg); err != nil {
+		c.emitError(err)
+		return err
+	}
+	return nil
 }
 
 func (c *Controller) RequestStatus(ctx context.Context) error {
@@ -1209,14 +1261,26 @@ func (c *Controller) ResumeProgram(ctx context.Context) error {
 		c.emitError(ErrPauseInProgress)
 		return ErrPauseInProgress
 	}
-	if run == nil || c.state.ProgramStatus != ProgramPaused {
+	if run == nil || c.state.ProgramStatus != ProgramPaused || c.stopOperation != nil ||
+		c.state.MachineReadiness != MachineReadinessNormal || c.state.EStopStatus != EStopClear {
+		var err error
+		switch {
+		case c.stopOperation != nil:
+			err = ErrStopInProgress
+		case c.state.MachineReadiness != MachineReadinessNormal:
+			err = c.admissionErrorLocked(admissionRealtime)
+		case c.state.EStopStatus != EStopClear:
+			err = c.admissionErrorLocked(admissionRealtime)
+		default:
+			err = errors.New("program is not paused")
+		}
 		c.mu.Unlock()
-		err := errors.New("program is not paused")
 		c.emitError(err)
 		return err
 	}
 	c.mu.Unlock()
-	if err := c.writeProgramAction(ctx, grbl.ActionResume); err != nil {
+	if err := c.writeProgramActionForRun(ctx, run, 0, grbl.ActionResume); err != nil {
+		c.emitError(err)
 		return err
 	}
 	c.mu.Lock()
@@ -1266,10 +1330,10 @@ func (c *Controller) endPauseTransitionLocked(run *programRun, transition pauseT
 	return true
 }
 
-// writeProgramActionForRun reserves realtime transport only if the Pause token
+// writeProgramActionForRun reserves realtime transport only if the action
 // still belongs to the same current run at actual write admission. A Stop or
-// termination that wins this lock therefore prevents a late Hold from being
-// sent against a replacement run.
+// termination that wins this lock therefore prevents a late Hold or Resume
+// from being sent against a replacement run.
 func (c *Controller) writeProgramActionForRun(ctx context.Context, run *programRun, transition pauseTransitionID, action grbl.Action) error {
 	msg, err := grbl.BuildAction(action)
 	if err != nil {
@@ -1279,9 +1343,18 @@ func (c *Controller) writeProgramActionForRun(ctx context.Context, run *programR
 		return err
 	}
 	c.mu.Lock()
-	if c.run != run || run.pauseTransition != transition ||
-		c.connectionGeneration != run.generation ||
-		(c.state.ProgramStatus != ProgramRunning && c.state.ProgramStatus != ProgramDraining) {
+	valid := c.run == run && c.connectionGeneration == run.generation &&
+		c.stopOperation == nil && c.state.MachineReadiness == MachineReadinessNormal && c.state.EStopStatus == EStopClear
+	switch action {
+	case grbl.ActionHold:
+		valid = valid && run.pauseTransition == transition &&
+			(c.state.ProgramStatus == ProgramRunning || c.state.ProgramStatus == ProgramDraining)
+	case grbl.ActionResume:
+		valid = valid && transition == 0 && run.pauseTransition == 0 && c.state.ProgramStatus == ProgramPaused
+	default:
+		valid = false
+	}
+	if !valid {
 		c.endForegroundAdmissionLocked()
 		c.mu.Unlock()
 		return ErrCommandSessionCanceled
@@ -1320,10 +1393,11 @@ func (c *Controller) StopProgram(ctx context.Context) error {
 		c.nextStopOperationID++
 	}
 	op := &programStopOperation{
-		id:         c.nextStopOperationID,
-		run:        run,
-		generation: run.generation,
-		done:       make(chan struct{}),
+		id:            c.nextStopOperationID,
+		run:           run,
+		generation:    run.generation,
+		alarmBaseline: c.alarmRevision,
+		done:          make(chan struct{}),
 	}
 	c.stopOperation = op
 	run.pauseTransition = 0
@@ -1840,6 +1914,11 @@ func (c *Controller) handleTransportDisconnected(generation transport.Connection
 	owner := c.responseOwner
 	c.terminateResponseOwnerLocked(owner, err)
 	if c.stopOperation != nil {
+		c.stopOperation.invalidated = true
+		c.stopOperation.verificationInvalidated = true
+		if c.stopOperation.verificationErr == nil {
+			c.stopOperation.verificationErr = err
+		}
 		c.completeStopOperationLocked(c.stopOperation, err)
 	}
 	changed := c.clearConnectionStateLocked()
@@ -1889,6 +1968,8 @@ func (c *Controller) clearConnectionStateLocked() bool {
 	c.statusReportChanged = make(chan struct{})
 	close(c.startupBannerChanged)
 	c.startupBannerChanged = make(chan struct{})
+	close(c.alarmChanged)
+	c.alarmChanged = make(chan struct{})
 	return changed
 }
 
@@ -2019,6 +2100,10 @@ func (c *Controller) runTransportEventBridge() {
 				continue
 			}
 			c.noteControllerActivityLocked(ev.Generation, ev.When)
+			alarmCode, standaloneAlarm := grbl.ParseAlarm(ev.Text)
+			if standaloneAlarm {
+				c.noteStopVerificationAlarmLocked(ev.Generation, fmt.Errorf("controller reported ALARM:%d during reset verification", alarmCode))
+			}
 			if _, ok := grbl.ParseStartupBanner(ev.Text); ok {
 				c.startupBannerRevision++
 				bannerAt := ev.When
@@ -2035,7 +2120,7 @@ func (c *Controller) runTransportEventBridge() {
 			suppressRXLog := false
 			statusReport := false
 			var eStopResult eStopTransitionResult
-			if alarmCode, ok := grbl.ParseAlarm(ev.Text); ok && alarmCode == 50 {
+			if standaloneAlarm && alarmCode == 50 {
 				eStopResult = c.enterEStopLocked(EStopSourceAlarm50, ev.Generation)
 			}
 			var recoveryChanged bool
@@ -2043,6 +2128,9 @@ func (c *Controller) runTransportEventBridge() {
 			var recoveryText string
 			if report, ok := grbl.ParseStatusReport(ev.Text); ok {
 				statusReport = true
+				if strings.EqualFold(strings.TrimSpace(report.State), "Alarm") {
+					c.noteStopVerificationAlarmLocked(ev.Generation, errors.New("controller reported Alarm status during reset verification"))
+				}
 				if c.pendingQuietStatusReports > 0 {
 					c.pendingQuietStatusReports--
 					suppressRXLog = true
