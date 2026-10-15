@@ -883,7 +883,7 @@ func TestControllerProgramLoadStartComplete(t *testing.T) {
 	}
 
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 3 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 	completeEv := waitForEventText(t, controller.Events(), EventStateChanged, "program demo.gcode completed")
 	completeRevision := requireStateRevision(t, completeEv)
 	if completeRevision <= progressRevision {
@@ -940,9 +940,7 @@ func TestControllerProgramSystemCommandRequiresFreshIdleOnBothSides(t *testing.T
 	fake.InjectRX("<Idle|MPos:0,0,0>")
 	waitForLineWrites(t, fake, "G1 X1", "$G", "M5")
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool {
-		return s.ProgramComplete == 3 && s.ProgramStatus == ProgramCompleted
-	})
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestControllerSystemCommandBarrierDoesNotLoseBackToBackRunIdle(t *testing.T) {
@@ -955,7 +953,7 @@ func TestControllerSystemCommandBarrierDoesNotLoseBackToBackRunIdle(t *testing.T
 	fake.InjectRX("ok")
 	waitForStatusWritesAfter(t, fake, statusWrites)
 	fake.InjectRX("<Idle|MPos:0,0,0>")
-	waitForState(t, controller, func(s State) bool { return s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestControllerFinalSystemCommandCompletesOnlyAfterPostIdle(t *testing.T) {
@@ -980,7 +978,7 @@ func TestControllerFinalSystemCommandCompletesOnlyAfterPostIdle(t *testing.T) {
 	events := collectEventsFor(controller.Events(), noExtraLifecycleEventWindow)
 	assertEventTextCount(t, events, "program barrier.gcode completed", 0)
 	fake.InjectRX("<Idle|MPos:0,0,0>")
-	waitForState(t, controller, func(s State) bool { return s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestControllerStopProgramCancelsSystemCommandPreBarrier(t *testing.T) {
@@ -1418,6 +1416,39 @@ func waitForLineWrites(t *testing.T, fake *transport.FakeTransport, want ...stri
 	t.Fatalf("line writes = %#v, want %#v", lineWrites(fake), want)
 }
 
+// completeProgramAfterFreshIdle finishes tests whose subject is not final
+// queue draining. It waits until the controller has entered ProgramDraining
+// and admitted the required post-program status request before supplying the
+// qualifying Idle report.
+func completeProgramAfterFreshIdle(t *testing.T, controller *Controller, fake *transport.FakeTransport) State {
+	t.Helper()
+	state := waitForState(t, controller, func(state State) bool {
+		return state.ProgramStatus == ProgramDraining || state.ProgramStatus == ProgramCompleted
+	})
+	if state.ProgramStatus == ProgramCompleted {
+		return state
+	}
+	waitForFinalDrainStatusRequest(t, controller)
+	fake.InjectRX("<Idle|MPos:0,0,0>")
+	return waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramCompleted })
+}
+
+func waitForFinalDrainStatusRequest(t *testing.T, controller *Controller) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		controller.mu.RLock()
+		pollOutstanding := controller.pendingQuietStatusReports > 0
+		completed := controller.state.ProgramStatus == ProgramCompleted
+		controller.mu.RUnlock()
+		if pollOutstanding || completed {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for final-drain status request")
+}
+
 func ensureLineWritesStayAt(t *testing.T, fake *transport.FakeTransport, want []string) {
 	t.Helper()
 	deadline := time.Now().Add(noExtraLifecycleEventWindow)
@@ -1612,7 +1643,7 @@ func TestControllerDefaultMacrosStoreNumericAndWriteWCS(t *testing.T) {
 		t.Fatalf("written line = %q, want %q", got, want)
 	}
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 2 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestControllerDefaultMacrosReadWCSAndWriteWCS(t *testing.T) {
@@ -1647,7 +1678,7 @@ func TestControllerDefaultMacrosReadWCSAndWriteWCS(t *testing.T) {
 		t.Fatalf("second written line = %q, want %q", got, want)
 	}
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 2 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestControllerDefaultM100WritesMidpointAndVerifies(t *testing.T) {
@@ -1689,7 +1720,7 @@ func TestControllerDefaultM100WritesMidpointAndVerifies(t *testing.T) {
 	}
 	fake.InjectRX("[G56:2.000,0.000,0.000]")
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 1 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 	for _, written := range fake.Written() {
 		if strings.HasPrefix(written.Display, "M100") {
 			t.Fatalf("raw M100 was sent: %#v", fake.Written())
@@ -1778,7 +1809,7 @@ func TestControllerDefaultM101PassAllowsNextLine(t *testing.T) {
 		t.Fatalf("second written line = %q, want %q", got, want)
 	}
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 2 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 	for _, written := range fake.Written() {
 		if strings.HasPrefix(written.Display, "M101") {
 			t.Fatalf("raw M101 was sent: %#v", fake.Written())
@@ -1845,7 +1876,7 @@ func TestControllerUnregisteredMCodePassesThrough(t *testing.T) {
 		t.Fatalf("written line = %q, want %q", got, want)
 	}
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 1 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestControllerRegisteredMacroInterceptsAndAdvances(t *testing.T) {
@@ -1877,12 +1908,12 @@ func TestControllerRegisteredMacroInterceptsAndAdvances(t *testing.T) {
 		t.Fatalf("StartProgram() error = %v", err)
 	}
 	_ = waitForEventText(t, controller.Events(), EventStateChanged, "started program registered-m.gcode")
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 1 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 	if !called {
 		t.Fatal("handler was not called")
 	}
-	if got := len(fake.Written()); got != 0 {
-		t.Fatalf("len(written) = %d, want 0", got)
+	if got := lineWrites(fake); len(got) != 0 {
+		t.Fatalf("line writes = %#v, want none", got)
 	}
 }
 
@@ -1957,7 +1988,7 @@ func TestControllerMacroHandlerCanSendControllerLines(t *testing.T) {
 		t.Fatalf("second write = %q, want %q", got, want)
 	}
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 1 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestControllerMacroQueryCollectsIntermediateResponses(t *testing.T) {
@@ -2025,7 +2056,7 @@ func TestControllerMacroQueryCollectsIntermediateResponses(t *testing.T) {
 		t.Fatalf("collected lines = %#v, want %#v", lines, want)
 	}
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 2 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestControllerMacroQueryFailsOnControllerError(t *testing.T) {
@@ -2130,7 +2161,7 @@ func TestControllerRunProbeCapturesLastProbePoint(t *testing.T) {
 	if got := waitForProbePoint(t, gotPoint); got != want {
 		t.Fatalf("probe point = %#v, want %#v", got, want)
 	}
-	waitForState(t, controller, func(s State) bool { return s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 	got, ok := controller.LastProbePoint()
 	if !ok || got != want {
 		t.Fatalf("LastProbePoint() = %#v, %v; want %#v, true", got, ok, want)
@@ -2211,7 +2242,7 @@ func TestControllerRunProbeFailurePreservesPreviousLastProbe(t *testing.T) {
 	if got := waitForProbePoint(t, gotPoint); got != want {
 		t.Fatalf("probe point = %#v, want %#v", got, want)
 	}
-	waitForState(t, controller, func(s State) bool { return s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 
 	path := writeProgramFile(t, "macro-probe-preserve-failure.gcode", "M92 G38.2 Z-5 F100\n")
 	if err := controller.LoadProgramFile(path); err != nil {
@@ -2283,7 +2314,7 @@ func TestControllerReadWCSOffsetsUsesQueryHelper(t *testing.T) {
 	if got, want := offsets[macro.WCS("G55")], (macro.Point{X: 4, Y: 5, Z: 6}); got != want {
 		t.Fatalf("G55 offsets = %+v, want %+v", got, want)
 	}
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 1 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestControllerNormalProgramSendIgnoresIntermediateRX(t *testing.T) {
@@ -2318,7 +2349,7 @@ func TestControllerNormalProgramSendIgnoresIntermediateRX(t *testing.T) {
 	}
 
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 1 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestControllerNormalLongRunningLineIgnoresNonTerminalRXBurst(t *testing.T) {
@@ -2354,7 +2385,7 @@ func TestControllerNormalLongRunningLineIgnoresNonTerminalRXBurst(t *testing.T) 
 	}
 
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 1 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestControllerSendLineCollectingResponsesRejectsConcurrentQuery(t *testing.T) {
@@ -2451,7 +2482,7 @@ func TestControllerMotionRewrite(t *testing.T) {
 		t.Fatalf("written line = %q, want %q", got, want)
 	}
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestControllerMotionRewriteErrorFailsProgram(t *testing.T) {
@@ -2535,7 +2566,7 @@ func TestControllerDefaultMacrosDoNotInterceptDottedMCode(t *testing.T) {
 		t.Fatalf("written line = %q, want %q", got, want)
 	}
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 1 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestControllerFinishProgramFailureCancelsActiveRun(t *testing.T) {
@@ -2678,7 +2709,7 @@ func TestControllerDefaultM102NumericExpressionWritesWithoutWCSQuery(t *testing.
 		t.Fatalf("written = %q, want %q", got, want)
 	}
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 1 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 	for _, w := range fake.Written() {
 		if strings.HasPrefix(w.Display, "M102") || w.Display == "$#" {
 			t.Fatalf("unexpected write: %#v", fake.Written())
@@ -2717,7 +2748,7 @@ func TestControllerDefaultM102WCSExpressionReadsOnceAndWrites(t *testing.T) {
 		t.Fatalf("second = %q, want %q", got, want)
 	}
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 1 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 	for _, written := range fake.Written() {
 		if strings.HasPrefix(written.Display, "M102") {
 			t.Fatalf("raw M102 was sent: %#v", fake.Written())
@@ -2788,7 +2819,7 @@ func TestControllerDefaultM106PassAllowsNextLine(t *testing.T) {
 		t.Fatalf("second = %q, want %q", got, want)
 	}
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 2 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 	for _, written := range fake.Written() {
 		if strings.HasPrefix(written.Display, "M106") {
 			t.Fatalf("raw M106 was sent: %#v", fake.Written())
@@ -2853,7 +2884,7 @@ func TestControllerDefaultM106NumericAssertionDoesNotReadWCS(t *testing.T) {
 		t.Fatalf("first = %q, want %q", got, want)
 	}
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramComplete == 2 && s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 	for _, written := range fake.Written() {
 		if strings.HasPrefix(written.Display, "M106") {
 			t.Fatalf("raw M106 was sent: %#v", fake.Written())
@@ -2894,7 +2925,7 @@ func TestControllerDefaultM109CollectsContourPoint(t *testing.T) {
 	}
 	fake.InjectRX("[PRB:1.000,2.000,-3.500:1]")
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 	want := macro.Point{X: 1, Y: 2, Z: -3.5}
 	if got, ok := controller.LastProbePoint(); !ok || got != want {
 		t.Fatalf("LastProbePoint() = %#v, %v; want %#v, true", got, ok, want)
@@ -3014,8 +3045,8 @@ func TestControllerDefaultM111DisablesContourMode(t *testing.T) {
 	if err := controller.StartProgram(context.Background()); err != nil {
 		t.Fatalf("StartProgram() error = %v", err)
 	}
-	waitForState(t, controller, func(s State) bool { return s.ProgramStatus == ProgramCompleted })
-	ensureWritesStayAt(t, fake, 0, 100*time.Millisecond)
+	completeProgramAfterFreshIdle(t, controller, fake)
+	ensureLineWritesStayAt(t, fake, nil)
 	if controller.Contour().Enabled() {
 		t.Fatal("Contour().Enabled() = true, want false")
 	}
@@ -3031,8 +3062,8 @@ func TestControllerDefaultM112ClearsContourState(t *testing.T) {
 	if err := controller.StartProgram(context.Background()); err != nil {
 		t.Fatalf("StartProgram() error = %v", err)
 	}
-	waitForState(t, controller, func(s State) bool { return s.ProgramStatus == ProgramCompleted })
-	ensureWritesStayAt(t, fake, 0, 100*time.Millisecond)
+	completeProgramAfterFreshIdle(t, controller, fake)
+	ensureLineWritesStayAt(t, fake, nil)
 	if controller.Contour().Enabled() {
 		t.Fatal("Contour().Enabled() = true, want false")
 	}
@@ -3500,7 +3531,7 @@ func TestControllerStartProgramRejectedWhileInteractiveMacroWaitingOK(t *testing
 	}
 	waitForWrites(t, fake, 2)
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(s State) bool { return s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestControllerStartProgramRejectedWhileInteractiveMacroQueryActive(t *testing.T) {

@@ -59,7 +59,7 @@ func TestRejectedDocumentStartsAreGeneralErrors(t *testing.T) {
 	}
 
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestCompletedRunUnrelatedErrorHasNoRunAssociation(t *testing.T) {
@@ -75,7 +75,7 @@ func TestCompletedRunUnrelatedErrorHasNoRunAssociation(t *testing.T) {
 	}
 	waitForLineWrites(t, fake, "M5")
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 	drainEvents(controller.Events())
 
 	if err := controller.SendConsoleLine(context.Background(), "G0 X1\nG0 X2"); !errors.Is(err, ErrInvalidControllerLine) {
@@ -155,9 +155,10 @@ func TestProgramFailureErrorAssociationSurvivesGeneralErrorAndNewRun(t *testing.
 	}
 	waitForLineWrites(t, fake, "G0 X1", "M5")
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(state State) bool {
-		return state.ProgramStatus == ProgramCompleted && state.ProgramRunID == secondRunID
-	})
+	completed := completeProgramAfterFreshIdle(t, controller, fake)
+	if completed.ProgramRunID != secondRunID {
+		t.Fatalf("completed RunID = %d, want %d", completed.ProgramRunID, secondRunID)
+	}
 }
 
 func TestProgramErrorAttributionOnTransportDisconnect(t *testing.T) {
@@ -246,7 +247,7 @@ func TestProgramErrorAttributionOnEmergencyStop(t *testing.T) {
 		}
 		waitForLineWrites(t, fake, "M5")
 		fake.InjectRX("ok")
-		waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramCompleted })
+		completeProgramAfterFreshIdle(t, controller, fake)
 		drainEvents(controller.Events())
 
 		fake.InjectRX("ALARM:50")

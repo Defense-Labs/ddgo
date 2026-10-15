@@ -97,6 +97,20 @@ func TestMainWindowControls(t *testing.T) {
 			},
 		},
 		{
+			name: "draining program",
+			state: app.State{
+				ConnectionStatus: app.ConnectionConnected,
+				EStopStatus:      app.EStopClear,
+				ProgramStatus:    app.ProgramDraining,
+				ProgramTotal:     10,
+				ProgramComplete:  10,
+			},
+			want: MainWindowControlState{
+				PauseProgramEnabled: true,
+				StopProgramEnabled:  true,
+			},
+		},
+		{
 			name: "E-stop active",
 			state: app.State{
 				ConnectionStatus: app.ConnectionConnected,

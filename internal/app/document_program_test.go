@@ -70,7 +70,7 @@ func TestStartDocumentProgramUsesAtomicSnapshotAndRetainsIdentity(t *testing.T) 
 	}
 
 	fake.InjectRX("ok")
-	completed := waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramCompleted })
+	completed := completeProgramAfterFreshIdle(t, controller, fake)
 	if completed.ProgramDocumentID != documentID || completed.ProgramRunID != runID || completed.ProgramComplete != 2 {
 		t.Fatalf("completion state = %+v", completed)
 	}
@@ -91,6 +91,7 @@ func TestDocumentProgramRunIDsAreUniqueAndRevisionsDistinguishRuns(t *testing.T)
 	firstStart := waitForEventText(t, controller.Events(), EventStateChanged, "started program repeat.gcode")
 	waitForLineWrites(t, fake, "M5")
 	fake.InjectRX("ok")
+	completeProgramAfterFreshIdle(t, controller, fake)
 	firstComplete := waitForEventText(t, controller.Events(), EventStateChanged, "program repeat.gcode completed")
 
 	secondID, err := controller.StartDocumentProgram(context.Background(), 7, program)
@@ -110,9 +111,10 @@ func TestDocumentProgramRunIDsAreUniqueAndRevisionsDistinguishRuns(t *testing.T)
 
 	waitForLineWrites(t, fake, "M5", "M5")
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(state State) bool {
-		return state.ProgramStatus == ProgramCompleted && state.ProgramRunID == secondID
-	})
+	completed := completeProgramAfterFreshIdle(t, controller, fake)
+	if completed.ProgramRunID != secondID {
+		t.Fatalf("completed RunID = %d, want %d", completed.ProgramRunID, secondID)
+	}
 }
 
 func TestConcurrentDocumentStartsAdmitOnlyOneRun(t *testing.T) {
@@ -177,7 +179,7 @@ func TestConcurrentDocumentStartsAdmitOnlyOneRun(t *testing.T) {
 	}
 	waitForLineWrites(t, fake, wantLine)
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestInvalidDocumentProgramsCannotAcquireRunOwnership(t *testing.T) {
@@ -213,7 +215,7 @@ func TestInvalidDocumentProgramsCannotAcquireRunOwnership(t *testing.T) {
 	}
 	waitForLineWrites(t, fake, "M5")
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }
 
 func TestDocumentRunIdentitySurvivesPauseResumeFailureAndStop(t *testing.T) {
@@ -314,7 +316,7 @@ func TestLegacyProgramRunsReceiveIdentityAndLoadCommitRevalidates(t *testing.T) 
 
 	waitForLineWrites(t, fake, "G0 X1")
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 	if err := controller.LoadProgramFile(writeProgramFile(t, "replacement.gcode", "M5\n")); err != nil {
 		t.Fatalf("replacement LoadProgramFile() error = %v", err)
 	}
@@ -331,5 +333,5 @@ func TestLegacyProgramRunsReceiveIdentityAndLoadCommitRevalidates(t *testing.T) 
 	}
 	waitForLineWrites(t, fake, "G0 X1", "M5")
 	fake.InjectRX("ok")
-	waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, controller, fake)
 }

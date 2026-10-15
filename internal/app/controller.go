@@ -97,14 +97,17 @@ const (
 )
 
 type programRun struct {
-	program    gcode.Program
-	documentID DocumentID
-	runID      RunID
-	session    *responseSession
-	rxCh       chan string
-	queryRxCh  chan string
-	cancel     context.CancelFunc
-	generation transport.ConnectionGeneration
+	program        gcode.Program
+	documentID     DocumentID
+	runID          RunID
+	session        *responseSession
+	rxCh           chan string
+	queryRxCh      chan string
+	cancel         context.CancelFunc
+	generation     transport.ConnectionGeneration
+	draining       bool
+	pausePending   bool
+	drainSyncEpoch uint64
 }
 
 type Controller struct {
@@ -1096,21 +1099,31 @@ func (c *Controller) startProgram(ctx context.Context, documentID DocumentID, su
 func (c *Controller) PauseProgram(ctx context.Context) error {
 	c.mu.Lock()
 	run := c.run
-	if run == nil || c.state.ProgramStatus != ProgramRunning {
+	if run == nil || (c.state.ProgramStatus != ProgramRunning && c.state.ProgramStatus != ProgramDraining) {
 		c.mu.Unlock()
 		err := errors.New("program is not running")
 		c.emitError(err)
 		return err
 	}
+	run.pausePending = true
+	if run.draining {
+		run.drainSyncEpoch++
+	}
 	c.mu.Unlock()
 	if err := c.writeProgramAction(ctx, grbl.ActionHold); err != nil {
+		c.mu.Lock()
+		if c.run == run {
+			run.pausePending = false
+		}
+		c.mu.Unlock()
 		return err
 	}
 	c.mu.Lock()
-	if c.run != run || c.state.ProgramStatus != ProgramRunning {
+	if c.run != run || (c.state.ProgramStatus != ProgramRunning && c.state.ProgramStatus != ProgramDraining) {
 		c.mu.Unlock()
 		return nil
 	}
+	run.pausePending = false
 	c.state.ProgramStatus = ProgramPaused
 	snapshot := c.captureEventStateLocked()
 	c.mu.Unlock()
@@ -1136,7 +1149,11 @@ func (c *Controller) ResumeProgram(ctx context.Context) error {
 		c.mu.Unlock()
 		return nil
 	}
-	c.state.ProgramStatus = ProgramRunning
+	if run.draining {
+		c.state.ProgramStatus = ProgramDraining
+	} else {
+		c.state.ProgramStatus = ProgramRunning
+	}
 	snapshot := c.captureEventStateLocked()
 	c.mu.Unlock()
 	c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: snapshot.state, StateRevision: snapshot.revision, Text: "program resumed"}
@@ -1183,6 +1200,7 @@ func (c *Controller) StopProgram(ctx context.Context) error {
 func (c *Controller) runProgram(ctx context.Context, run *programRun) {
 	for idx, line := range run.program.Lines {
 		if err := c.waitUntilRunnable(ctx, run); err != nil {
+			c.finishProgramFailure(run, err)
 			return
 		}
 
@@ -1218,7 +1236,38 @@ func (c *Controller) runProgram(ctx context.Context, run *programRun) {
 		}
 		c.updateProgramProgress(run, idx+1)
 	}
-	c.finishProgramSuccess(run)
+	if !c.beginProgramDraining(run) {
+		return
+	}
+	runtime := c.runtimeForProgramRun(run)
+	for {
+		if err := c.waitUntilRunnable(ctx, run); err != nil {
+			c.finishProgramFailure(run, err)
+			return
+		}
+		c.mu.RLock()
+		drainSyncEpoch := run.drainSyncEpoch
+		c.mu.RUnlock()
+		if err := runtime.waitForFreshIdle(ctx); err != nil {
+			c.finishProgramFailure(run, err)
+			return
+		}
+		c.mu.RLock()
+		needsFreshSync := c.run == run && run.drainSyncEpoch != drainSyncEpoch
+		c.mu.RUnlock()
+		if needsFreshSync {
+			continue
+		}
+		if c.finishProgramSuccess(run) {
+			return
+		}
+		c.mu.RLock()
+		stillCurrent := c.run == run
+		c.mu.RUnlock()
+		if !stillCurrent {
+			return
+		}
+	}
 }
 
 func (c *Controller) SendLineAndWaitOK(ctx context.Context, line string) error {
@@ -1450,11 +1499,12 @@ func (c *Controller) waitUntilRunnable(ctx context.Context, run *programRun) err
 		c.mu.RLock()
 		stillCurrent := c.run == run
 		status := c.state.ProgramStatus
+		pausePending := run.pausePending
 		c.mu.RUnlock()
 		if !stillCurrent {
 			return context.Canceled
 		}
-		if status != ProgramPaused {
+		if status != ProgramPaused && !pausePending {
 			return nil
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -1473,11 +1523,27 @@ func (c *Controller) updateProgramProgress(run *programRun, complete int) {
 	c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: snapshot.state, StateRevision: snapshot.revision}
 }
 
-func (c *Controller) finishProgramSuccess(run *programRun) {
+func (c *Controller) beginProgramDraining(run *programRun) bool {
 	c.mu.Lock()
 	if c.run != run {
 		c.mu.Unlock()
-		return
+		return false
+	}
+	run.draining = true
+	if c.state.ProgramStatus != ProgramPaused {
+		c.state.ProgramStatus = ProgramDraining
+	}
+	snapshot := c.captureEventStateLocked()
+	c.mu.Unlock()
+	c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: snapshot.state, StateRevision: snapshot.revision, Text: fmt.Sprintf("program %s waiting for machine Idle", run.program.Name)}
+	return true
+}
+
+func (c *Controller) finishProgramSuccess(run *programRun) bool {
+	c.mu.Lock()
+	if c.run != run || !run.draining || run.pausePending || c.state.ProgramStatus != ProgramDraining {
+		c.mu.Unlock()
+		return false
 	}
 	c.run = nil
 	c.releaseResponseOwnerLocked(responseOwnerProgram, run.responseSession())
@@ -1487,6 +1553,7 @@ func (c *Controller) finishProgramSuccess(run *programRun) {
 	snapshot := c.captureEventStateLocked()
 	c.mu.Unlock()
 	c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: snapshot.state, StateRevision: snapshot.revision, Text: fmt.Sprintf("program %s completed", run.program.Name)}
+	return true
 }
 
 func (c *Controller) finishProgramFailure(run *programRun, err error) {

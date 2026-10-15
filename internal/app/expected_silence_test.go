@@ -662,7 +662,7 @@ func TestExpectedSilenceProgramCompletionAndCancellation(t *testing.T) {
 			t.Fatalf("program lease at transport write = %d, want %d", got, lease.id)
 		}
 		fake.InjectRX("ok")
-		waitForState(t, c, func(state State) bool { return state.ProgramStatus == ProgramCompleted })
+		completeProgramAfterFreshIdle(t, c, fake)
 		if lease := expectedSilenceSnapshot(c); lease.id != 0 {
 			t.Fatalf("program completion left lease active: %+v", lease)
 		}
@@ -751,7 +751,7 @@ func TestExpectedSilenceSystemTerminalEndsLeaseBeforeFreshIdleBarrier(t *testing
 		t.Fatalf("terminal ok left lease active during Idle barrier: %+v", lease)
 	}
 	fake.InjectRX("<Idle|MPos:0,0,0>")
-	waitForState(t, c, func(state State) bool { return state.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, c, fake)
 }
 
 func TestExpectedSilenceGenerationIsolation(t *testing.T) {

@@ -38,7 +38,7 @@ func MainWindowControls(state app.State) MainWindowControlState {
 		ProgramPathEnabled:   !programActive,
 		BrowseProgramEnabled: !programActive,
 		RunProgramEnabled:    canRun,
-		PauseProgramEnabled:  state.ProgramStatus == app.ProgramRunning,
+		PauseProgramEnabled:  state.ProgramStatus == app.ProgramRunning || state.ProgramStatus == app.ProgramDraining,
 		ResumeProgramEnabled: state.ProgramStatus == app.ProgramPaused,
 		StopProgramEnabled:   programActive,
 

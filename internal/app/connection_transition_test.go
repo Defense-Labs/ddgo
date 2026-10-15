@@ -359,6 +359,21 @@ func TestConnectAdmissionBlocksCommandsAndConcurrentConnect(t *testing.T) {
 		t.Fatalf("StartProgram() after Connect error = %v", err)
 	}
 	tr.events <- transport.Event{Kind: transport.EventRX, Generation: 1, When: time.Now(), Text: "ok"}
+	waitForState(t, c, func(state State) bool { return state.ProgramStatus == ProgramDraining })
+	deadline := time.Now().Add(time.Second)
+	for {
+		c.mu.RLock()
+		pollOutstanding := c.pendingQuietStatusReports > 0
+		c.mu.RUnlock()
+		if pollOutstanding {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for final-drain status request")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	tr.events <- transport.Event{Kind: transport.EventRX, Generation: 1, When: time.Now(), Text: "<Idle|MPos:0,0,0>"}
 	waitForState(t, c, func(state State) bool { return state.ProgramStatus == ProgramCompleted })
 	if err := c.Connect(context.Background(), transport.DefaultPortConfig("again")); !errors.Is(err, ErrAlreadyConnected) {
 		t.Fatalf("second stable Connect() error = %v, want ErrAlreadyConnected", err)

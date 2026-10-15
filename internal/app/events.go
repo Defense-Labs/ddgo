@@ -60,6 +60,7 @@ const (
 	ProgramNotLoaded ProgramStatus = "not_loaded"
 	ProgramLoaded    ProgramStatus = "loaded"
 	ProgramRunning   ProgramStatus = "running"
+	ProgramDraining  ProgramStatus = "draining"
 	ProgramPaused    ProgramStatus = "paused"
 	ProgramStopped   ProgramStatus = "stopped"
 	ProgramCompleted ProgramStatus = "completed"
@@ -68,7 +69,7 @@ const (
 
 func (s ProgramStatus) IsActive() bool {
 	switch s {
-	case ProgramRunning, ProgramPaused:
+	case ProgramRunning, ProgramDraining, ProgramPaused:
 		return true
 	default:
 		return false

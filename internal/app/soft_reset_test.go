@@ -128,7 +128,7 @@ func TestControllerSoftResetRejectedForProgramOwner(t *testing.T) {
 		t.Fatal("program owner changed")
 	}
 	fake.InjectRX("ok")
-	waitForState(t, c, func(s State) bool { return s.ProgramStatus == ProgramCompleted })
+	completeProgramAfterFreshIdle(t, c, fake)
 }
 
 func TestControllerSoftResetWriteFailureLeavesInteractiveCanceled(t *testing.T) {
