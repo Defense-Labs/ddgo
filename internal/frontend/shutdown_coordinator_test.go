@@ -98,9 +98,18 @@ func TestShutdownCoordinatorObservesExistingExactStopOnly(t *testing.T) {
 	coordinator, attempt := beginShutdown(t, []app.DocumentID{3}, target)
 	coordinator.ConfirmApplication(attempt, true)
 	coordinator.ConfirmStop(attempt, true)
+	coordinator.StopAlreadyInProgress(attempt, target)
 	if coordinator.ObserveExternalStop(app.State{ProgramDocumentID: 1, ProgramRunID: 11, ProgramStatus: app.ProgramStopped, MachineReadiness: app.MachineReadinessNormal}) {
 		t.Fatal("replacement document run completed legacy shutdown")
 	}
+	if coordinator.Phase() != ShutdownIdle {
+		t.Fatalf("replacement run left shutdown waiting: %v", coordinator.Phase())
+	}
+
+	coordinator, attempt = beginShutdown(t, []app.DocumentID{3}, target)
+	coordinator.ConfirmApplication(attempt, true)
+	coordinator.ConfirmStop(attempt, true)
+	coordinator.StopAlreadyInProgress(attempt, target)
 	if !coordinator.ObserveExternalStop(app.State{ProgramDocumentID: 0, ProgramRunID: 11, ProgramStatus: app.ProgramStopped, MachineReadiness: app.MachineReadinessNormal}) {
 		t.Fatal("matching external stop was not observed")
 	}
@@ -113,5 +122,110 @@ func TestShutdownCoordinatorRejectedDocumentCloseCancelsAttempt(t *testing.T) {
 		t.Fatal("missing document to close")
 	} else if !coordinator.DocumentCloseRejected(attempt, id) || coordinator.Phase() != ShutdownIdle {
 		t.Fatalf("rejected close phase = %v", coordinator.Phase())
+	}
+}
+
+func TestShutdownCoordinatorAuthorizesOnlySelectedDocument(t *testing.T) {
+	coordinator, attempt := beginShutdown(t, []app.DocumentID{1, 2, 3}, ShutdownStopTarget{})
+	coordinator.ConfirmApplication(attempt, true)
+	first, ok := coordinator.NextDocumentToClose(attempt)
+	if !ok {
+		t.Fatal("missing first selected document")
+	}
+	if !coordinator.AllowsDocumentClose(attempt, first) {
+		t.Fatalf("selected document %d was not authorized", first)
+	}
+	for _, id := range []app.DocumentID{1, 2, 3} {
+		if id != first && coordinator.AllowsDocumentClose(attempt, id) {
+			t.Fatalf("unselected document %d was authorized while %d was selected", id, first)
+		}
+	}
+	if _, ok := coordinator.NextDocumentToClose(attempt); ok {
+		t.Fatal("second document was selected while first closure remained outstanding")
+	}
+	for _, id := range []app.DocumentID{1, 2, 3} {
+		if id != first && coordinator.DocumentClosed(attempt, id) {
+			t.Fatalf("unselected document %d was accepted as a shutdown close", id)
+		}
+	}
+	if coordinator.DocumentClosed(attempt, 99) || !coordinator.DocumentClosed(attempt, first) {
+		t.Fatal("selected document closure was not recorded exactly")
+	}
+	second, ok := coordinator.NextDocumentToClose(attempt)
+	if !ok || second == first || !coordinator.AllowsDocumentClose(attempt, second) {
+		t.Fatalf("next selection = %d, %v after closing %d", second, ok, first)
+	}
+}
+
+func TestShutdownCoordinatorStaleCloseAuthorizationCannotCrossAttempts(t *testing.T) {
+	coordinator, first := beginShutdown(t, []app.DocumentID{7}, ShutdownStopTarget{})
+	coordinator.ConfirmApplication(first, true)
+	id, ok := coordinator.NextDocumentToClose(first)
+	if !ok || !coordinator.AllowsDocumentClose(first, id) {
+		t.Fatal("first attempt did not select its document")
+	}
+	if !coordinator.Cancel(first) {
+		t.Fatal("first attempt was not cancelled")
+	}
+	second, ok := coordinator.Begin([]app.DocumentID{7}, ShutdownStopTarget{})
+	if !ok {
+		t.Fatal("second attempt was not created")
+	}
+	coordinator.ConfirmApplication(second, true)
+	if coordinator.AllowsDocumentClose(first, id) {
+		t.Fatal("old attempt authorization survived cancellation")
+	}
+	if next, ok := coordinator.NextDocumentToClose(second); !ok || next != id || !coordinator.AllowsDocumentClose(second, id) {
+		t.Fatalf("second attempt selection = %d, %v", next, ok)
+	}
+}
+
+func TestShutdownCoordinatorRejectedSelectedCloseStopsFurtherProgress(t *testing.T) {
+	coordinator, attempt := beginShutdown(t, []app.DocumentID{1, 2}, ShutdownStopTarget{})
+	coordinator.ConfirmApplication(attempt, true)
+	id, ok := coordinator.NextDocumentToClose(attempt)
+	if !ok || !coordinator.DocumentCloseRejected(attempt, id) {
+		t.Fatal("selected close rejection was not accepted")
+	}
+	if coordinator.Phase() != ShutdownIdle {
+		t.Fatalf("rejected close phase = %v", coordinator.Phase())
+	}
+	if _, ok := coordinator.NextDocumentToClose(attempt); ok || coordinator.AllowsDocumentClose(attempt, 1) || coordinator.DocumentClosed(attempt, 2) {
+		t.Fatal("cancelled shutdown accepted later document work")
+	}
+}
+
+func TestShutdownCoordinatorRejectsSelectedCloseWhenExecutionChanges(t *testing.T) {
+	coordinator, attempt := beginShutdown(t, []app.DocumentID{6}, ShutdownStopTarget{})
+	coordinator.ConfirmApplication(attempt, true)
+	id, ok := coordinator.NextDocumentToClose(attempt)
+	if !ok {
+		t.Fatal("missing selected document")
+	}
+	state := app.State{
+		ProgramDocumentID: id,
+		ProgramRunID:      44,
+		ProgramStatus:     app.ProgramRunning,
+		MachineReadiness:  app.MachineReadinessNormal,
+	}
+	if coordinator.CanCloseSelectedDocument(attempt, id, state) {
+		t.Fatal("selected document was closeable after a new active execution")
+	}
+	if !coordinator.DocumentCloseRejected(attempt, id) || coordinator.Phase() != ShutdownIdle {
+		t.Fatalf("execution change did not cancel shutdown: %v", coordinator.Phase())
+	}
+}
+
+func TestShutdownCoordinatorExternalStopTerminalFailureCancels(t *testing.T) {
+	target := ShutdownStopTarget{DocumentID: 4, RunID: 10}
+	coordinator, attempt := beginShutdown(t, []app.DocumentID{4}, target)
+	coordinator.ConfirmApplication(attempt, true)
+	coordinator.ConfirmStop(attempt, true)
+	coordinator.StopAlreadyInProgress(attempt, target)
+	if coordinator.ObserveExternalStop(app.State{ProgramDocumentID: 4, ProgramRunID: 10, ProgramStatus: app.ProgramFailed, MachineReadiness: app.MachineReadinessNormal}) {
+		t.Fatal("failed stop was reported as successful")
+	}
+	if coordinator.Phase() != ShutdownIdle {
+		t.Fatalf("failed external stop phase = %v", coordinator.Phase())
 	}
 }

@@ -39,7 +39,11 @@ type ShutdownCoordinator struct {
 	stopTarget  ShutdownStopTarget
 	stopOwned   bool
 	documents   map[app.DocumentID]bool // false until native closure is observed
-	finalIssued bool
+	// selectedDocument is the one native document closure currently authorized
+	// by this attempt. A close callback for any other document must still take
+	// the ordinary independent-close path.
+	selectedDocument app.DocumentID
+	finalIssued      bool
 }
 
 func (c *ShutdownCoordinator) Phase() ShutdownPhase       { return c.phase }
@@ -133,7 +137,17 @@ func (c *ShutdownCoordinator) StopAlreadyInProgress(attempt ShutdownAttemptID, t
 // ObserveExternalStop handles the controller's pre-existing Stop coordinator.
 // It never claims ownership, but can finish an already-current exact run.
 func (c *ShutdownCoordinator) ObserveExternalStop(state app.State) bool {
-	if c.phase != ShutdownWaitingForStop || !c.stopTarget.matches(state) {
+	if c.phase != ShutdownWaitingForStop {
+		return false
+	}
+	if !c.stopTarget.matches(state) {
+		// A later execution must never inherit this attempt's Stop or document
+		// close authority. A zero RunID means the original terminal result is no
+		// longer represented by current state, so successful Stop cannot be
+		// established either.
+		if state.ProgramRunID == 0 || state.ProgramRunID != c.stopTarget.RunID || state.ProgramDocumentID != c.stopTarget.DocumentID {
+			c.cancelCurrent()
+		}
 		return false
 	}
 	if state.ProgramStatus == app.ProgramStopped && state.MachineReadiness == app.MachineReadinessNormal {
@@ -141,7 +155,8 @@ func (c *ShutdownCoordinator) ObserveExternalStop(state app.State) bool {
 		c.phase = ShutdownClosingDocuments
 		return true
 	}
-	if state.ProgramStatus == app.ProgramFailed || state.MachineReadiness == app.MachineReadinessRecoveryRequired {
+	if state.ProgramStatus == app.ProgramFailed || state.ProgramStatus == app.ProgramCompleted ||
+		state.MachineReadiness == app.MachineReadinessRecoveryRequired {
 		c.cancelCurrent()
 	}
 	return false
@@ -153,8 +168,14 @@ func (c *ShutdownCoordinator) NextDocumentToClose(attempt ShutdownAttemptID) (ap
 	if !c.current(attempt) || c.phase != ShutdownClosingDocuments {
 		return 0, false
 	}
+	if c.selectedDocument != 0 {
+		// Its native Close was already requested. Do not issue another request
+		// or advance to a second document until acceptance/rejection is known.
+		return 0, false
+	}
 	for id, closed := range c.documents {
 		if !closed {
+			c.selectedDocument = id
 			return id, true
 		}
 	}
@@ -168,10 +189,11 @@ func (c *ShutdownCoordinator) DocumentClosed(attempt ShutdownAttemptID, id app.D
 	if !c.current(attempt) || c.phase != ShutdownClosingDocuments {
 		return false
 	}
-	if _, ok := c.documents[id]; !ok {
+	if _, ok := c.documents[id]; !ok || c.selectedDocument != id {
 		return false
 	}
 	c.documents[id] = true
+	c.selectedDocument = 0
 	return true
 }
 
@@ -181,7 +203,7 @@ func (c *ShutdownCoordinator) DocumentCloseRejected(attempt ShutdownAttemptID, i
 	if !c.current(attempt) || c.phase != ShutdownClosingDocuments {
 		return false
 	}
-	if _, ok := c.documents[id]; !ok {
+	if _, ok := c.documents[id]; !ok || c.selectedDocument != id {
 		return false
 	}
 	c.cancelCurrent()
@@ -195,7 +217,16 @@ func (c *ShutdownCoordinator) AllowsDocumentClose(attempt ShutdownAttemptID, id 
 		return false
 	}
 	closed, ok := c.documents[id]
-	return ok && !closed
+	return ok && !closed && c.selectedDocument == id
+}
+
+// CanCloseSelectedDocument combines exact shutdown authorization with the
+// controller-state revalidation required immediately before native closure.
+// It intentionally does not mutate the attempt: the UI decides whether to
+// report a rejection and cancel through DocumentCloseRejected.
+func (c *ShutdownCoordinator) CanCloseSelectedDocument(attempt ShutdownAttemptID, id app.DocumentID, state app.State) bool {
+	return c.AllowsDocumentClose(attempt, id) && !state.ProgramStatus.IsActive() &&
+		state.MachineReadiness == app.MachineReadinessNormal
 }
 
 // CommitMainClose is the exact-once final-close commitment. It must be called
@@ -230,4 +261,5 @@ func (c *ShutdownCoordinator) cancelCurrent() {
 	c.stopTarget = ShutdownStopTarget{}
 	c.stopOwned = false
 	c.documents = nil
+	c.selectedDocument = 0
 }

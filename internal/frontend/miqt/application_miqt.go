@@ -122,11 +122,31 @@ func (a *Application) drainControllerEvents() {
 // shutdown is the sole closer while its coordinator is active, preventing a
 // second document Stop request or an accidental partial shutdown.
 func (a *Application) requestDocumentClose(id app.DocumentID) bool {
-	if a.approvedDocumentCloses[id] {
+	if a.shutdown.Active() {
+		attempt := a.shutdown.Attempt()
+		state := a.controller.Snapshot()
+		if !a.shutdown.AllowsDocumentClose(attempt, id) {
+			return false
+		}
+		// Selection is necessary but not sufficient: controller execution may
+		// have changed after shutdown preflight. Never translate an older close
+		// request into an unscoped Stop of a newly admitted run.
+		if !a.shutdown.CanCloseSelectedDocument(attempt, id, state) {
+			a.shutdown.DocumentCloseRejected(attempt, id)
+			a.warnMain("Shutdown Cancelled", "Controller execution or machine recovery became active before the document could close.")
+			return false
+		}
 		return true
 	}
-	if a.shutdown.Active() {
-		return a.shutdown.AllowsDocumentClose(a.shutdown.Attempt(), id)
+	if a.approvedDocumentCloses[id] {
+		state := a.controller.Snapshot()
+		if state.ProgramStatus.IsActive() && state.ProgramDocumentID == id {
+			// A new run for this document supersedes an earlier Stop-and-Close
+			// approval and requires a fresh explicit close request.
+			delete(a.approvedDocumentCloses, id)
+			return false
+		}
+		return true
 	}
 	entry, ok := a.documents.Entry(id)
 	if !ok {
@@ -274,6 +294,10 @@ func (a *Application) progressShutdown() {
 	state := a.controller.Snapshot()
 	if a.shutdown.Phase() == frontend.ShutdownWaitingForStop {
 		if a.shutdown.ObserveExternalStop(state) {
+			return
+		}
+		if !a.shutdown.Active() {
+			a.warnMain("Shutdown Cancelled", "The execution changed or did not reach a verified stopped state. DDGo remains open.")
 			return
 		}
 		if state.ProgramStatus == app.ProgramFailed || state.MachineReadiness == app.MachineReadinessRecoveryRequired {
