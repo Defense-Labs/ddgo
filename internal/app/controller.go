@@ -980,6 +980,7 @@ func (c *Controller) commitLoadedProgram(prog gcode.Program) (versionedState, er
 	c.state.ProgramName = prog.Name
 	c.state.ProgramDocumentID = 0
 	c.state.ProgramRunID = 0
+	c.state.ProgramError = ""
 	c.state.ProgramStatus = ProgramLoaded
 	c.state.ProgramTotal = len(prog.Lines)
 	c.state.ProgramComplete = 0
@@ -1073,6 +1074,7 @@ func (c *Controller) startProgram(ctx context.Context, documentID DocumentID, su
 		c.state.ProgramName = run.program.Name
 		c.state.ProgramDocumentID = run.documentID
 		c.state.ProgramRunID = run.runID
+		c.state.ProgramError = ""
 		c.state.ProgramStatus = ProgramRunning
 		c.state.ProgramTotal = len(run.program.Lines)
 		c.state.ProgramComplete = 0
@@ -1480,6 +1482,7 @@ func (c *Controller) finishProgramSuccess(run *programRun) {
 	c.run = nil
 	c.releaseResponseOwnerLocked(responseOwnerProgram, run.responseSession())
 	c.state.ProgramStatus = ProgramCompleted
+	c.state.ProgramError = ""
 	c.state.ProgramComplete = c.state.ProgramTotal
 	snapshot := c.captureEventStateLocked()
 	c.mu.Unlock()
@@ -1498,8 +1501,7 @@ func (c *Controller) finishProgramFailure(run *programRun, err error) {
 	}
 	c.run = nil
 	c.releaseResponseOwnerLocked(responseOwnerProgram, run.responseSession())
-	c.state.ProgramStatus = ProgramFailed
-	c.state.LastError = err.Error()
+	c.recordProgramFailureLocked(run, err)
 	c.contour.Disable()
 	cancel = run.cancel
 	snapshot := c.captureEventStateLocked()
@@ -1508,7 +1510,33 @@ func (c *Controller) finishProgramFailure(run *programRun, err error) {
 		cancel()
 	}
 	c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: snapshot.state, StateRevision: snapshot.revision, Text: "program failed"}
-	c.events <- Event{Kind: EventError, When: time.Now(), Err: err, Text: err.Error(), State: snapshot.state, StateRevision: snapshot.revision}
+	c.events <- programErrorEvent(err, snapshot, run)
+}
+
+// recordProgramFailureLocked updates the execution identified by run. Callers
+// must first prove that run is the current operation while holding c.mu.
+func (c *Controller) recordProgramFailureLocked(run *programRun, err error) {
+	c.state.ProgramDocumentID = run.documentID
+	c.state.ProgramRunID = run.runID
+	c.state.ProgramStatus = ProgramFailed
+	c.state.ProgramError = err.Error()
+	c.state.LastError = err.Error()
+}
+
+func programErrorEvent(err error, snapshot versionedState, run *programRun) Event {
+	event := Event{
+		Kind:          EventError,
+		When:          time.Now(),
+		Err:           err,
+		Text:          err.Error(),
+		State:         snapshot.state,
+		StateRevision: snapshot.revision,
+	}
+	if run != nil && run.runID != 0 {
+		event.ErrorDocumentID = run.documentID
+		event.ErrorRunID = run.runID
+	}
+	return event
 }
 
 func (c *Controller) handleTransportDisconnected(generation transport.ConnectionGeneration) {
@@ -1530,8 +1558,7 @@ func (c *Controller) handleTransportDisconnected(generation transport.Connection
 	run := c.run
 	if run != nil {
 		c.run = nil
-		c.state.ProgramStatus = ProgramFailed
-		c.state.LastError = err.Error()
+		c.recordProgramFailureLocked(run, err)
 		c.contour.Disable()
 		cancel = run.cancel
 	} else {
@@ -1555,7 +1582,7 @@ func (c *Controller) handleTransportDisconnected(generation transport.Connection
 		c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: snapshot.state, StateRevision: snapshot.revision, Text: err.Error()}
 	}
 	if emitError {
-		c.events <- Event{Kind: EventError, When: time.Now(), Err: err, Text: err.Error(), State: snapshot.state, StateRevision: snapshot.revision}
+		c.events <- programErrorEvent(err, snapshot, run)
 	}
 }
 
@@ -1764,9 +1791,10 @@ func (c *Controller) runTransportEventBridge() {
 				c.statusReportChanged = make(chan struct{})
 				recoveryChanged, recoverySnapshot, recoveryText = c.noteStatusResponseLocked(ev.Generation, report.State)
 			}
-			var overflowRun *programRun
+			var failedRun *programRun
+			var runFailure error
 			if !statusReport && !eStopResult.entered {
-				overflowRun = c.deliverResponseLocked(ev.Generation, ev.Text)
+				failedRun, runFailure = c.deliverResponseLocked(ev.Generation, ev.Text)
 			}
 			var snapshot versionedState
 			if !suppressRXLog {
@@ -1780,8 +1808,8 @@ func (c *Controller) runTransportEventBridge() {
 			}
 			c.mu.Unlock()
 			c.finishEStopTransition(eStopResult)
-			if overflowRun != nil {
-				c.finishProgramFailure(overflowRun, errors.New("program response backlog full"))
+			if failedRun != nil {
+				c.finishProgramFailure(failedRun, runFailure)
 			}
 			if recoveryChanged {
 				c.events <- Event{Kind: EventStateChanged, When: ev.When, State: recoverySnapshot.state, StateRevision: recoverySnapshot.revision, Text: recoveryText}
@@ -1839,14 +1867,14 @@ func (c *Controller) acceptDisconnectedEvent(generation transport.ConnectionGene
 	return generation != 0 && generation == c.connectionGeneration
 }
 
-func (c *Controller) deliverResponseLocked(generation transport.ConnectionGeneration, line string) *programRun {
+func (c *Controller) deliverResponseLocked(generation transport.ConnectionGeneration, line string) (*programRun, error) {
 	owner := c.responseOwner
 	if owner.kind != responseOwnerNone && owner.generation != generation {
-		return nil
+		return nil, nil
 	}
 	switch owner.kind {
 	case responseOwnerNone:
-		return nil
+		return nil, nil
 	case responseOwnerManualLine:
 		switch classifyProgramResponse(line) {
 		case responseOK:
@@ -1856,31 +1884,35 @@ func (c *Controller) deliverResponseLocked(generation transport.ConnectionGenera
 			c.clearSettingsMutationForOwnerLocked(owner)
 			c.releaseResponseOwnerLocked(responseOwnerManualLine, owner.session)
 		}
-		return nil
+		return nil, nil
 	case responseOwnerInteractiveMacro:
 		if deliverToSession(owner.session, line) {
-			return nil
+			return nil, nil
 		}
 		c.terminateResponseOwnerLocked(owner, ErrResponseBacklogFull)
-		return nil
+		return nil, nil
 	case responseOwnerProgram:
 		run := c.run
 		if run == nil || run.responseSession() != owner.session || run.generation != generation {
 			c.terminateResponseOwnerLocked(owner, ErrCommandSessionInvariant)
-			c.state.ProgramStatus = ProgramFailed
-			c.state.LastError = ErrCommandSessionInvariant.Error()
-			return nil
+			if run != nil {
+				return run, ErrCommandSessionInvariant
+			} else {
+				c.state.ProgramStatus = ProgramFailed
+				c.state.LastError = ErrCommandSessionInvariant.Error()
+			}
+			return nil, nil
 		}
 		if deliverToSession(owner.session, line) {
-			return nil
+			return nil, nil
 		}
-		return run
+		return run, errors.New("program response backlog full")
 	default:
 		c.endExpectedSilenceForOwnerLocked(owner)
 		c.clearSettingsMutationForOwnerLocked(owner)
 		c.responseOwner = responseOwner{}
 		c.state.LastError = ErrCommandSessionInvariant.Error()
-		return nil
+		return nil, nil
 	}
 }
 

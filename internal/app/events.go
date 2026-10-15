@@ -96,9 +96,12 @@ type State struct {
 	ProgramName             string
 	ProgramDocumentID       DocumentID
 	ProgramRunID            RunID
-	ProgramStatus           ProgramStatus
-	ProgramTotal            int
-	ProgramComplete         int
+	// ProgramError belongs only to ProgramRunID. General controller errors use
+	// LastError and must not modify this field.
+	ProgramError    string
+	ProgramStatus   ProgramStatus
+	ProgramTotal    int
+	ProgramComplete int
 }
 
 func (s State) IsConnected() bool {
@@ -110,12 +113,17 @@ func (s State) IsConnecting() bool {
 }
 
 type Event struct {
-	Kind          EventKind
-	When          time.Time
-	Text          string
-	Err           error
-	State         State
-	StateRevision StateRevision
-	Ports         []AvailablePort
-	Raw           transport.Event
+	Kind EventKind
+	When time.Time
+	Text string
+	Err  error
+	// ErrorRunID explicitly associates an EventError with a program failure.
+	// A zero value means the error is general; State.ProgramRunID remains only
+	// contextual in that case. ErrorDocumentID may be zero for a legacy run.
+	ErrorDocumentID DocumentID
+	ErrorRunID      RunID
+	State           State
+	StateRevision   StateRevision
+	Ports           []AvailablePort
+	Raw             transport.Event
 }

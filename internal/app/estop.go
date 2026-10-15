@@ -12,10 +12,12 @@ import (
 const defaultControllerResponseTimeout = 2 * time.Second
 
 type eStopTransitionResult struct {
-	entered  bool
-	cancel   context.CancelFunc
-	error    error
-	snapshot versionedState
+	entered         bool
+	cancel          context.CancelFunc
+	error           error
+	errorDocumentID DocumentID
+	errorRunID      RunID
+	snapshot        versionedState
 }
 
 func emergencyStopError(source EStopSource) error {
@@ -56,7 +58,11 @@ func (c *Controller) enterEStopLocked(source EStopSource, generation transport.C
 		cancel = run.cancel
 	}
 	if run != nil || c.state.ProgramStatus.IsActive() {
-		c.state.ProgramStatus = ProgramFailed
+		if run != nil {
+			c.recordProgramFailureLocked(run, err)
+		} else {
+			c.state.ProgramStatus = ProgramFailed
+		}
 	}
 	c.terminateResponseOwnerLocked(c.responseOwner, err)
 	c.clearExpectedSilenceLocked()
@@ -66,11 +72,20 @@ func (c *Controller) enterEStopLocked(source EStopSource, generation transport.C
 	c.state.EStopSource = source
 	c.state.LastError = err.Error()
 
+	var errorDocumentID DocumentID
+	var errorRunID RunID
+	if run != nil {
+		errorDocumentID = run.documentID
+		errorRunID = run.runID
+	}
+
 	return eStopTransitionResult{
-		entered:  true,
-		cancel:   cancel,
-		error:    err,
-		snapshot: c.captureEventStateLocked(),
+		entered:         true,
+		cancel:          cancel,
+		error:           err,
+		errorDocumentID: errorDocumentID,
+		errorRunID:      errorRunID,
+		snapshot:        c.captureEventStateLocked(),
 	}
 }
 
@@ -89,12 +104,14 @@ func (c *Controller) finishEStopTransition(result eStopTransitionResult) {
 		Text:          result.error.Error(),
 	}
 	c.events <- Event{
-		Kind:          EventError,
-		When:          time.Now(),
-		Err:           result.error,
-		Text:          result.error.Error(),
-		State:         result.snapshot.state,
-		StateRevision: result.snapshot.revision,
+		Kind:            EventError,
+		When:            time.Now(),
+		Err:             result.error,
+		Text:            result.error.Error(),
+		ErrorDocumentID: result.errorDocumentID,
+		ErrorRunID:      result.errorRunID,
+		State:           result.snapshot.state,
+		StateRevision:   result.snapshot.revision,
 	}
 }
 
