@@ -159,6 +159,16 @@ func (c *Controller) admissionErrorLocked(request admissionKind) error {
 	if c.connectionTransition != connectionStable {
 		return ErrConnectionTransition
 	}
+	if c.state.MachineReadiness != MachineReadinessNormal {
+		switch request {
+		case admissionConnect, admissionDisconnect, admissionStatusPoll, admissionRecoveryManual, admissionRecoveryRealtime, admissionSafetyRealtime, admissionStop:
+		default:
+			if c.state.MachineReadinessReason == "" {
+				return ErrMachineNotReady
+			}
+			return fmt.Errorf("%w: %s", ErrMachineNotReady, c.state.MachineReadinessReason)
+		}
+	}
 	if c.state.EStopStatus != EStopClear {
 		switch request {
 		case admissionDisconnect, admissionStatusPoll, admissionConnect:
@@ -177,7 +187,7 @@ func (c *Controller) admissionErrorLocked(request admissionKind) error {
 		// Disconnect first claims its transition and then drains the admitted
 		// write; every other admission must wait for the reservation to end.
 		if request == admissionDisconnect {
-			if c.run != nil || c.state.ProgramStatus.IsActive() {
+			if (c.run != nil || c.state.ProgramStatus.IsActive()) && c.state.MachineReadiness == MachineReadinessNormal {
 				return ErrProgramActive
 			}
 			return nil
@@ -191,12 +201,12 @@ func (c *Controller) admissionErrorLocked(request admissionKind) error {
 		return c.responseOwnerBusyErrorLocked(responseOwnerProgram)
 	}
 	if request == admissionDisconnect {
-		if c.run != nil || c.state.ProgramStatus.IsActive() {
+		if (c.run != nil || c.state.ProgramStatus.IsActive()) && c.state.MachineReadiness == MachineReadinessNormal {
 			return ErrProgramActive
 		}
 		return nil
 	}
-	if request == admissionRealtime || request == admissionStatusPoll || request == admissionRecoveryRealtime {
+	if request == admissionRealtime || request == admissionStatusPoll || request == admissionRecoveryRealtime || request == admissionSafetyRealtime || request == admissionStop {
 		return nil
 	}
 	requested := responseOwnerManualLine

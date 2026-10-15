@@ -33,8 +33,15 @@ var ErrInvalidControllerLine = errors.New("controller command must contain exact
 var ErrDocumentIDRequired = errors.New("document ID is required")
 var ErrRunIDExhausted = errors.New("program run IDs exhausted")
 var ErrPauseInProgress = errors.New("program pause is already in progress")
+var ErrStopInProgress = errors.New("program stop is already in progress")
+var ErrMachineNotReady = errors.New("machine execution readiness has not been established")
 
-const defaultStatusPollInterval = 500 * time.Millisecond
+const (
+	defaultStatusPollInterval     = 500 * time.Millisecond
+	defaultStopTransportTimeout   = 5 * time.Second
+	defaultStopResetBannerTimeout = 5 * time.Second
+	defaultStopIdleTimeout        = 5 * time.Second
+)
 
 type responseSession struct {
 	rxCh      chan string
@@ -87,11 +94,14 @@ const (
 	admissionRecoveryRealtime
 	admissionConnect
 	admissionDisconnect
+	admissionSafetyRealtime
+	admissionStop
 )
 
 type realtimeWriteOwner uint8
 
 type pauseTransitionID uint64
+type stopOperationID uint64
 
 const (
 	realtimeWriteOwnerNone realtimeWriteOwner = iota
@@ -100,17 +110,18 @@ const (
 )
 
 type programRun struct {
-	program         gcode.Program
-	documentID      DocumentID
-	runID           RunID
-	session         *responseSession
-	rxCh            chan string
-	queryRxCh       chan string
-	cancel          context.CancelFunc
-	generation      transport.ConnectionGeneration
-	draining        bool
-	pauseTransition pauseTransitionID
-	drainSyncEpoch  uint64
+	program             gcode.Program
+	documentID          DocumentID
+	runID               RunID
+	session             *responseSession
+	rxCh                chan string
+	queryRxCh           chan string
+	cancel              context.CancelFunc
+	generation          transport.ConnectionGeneration
+	draining            bool
+	pauseTransition     pauseTransitionID
+	drainSyncEpoch      uint64
+	machineWorkPossible bool
 }
 
 type Controller struct {
@@ -128,6 +139,8 @@ type Controller struct {
 	run                                     *programRun
 	nextRunID                               RunID
 	nextPauseTransitionID                   pauseTransitionID
+	nextStopOperationID                     stopOperationID
+	stopOperation                           *programStopOperation
 	responseOwner                           responseOwner
 	expectedSilencePolicy                   expectedSilencePolicy
 	nextExpectedSilenceID                   expectedSilenceID
@@ -167,6 +180,12 @@ type Controller struct {
 	pendingQuietStatusReports               int
 	statusReportRevision                    uint64
 	statusReportChanged                     chan struct{}
+	startupBannerRevision                   uint64
+	lastStartupBannerAt                     time.Time
+	startupBannerChanged                    chan struct{}
+	stopTransportTimeout                    time.Duration
+	stopResetBannerTimeout                  time.Duration
+	stopIdleTimeout                         time.Duration
 	suppressTransportDisconnectedGeneration transport.ConnectionGeneration
 }
 
@@ -193,6 +212,10 @@ func NewController(t transport.Transport, listPorts ports.ListFunc) *Controller 
 		variables:                      macro.NewVariableStore(),
 		contour:                        macro.NewContourState(),
 		statusReportChanged:            make(chan struct{}),
+		startupBannerChanged:           make(chan struct{}),
+		stopTransportTimeout:           defaultStopTransportTimeout,
+		stopResetBannerTimeout:         defaultStopResetBannerTimeout,
+		stopIdleTimeout:                defaultStopIdleTimeout,
 	}
 	go c.runTransportEventBridge()
 	return c
@@ -339,15 +362,18 @@ func (c *Controller) connect(ctx context.Context, cfg transport.PortConfig, orig
 	c.state.LastError = ""
 	c.applySuccessfulConnectionPolicyLocked(origin, cfg)
 	c.finishConnectAttemptLocked(attempt)
+	recoveryVerification := c.state.MachineReadiness != MachineReadinessNormal
+	if recoveryVerification {
+		c.setMachineReadinessLocked(MachineReadinessVerifying, "connection validated; waiting for a fresh controller Idle status")
+	}
+	c.startStatusPollingLocked()
 	snapshot := c.captureEventStateLocked()
 	c.mu.Unlock()
 
 	c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: snapshot.state, StateRevision: snapshot.revision, Text: fmt.Sprintf("connected to %s", cfg.Name)}
-	c.mu.Lock()
-	if c.state.ConnectionStatus == ConnectionConnected && c.connectionGeneration == generation {
-		c.startStatusPollingLocked()
+	if recoveryVerification {
+		go c.verifyReadinessAfterConnect(generation)
 	}
-	c.mu.Unlock()
 	return nil
 }
 
@@ -391,11 +417,27 @@ func (c *Controller) Disconnect() error {
 	suppressed := c.connectedMachineIdentityLocked()
 	c.connectionTransition = connectionDisconnecting
 	writeDone := c.realtimeWriteDone
+	forceCloseActiveWrite := writeDone != nil && c.state.MachineReadiness == MachineReadinessRecoveryRequired
+	var cancelRun context.CancelFunc
+	if c.run != nil {
+		run := c.run
+		c.run = nil
+		cancelRun = run.cancel
+		err := errors.New("program interrupted by controller disconnect")
+		c.recordProgramFailureLocked(run, err)
+		c.requireMachineRecoveryLocked("program was disconnected before machine readiness was confirmed; reconnect and verify controller Idle")
+		if c.stopOperation != nil {
+			c.completeStopOperationLocked(c.stopOperation, err)
+		}
+	}
 	c.terminateResponseOwnerLocked(c.responseOwner, ErrTransportDisconnected)
 	c.suppressTransportDisconnectedGeneration = c.connectionGeneration
 	c.mu.Unlock()
+	if cancelRun != nil {
+		cancelRun()
+	}
 	c.stopStatusPolling()
-	if writeDone != nil {
+	if writeDone != nil && !forceCloseActiveWrite {
 		<-writeDone
 	}
 	if err := c.transport.Close(); err != nil {
@@ -405,6 +447,9 @@ func (c *Controller) Disconnect() error {
 		c.mu.Unlock()
 		c.emitError(err)
 		return err
+	}
+	if forceCloseActiveWrite {
+		c.endRealtimeWriteReservation(writeDone)
 	}
 
 	c.mu.Lock()
@@ -432,7 +477,7 @@ func (c *Controller) SendConsoleLine(ctx context.Context, text string) error {
 			c.emitError(err)
 			return err
 		}
-		return c.writeRealtimeMessage(ctx, msg)
+		return c.writeRealtimeMessageForAdmission(ctx, msg, admissionSafetyRealtime)
 	}
 	line, parseOK := parseConsoleGCodeLine(text)
 	if parseOK {
@@ -581,7 +626,7 @@ func (c *Controller) StopMotion(ctx context.Context) error {
 		if c.state.ProgramStatus.IsActive() || c.run != nil {
 			return ErrProgramActive
 		}
-		return c.beginRealtimeWriteLocked()
+		return c.beginRealtimeWriteForAdmissionLocked(admissionSafetyRealtime)
 	})
 	if err != nil {
 		c.emitError(err)
@@ -705,6 +750,10 @@ func (c *Controller) beginStatusPollForGenerationLocked(generation transport.Con
 	if request == admissionStatusPoll && c.expectedSilenceActiveForGenerationLocked(generation) {
 		return false, nil
 	}
+	if request == admissionStatusPoll &&
+		(c.state.MachineReadiness == MachineReadinessStopping || c.state.MachineReadiness == MachineReadinessVerifying) {
+		return false, nil
+	}
 	if err := c.beginRealtimeWriteForAdmissionLocked(request); err != nil {
 		return false, err
 	}
@@ -761,7 +810,7 @@ func (c *Controller) writeStatusPollWhenAvailable(ctx context.Context) error {
 	for {
 		c.mu.Lock()
 		generation := c.connectionGeneration
-		admitted, err := c.beginStatusPollForGenerationLocked(generation, admissionRealtime)
+		admitted, err := c.beginStatusPollForGenerationLocked(generation, admissionSafetyRealtime)
 		if err == nil {
 			c.endForegroundAdmissionLocked()
 			registered = false
@@ -818,7 +867,7 @@ func (c *Controller) Action(ctx context.Context, action grbl.Action) error {
 	}
 	if action == grbl.ActionSoftReset {
 		err = c.withForegroundAdmission(ctx, func() error {
-			request := admissionRealtime
+			request := admissionSafetyRealtime
 			if c.state.EStopStatus == EStopRecovery {
 				request = admissionRecoveryRealtime
 			}
@@ -844,7 +893,13 @@ func (c *Controller) Action(ctx context.Context, action grbl.Action) error {
 		}
 		return nil
 	}
-	return c.writeRealtimeMessage(ctx, msg)
+	request := admissionRealtime
+	if action == grbl.ActionStatus {
+		request = admissionSafetyRealtime
+	} else if action == grbl.ActionHold || action == grbl.ActionJogCancel {
+		request = admissionSafetyRealtime
+	}
+	return c.writeRealtimeMessageForAdmission(ctx, msg, request)
 }
 
 func (c *Controller) Unlock(ctx context.Context) error {
@@ -905,8 +960,20 @@ func (c *Controller) endRealtimeWrite() {
 	c.mu.Unlock()
 }
 
+func (c *Controller) endRealtimeWriteReservation(done chan struct{}) {
+	c.mu.Lock()
+	if done != nil && c.realtimeWriteDone == done {
+		c.endRealtimeWriteLocked()
+	}
+	c.mu.Unlock()
+}
+
 func (c *Controller) writeRealtimeMessage(ctx context.Context, msg transport.Message) error {
-	if err := c.withForegroundAdmission(ctx, c.beginRealtimeWriteLocked); err != nil {
+	return c.writeRealtimeMessageForAdmission(ctx, msg, admissionRealtime)
+}
+
+func (c *Controller) writeRealtimeMessageForAdmission(ctx context.Context, msg transport.Message, request admissionKind) error {
+	if err := c.withForegroundAdmission(ctx, func() error { return c.beginRealtimeWriteForAdmissionLocked(request) }); err != nil {
 		c.emitError(err)
 		return err
 	}
@@ -1231,40 +1298,52 @@ func (c *Controller) writeProgramActionForRun(ctx context.Context, run *programR
 }
 
 func (c *Controller) StopProgram(ctx context.Context) error {
-	var (
-		run      *programRun
-		snapshot versionedState
-	)
-	err := c.withForegroundAdmission(ctx, func() error {
-		run = c.run
-		if run == nil {
-			return errors.New("program is not running")
-		}
-		if err := c.beginRealtimeWriteLocked(); err != nil {
-			return err
-		}
-		c.run = nil
-		c.releaseResponseOwnerLocked(responseOwnerProgram, run.responseSession())
-		c.state.ProgramStatus = ProgramStopped
-		snapshot = c.captureEventStateLocked()
-		return nil
-	})
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		c.emitError(err)
 		return err
 	}
-	defer c.endRealtimeWrite()
+	c.mu.Lock()
+	if c.stopOperation != nil {
+		c.mu.Unlock()
+		c.emitError(ErrStopInProgress)
+		return ErrStopInProgress
+	}
+	run := c.run
+	if run == nil || !c.state.ProgramStatus.IsActive() {
+		c.mu.Unlock()
+		err := errors.New("program is not running")
+		c.emitError(err)
+		return err
+	}
+	c.nextStopOperationID++
+	if c.nextStopOperationID == 0 {
+		c.nextStopOperationID++
+	}
+	op := &programStopOperation{
+		id:         c.nextStopOperationID,
+		run:        run,
+		generation: run.generation,
+		done:       make(chan struct{}),
+	}
+	c.stopOperation = op
+	run.pauseTransition = 0
+	run.drainSyncEpoch++
+	c.terminateResponseOwnerLocked(c.responseOwner, ErrCommandSessionCanceled)
+	c.state.ProgramStatus = ProgramStopping
+	c.setMachineReadinessLocked(MachineReadinessStopping, "program stop accepted; controller abort is in progress")
+	snapshot := c.captureEventStateLocked()
+	c.mu.Unlock()
 
 	run.cancel()
-	var firstErr error
-	if err := c.writeProgramActionReserved(ctx, grbl.ActionHold); err != nil && firstErr == nil {
-		firstErr = err
+	c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: snapshot.state, StateRevision: snapshot.revision, Text: "program stopping"}
+	go c.executeProgramStop(op)
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-op.done:
+		return op.err
 	}
-	if err := c.writeProgramActionReserved(ctx, grbl.ActionSoftReset); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: snapshot.state, StateRevision: snapshot.revision, Text: "program stopped"}
-	return firstErr
 }
 
 func (c *Controller) runProgram(ctx context.Context, run *programRun) {
@@ -1380,7 +1459,7 @@ func (r *commandRuntime) sendLineAndWaitOK(ctx context.Context, line string, sou
 		return err
 	}
 	defer func() { c.clearCommandPreparation(preparation) }()
-	if err := c.transport.Write(ctx, msg); err != nil {
+	if err := c.writeRuntimeMessage(ctx, r.run, msg); err != nil {
 		if sourceLine > 0 {
 			return fmt.Errorf("send line %d: %w", sourceLine, err)
 		}
@@ -1467,7 +1546,7 @@ func (r *commandRuntime) sendLineCollectingResponses(ctx context.Context, line s
 		return nil, err
 	}
 	defer func() { c.clearCommandPreparation(preparation) }()
-	if err := c.transport.Write(ctx, msg); err != nil {
+	if err := c.writeRuntimeMessage(ctx, r.run, msg); err != nil {
 		return nil, fmt.Errorf("send query line: %w", err)
 	}
 	var responses []string
@@ -1510,6 +1589,51 @@ func (r *commandRuntime) sendLineCollectingResponses(ctx context.Context, line s
 				responses = append(responses, rx)
 			}
 		}
+	}
+}
+
+func (c *Controller) writeRuntimeMessage(ctx context.Context, run *programRun, msg transport.Message) error {
+	if run == nil {
+		return c.transport.Write(ctx, msg)
+	}
+	for {
+		if err := c.waitUntilRunnable(ctx, run); err != nil {
+			return err
+		}
+		if err := c.beginForegroundAdmission(ctx); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		if c.run != run || c.connectionGeneration != run.generation || c.state.ProgramStatus != ProgramRunning {
+			c.endForegroundAdmissionLocked()
+			c.mu.Unlock()
+			return ErrCommandSessionCanceled
+		}
+		if run.pauseTransition != 0 {
+			c.endForegroundAdmissionLocked()
+			c.mu.Unlock()
+			continue
+		}
+		if c.realtimeWriteActive {
+			done := c.realtimeWriteDone
+			c.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				c.endForegroundAdmission()
+				return ctx.Err()
+			case <-done:
+				c.endForegroundAdmission()
+				continue
+			}
+		}
+		c.realtimeWriteActive = true
+		c.realtimeWriteDone = make(chan struct{})
+		c.realtimeWriteOwner = realtimeWriteOwnerForeground
+		run.machineWorkPossible = true
+		c.endForegroundAdmissionLocked()
+		c.mu.Unlock()
+		defer c.endRealtimeWrite()
+		return c.transport.Write(ctx, msg)
 	}
 }
 
@@ -1574,6 +1698,9 @@ func (c *Controller) waitUntilRunnable(ctx context.Context, run *programRun) err
 		if !stillCurrent {
 			return context.Canceled
 		}
+		if status == ProgramStopping || status == ProgramFailed || status == ProgramStopped || status == ProgramCompleted {
+			return context.Canceled
+		}
 		if status != ProgramPaused && !pauseTransitionPending {
 			return nil
 		}
@@ -1583,7 +1710,7 @@ func (c *Controller) waitUntilRunnable(ctx context.Context, run *programRun) err
 
 func (c *Controller) updateProgramProgress(run *programRun, complete int) {
 	c.mu.Lock()
-	if c.run != run {
+	if c.run != run || c.state.ProgramStatus == ProgramStopping {
 		c.mu.Unlock()
 		return
 	}
@@ -1595,7 +1722,8 @@ func (c *Controller) updateProgramProgress(run *programRun, complete int) {
 
 func (c *Controller) beginProgramDraining(run *programRun) bool {
 	c.mu.Lock()
-	if c.run != run {
+	if c.run != run || c.stopOperation != nil ||
+		(c.state.ProgramStatus != ProgramRunning && c.state.ProgramStatus != ProgramPaused) {
 		c.mu.Unlock()
 		return false
 	}
@@ -1636,9 +1764,16 @@ func (c *Controller) finishProgramFailure(run *programRun, err error) {
 		c.mu.Unlock()
 		return
 	}
+	if c.stopOperation != nil && c.stopOperation.run == run {
+		c.mu.Unlock()
+		return
+	}
 	c.run = nil
 	c.releaseResponseOwnerLocked(responseOwnerProgram, run.responseSession())
 	c.recordProgramFailureLocked(run, err)
+	if run.machineWorkPossible {
+		c.requireMachineRecoveryLocked("program failed with controller work potentially pending: " + err.Error())
+	}
 	c.contour.Disable()
 	cancel = run.cancel
 	snapshot := c.captureEventStateLocked()
@@ -1696,6 +1831,7 @@ func (c *Controller) handleTransportDisconnected(generation transport.Connection
 	if run != nil {
 		c.run = nil
 		c.recordProgramFailureLocked(run, err)
+		c.requireMachineRecoveryLocked("program connection was lost before machine readiness was confirmed; reconnect and verify controller Idle")
 		c.contour.Disable()
 		cancel = run.cancel
 	} else {
@@ -1703,6 +1839,9 @@ func (c *Controller) handleTransportDisconnected(generation transport.Connection
 	}
 	owner := c.responseOwner
 	c.terminateResponseOwnerLocked(owner, err)
+	if c.stopOperation != nil {
+		c.completeStopOperationLocked(c.stopOperation, err)
+	}
 	changed := c.clearConnectionStateLocked()
 	emitState := changed || run != nil || owner.kind != responseOwnerNone
 	emitError := run != nil || owner.kind != responseOwnerNone
@@ -1724,6 +1863,9 @@ func (c *Controller) handleTransportDisconnected(generation transport.Connection
 }
 
 func (c *Controller) clearConnectionStateLocked() bool {
+	if c.state.MachineReadiness == MachineReadinessStopping || c.state.MachineReadiness == MachineReadinessVerifying {
+		c.requireMachineRecoveryLocked("connection was lost before post-abort readiness verification completed; reconnect and verify controller Idle")
+	}
 	changed := c.state.ConnectionStatus != ConnectionDisconnected ||
 		c.state.EStopStatus != EStopClear ||
 		c.state.EStopSource != EStopSourceNone ||
@@ -1743,6 +1885,10 @@ func (c *Controller) clearConnectionStateLocked() bool {
 	c.clearExpectedSilenceLocked()
 	c.pendingQuietStatusReports = 0
 	c.resetControllerHealthLocked()
+	close(c.statusReportChanged)
+	c.statusReportChanged = make(chan struct{})
+	close(c.startupBannerChanged)
+	c.startupBannerChanged = make(chan struct{})
 	return changed
 }
 
@@ -1838,21 +1984,6 @@ func (c *Controller) writeProgramAction(ctx context.Context, action grbl.Action)
 	return c.writeRealtimeMessage(ctx, msg)
 }
 
-// writeProgramActionReserved writes within the reservation StopProgram acquired
-// before releasing program ownership.
-func (c *Controller) writeProgramActionReserved(ctx context.Context, action grbl.Action) error {
-	msg, err := grbl.BuildAction(action)
-	if err != nil {
-		c.emitError(err)
-		return err
-	}
-	if err := c.transport.Write(ctx, msg); err != nil {
-		c.emitError(err)
-		return err
-	}
-	return nil
-}
-
 func (c *Controller) runTransportEventBridge() {
 	for ev := range c.transport.Events() {
 		switch ev.Kind {
@@ -1888,6 +2019,18 @@ func (c *Controller) runTransportEventBridge() {
 				continue
 			}
 			c.noteControllerActivityLocked(ev.Generation, ev.When)
+			if _, ok := grbl.ParseStartupBanner(ev.Text); ok {
+				c.startupBannerRevision++
+				bannerAt := ev.When
+				if bannerAt.IsZero() {
+					bannerAt = c.now()
+				}
+				if bannerAt.After(c.lastStartupBannerAt) {
+					c.lastStartupBannerAt = bannerAt
+				}
+				close(c.startupBannerChanged)
+				c.startupBannerChanged = make(chan struct{})
+			}
 			c.noteExpectedSilenceProgressLocked(ev.Generation, ev.When, ev.Text)
 			suppressRXLog := false
 			statusReport := false

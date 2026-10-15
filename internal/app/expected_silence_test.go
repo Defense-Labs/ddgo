@@ -680,9 +680,7 @@ func TestExpectedSilenceProgramCompletionAndCancellation(t *testing.T) {
 			t.Fatalf("StartProgram() error = %v", err)
 		}
 		waitForExpectedSilence(t, c, true)
-		if err := c.StopProgram(context.Background()); err != nil {
-			t.Fatalf("StopProgram() error = %v", err)
-		}
+		stopProgramAndConfirm(t, c, fake)
 		if lease := expectedSilenceSnapshot(c); lease.id != 0 {
 			t.Fatalf("program cancellation left lease active: %+v", lease)
 		}

@@ -64,6 +64,12 @@ func (c *Controller) enterEStopLocked(source EStopSource, generation transport.C
 			c.state.ProgramStatus = ProgramFailed
 		}
 	}
+	if run != nil {
+		c.requireMachineRecoveryLocked("emergency stop interrupted program execution; reconnect and verify controller Idle")
+	}
+	if c.stopOperation != nil {
+		c.completeStopOperationLocked(c.stopOperation, err)
+	}
 	c.terminateResponseOwnerLocked(c.responseOwner, err)
 	c.clearExpectedSilenceLocked()
 	c.contour.Disable()
@@ -178,6 +184,10 @@ func (c *Controller) checkStatusWatchdog(generation transport.ConnectionGenerati
 	c.mu.Lock()
 	if generation == 0 || generation != c.connectionGeneration || generation != c.statusMonitoringGeneration ||
 		!c.state.IsConnected() || c.state.EStopStatus == EStopActive {
+		c.mu.Unlock()
+		return
+	}
+	if c.state.MachineReadiness == MachineReadinessStopping || c.state.MachineReadiness == MachineReadinessVerifying {
 		c.mu.Unlock()
 		return
 	}

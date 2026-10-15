@@ -18,6 +18,8 @@ func FormatProgramStatus(state app.State) string {
 		return fmt.Sprintf("finishing — waiting for machine Idle (%s)", state.ProgramName)
 	case app.ProgramPaused:
 		return fmt.Sprintf("paused (%s)", state.ProgramName)
+	case app.ProgramStopping:
+		return fmt.Sprintf("stopping — verifying machine readiness (%s)", state.ProgramName)
 	case app.ProgramStopped:
 		return fmt.Sprintf("stopped (%s)", state.ProgramName)
 	case app.ProgramCompleted:

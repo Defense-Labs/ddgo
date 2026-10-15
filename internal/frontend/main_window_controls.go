@@ -24,11 +24,13 @@ func MainWindowControls(state app.State) MainWindowControlState {
 	programActive := state.ProgramStatus.IsActive()
 	connected := state.IsConnected()
 	safetyClear := state.EStopStatus == app.EStopClear
+	machineReady := state.MachineReadiness == app.MachineReadinessNormal
+	machineRecoveryRequired := state.MachineReadiness == app.MachineReadinessRecoveryRequired
 	recovering := state.EStopStatus == app.EStopRecovery
 	loaded := state.ProgramTotal > 0
 
-	canManual := connected && safetyClear && !programActive
-	canRun := connected && safetyClear && loaded && !programActive
+	canManual := connected && safetyClear && machineReady && !programActive
+	canRun := connected && safetyClear && machineReady && loaded && !programActive
 
 	return MainWindowControlState{
 		RefreshPortsEnabled:  !programActive,
@@ -39,14 +41,14 @@ func MainWindowControls(state app.State) MainWindowControlState {
 		BrowseProgramEnabled: !programActive,
 		RunProgramEnabled:    canRun,
 		PauseProgramEnabled:  state.ProgramStatus == app.ProgramRunning || state.ProgramStatus == app.ProgramDraining,
-		ResumeProgramEnabled: state.ProgramStatus == app.ProgramPaused,
-		StopProgramEnabled:   programActive,
+		ResumeProgramEnabled: state.ProgramStatus == app.ProgramPaused && machineReady,
+		StopProgramEnabled:   programActive && state.ProgramStatus != app.ProgramStopping,
 
 		ManualControlsEnabled: canManual,
 		UnlockEnabled: canManual ||
 			(connected && recovering && !programActive),
 		ResetEnabled: canManual ||
-			(connected && recovering && !programActive),
+			(connected && (recovering || machineRecoveryRequired) && !programActive),
 		JogToEndEnabled: canManual && state.HasMachinePosition,
 	}
 }

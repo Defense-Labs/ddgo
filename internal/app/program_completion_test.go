@@ -348,9 +348,7 @@ func TestOverlappingPauseWhileRunningDoesNotAdvanceProgram(t *testing.T) {
 	if got := tr.holdWriteCount(); got != 1 {
 		t.Fatalf("Hold write attempts = %d, want 1", got)
 	}
-	if err := controller.StopProgram(context.Background()); err != nil {
-		t.Fatalf("StopProgram() error = %v", err)
-	}
+	stopProgramAndConfirm(t, controller, tr.fake)
 }
 
 func TestPauseRealtimeReservationSerializesStop(t *testing.T) {
@@ -365,16 +363,36 @@ func TestPauseRealtimeReservationSerializesStop(t *testing.T) {
 	pauseDone := make(chan error, 1)
 	go func() { pauseDone <- controller.PauseProgram(context.Background()) }()
 	<-holdStarted
-	if err := controller.StopProgram(context.Background()); !errors.Is(err, ErrControllerIOActive) {
-		t.Fatalf("StopProgram() during admitted Pause error = %v, want %v", err, ErrControllerIOActive)
+	statusBefore := 0
+	for _, msg := range tr.fake.Written() {
+		if msg.Display == "?" {
+			statusBefore++
+		}
 	}
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- controller.StopProgram(context.Background()) }()
+	waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramStopping })
 	releaseHold()
 	if err := <-pauseDone; err != nil {
 		t.Fatalf("PauseProgram() error = %v", err)
 	}
-	waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramPaused })
-	if err := controller.StopProgram(context.Background()); err != nil {
-		t.Fatalf("StopProgram() after Pause error = %v", err)
+	waitForLineWrites(t, tr.fake, "G1 X1")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		writes := nonStatusWrites(tr.fake)
+		if len(writes) >= 4 && writes[len(writes)-1].Display == "Ctrl-X" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for Stop after Pause reservation")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	tr.fake.InjectRX("Grbl 1.1g [help:'$']")
+	waitForStatusWritesAfter(t, tr.fake, statusBefore)
+	tr.fake.InjectRX("<Idle|MPos:0,0,0>")
+	if err := <-stopDone; err != nil {
+		t.Fatalf("StopProgram() error = %v", err)
 	}
 	writes := nonStatusWrites(tr.fake)
 	if len(writes) < 4 || writes[len(writes)-2].Display != "!" || writes[len(writes)-1].Display != "Ctrl-X" {
@@ -396,9 +414,7 @@ func TestStopWinningBeforePauseWritePreventsLateHold(t *testing.T) {
 	if err != nil {
 		t.Fatalf("beginPauseTransitionLocked() error = %v", err)
 	}
-	if err := controller.StopProgram(context.Background()); err != nil {
-		t.Fatalf("StopProgram() error = %v", err)
-	}
+	stopProgramAndConfirm(t, controller, tr.fake)
 	replacementID, err := controller.StartDocumentProgram(context.Background(), 92, documentProgram(t, "replacement.gcode", "M5\n"))
 	if err != nil {
 		t.Fatalf("replacement StartDocumentProgram() error = %v", err)
@@ -417,9 +433,7 @@ func TestStopWinningBeforePauseWritePreventsLateHold(t *testing.T) {
 	if state.ProgramStatus != ProgramRunning || state.ProgramRunID != replacementID || state.ProgramDocumentID != 92 {
 		t.Fatalf("late Pause changed replacement run: %+v", state)
 	}
-	if err := controller.StopProgram(context.Background()); err != nil {
-		t.Fatalf("replacement StopProgram() error = %v", err)
-	}
+	stopProgramAndConfirm(t, controller, tr.fake)
 }
 
 func TestPendingPauseCannotResurrectInterruptedRun(t *testing.T) {
@@ -470,9 +484,7 @@ func TestPendingPauseCannotResurrectInterruptedRun(t *testing.T) {
 func TestStopDuringFinalDrainPreventsLateCompletion(t *testing.T) {
 	controller, fake, runID := startSingleLineDocumentRun(t)
 	enterProgramDrain(t, controller, fake)
-	if err := controller.StopProgram(context.Background()); err != nil {
-		t.Fatalf("StopProgram() error = %v", err)
-	}
+	stopProgramAndConfirm(t, controller, fake)
 	stopped := waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramStopped })
 	if stopped.ProgramRunID != runID {
 		t.Fatalf("stopped RunID = %d, want %d", stopped.ProgramRunID, runID)
@@ -565,9 +577,7 @@ func TestStaleDrainingWorkerCannotCompleteReplacementRun(t *testing.T) {
 	controller.mu.RLock()
 	staleRun := controller.run
 	controller.mu.RUnlock()
-	if err := controller.StopProgram(context.Background()); err != nil {
-		t.Fatalf("StopProgram() error = %v", err)
-	}
+	stopProgramAndConfirm(t, controller, fake)
 
 	replacementID, err := controller.StartDocumentProgram(context.Background(), 92, documentProgram(t, "replacement.gcode", "M5\n"))
 	if err != nil {
@@ -580,9 +590,7 @@ func TestStaleDrainingWorkerCannotCompleteReplacementRun(t *testing.T) {
 	if state.ProgramStatus != ProgramRunning || state.ProgramRunID != replacementID || state.ProgramDocumentID != 92 {
 		t.Fatalf("stale completion changed replacement state: %+v", state)
 	}
-	if err := controller.StopProgram(context.Background()); err != nil {
-		t.Fatalf("replacement StopProgram() error = %v", err)
-	}
+	stopProgramAndConfirm(t, controller, fake)
 }
 
 func TestFinalSystemCommandStillRequiresProgramDrainIdle(t *testing.T) {

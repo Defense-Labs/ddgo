@@ -597,7 +597,9 @@ func (w *MainWindow) ApplyState(state app.State) {
 	}
 	w.programStatus.SetText("Program: " + frontend.FormatProgramStatus(state))
 	w.programProgress.SetText(fmt.Sprintf("Progress: %d / %d", state.ProgramComplete, state.ProgramTotal))
-	if state.LastError != "" {
+	if state.MachineReadiness != app.MachineReadinessNormal && state.MachineReadinessReason != "" {
+		w.lastErrorLabel.SetText("Machine not ready: " + state.MachineReadinessReason)
+	} else if state.LastError != "" {
 		w.lastErrorLabel.SetText("Last error: " + state.LastError)
 	} else {
 		w.lastErrorLabel.SetText("Last error: none")

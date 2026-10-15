@@ -20,6 +20,10 @@ type RunID uint64
 
 type ProgramStatus string
 
+// MachineReadiness is the controller's independent post-abort execution
+// interlock. Its zero value is the normal/ready state.
+type MachineReadiness string
+
 type ConnectionStatus string
 
 type EStopStatus string
@@ -62,6 +66,7 @@ const (
 	ProgramRunning   ProgramStatus = "running"
 	ProgramDraining  ProgramStatus = "draining"
 	ProgramPaused    ProgramStatus = "paused"
+	ProgramStopping  ProgramStatus = "stopping"
 	ProgramStopped   ProgramStatus = "stopped"
 	ProgramCompleted ProgramStatus = "completed"
 	ProgramFailed    ProgramStatus = "failed"
@@ -69,12 +74,19 @@ const (
 
 func (s ProgramStatus) IsActive() bool {
 	switch s {
-	case ProgramRunning, ProgramDraining, ProgramPaused:
+	case ProgramRunning, ProgramDraining, ProgramPaused, ProgramStopping:
 		return true
 	default:
 		return false
 	}
 }
+
+const (
+	MachineReadinessNormal           MachineReadiness = ""
+	MachineReadinessStopping         MachineReadiness = "stopping"
+	MachineReadinessVerifying        MachineReadiness = "verifying"
+	MachineReadinessRecoveryRequired MachineReadiness = "recovery_required"
+)
 
 type State struct {
 	ConnectionStatus        ConnectionStatus
@@ -93,10 +105,14 @@ type State struct {
 	HasFeedSpindle          bool
 	LastStatusRaw           string
 	LastError               string
-	ProgramPath             string
-	ProgramName             string
-	ProgramDocumentID       DocumentID
-	ProgramRunID            RunID
+	// MachineReadiness independently gates execution after an interrupted run.
+	// MachineReadinessReason explains any non-normal restriction.
+	MachineReadiness       MachineReadiness
+	MachineReadinessReason string
+	ProgramPath            string
+	ProgramName            string
+	ProgramDocumentID      DocumentID
+	ProgramRunID           RunID
 	// ProgramError belongs only to ProgramRunID. General controller errors use
 	// LastError and must not modify this field.
 	ProgramError    string

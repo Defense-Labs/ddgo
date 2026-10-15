@@ -250,6 +250,7 @@ func TestDocumentRunIdentitySurvivesPauseResumeFailureAndStop(t *testing.T) {
 	if failed.ProgramDocumentID != documentID || failed.ProgramRunID != runID {
 		t.Fatalf("failed identity = %+v", failed)
 	}
+	reconnectAndConfirmReadiness(t, controller, fake)
 
 	stopRunID, err := controller.StartDocumentProgram(context.Background(), documentID, program)
 	if err != nil {
@@ -259,9 +260,7 @@ func TestDocumentRunIdentitySurvivesPauseResumeFailureAndStop(t *testing.T) {
 		t.Fatalf("replacement RunID = %d, want different from %d", stopRunID, runID)
 	}
 	waitForLineWrites(t, fake, "G0 X1", "G0 X1")
-	if err := controller.StopProgram(context.Background()); err != nil {
-		t.Fatalf("StopProgram() error = %v", err)
-	}
+	stopProgramAndConfirm(t, controller, fake)
 	stopEvent := waitForEventText(t, controller.Events(), EventStateChanged, "program stopped")
 	stopped := stopEvent.State
 	if stopped.ProgramDocumentID != documentID || stopped.ProgramRunID != stopRunID {

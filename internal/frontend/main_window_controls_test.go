@@ -111,6 +111,35 @@ func TestMainWindowControls(t *testing.T) {
 			},
 		},
 		{
+			name: "stopping program",
+			state: app.State{
+				ConnectionStatus: app.ConnectionConnected,
+				EStopStatus:      app.EStopClear,
+				ProgramStatus:    app.ProgramStopping,
+				MachineReadiness: app.MachineReadinessStopping,
+				ProgramTotal:     10,
+			},
+			want: MainWindowControlState{},
+		},
+		{
+			name: "machine recovery required",
+			state: app.State{
+				ConnectionStatus: app.ConnectionConnected,
+				EStopStatus:      app.EStopClear,
+				ProgramStatus:    app.ProgramFailed,
+				MachineReadiness: app.MachineReadinessRecoveryRequired,
+				ProgramTotal:     10,
+			},
+			want: MainWindowControlState{
+				RefreshPortsEnabled:  true,
+				ConnectEnabled:       true,
+				PortSelectionEnabled: true,
+				ProgramPathEnabled:   true,
+				BrowseProgramEnabled: true,
+				ResetEnabled:         true,
+			},
+		},
+		{
 			name: "E-stop active",
 			state: app.State{
 				ConnectionStatus: app.ConnectionConnected,

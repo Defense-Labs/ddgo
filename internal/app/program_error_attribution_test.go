@@ -132,6 +132,7 @@ func TestProgramFailureErrorAssociationSurvivesGeneralErrorAndNewRun(t *testing.
 		afterGeneral.ProgramRunID != firstRunID || afterGeneral.ProgramStatus != ProgramFailed {
 		t.Fatalf("failed attribution after general error = %+v", afterGeneral)
 	}
+	reconnectAndConfirmReadiness(t, controller, fake)
 
 	secondDocumentID := DocumentID(405)
 	secondRunID, err := controller.StartDocumentProgram(

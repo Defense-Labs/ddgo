@@ -985,14 +985,12 @@ func TestControllerStopProgramCancelsSystemCommandPreBarrier(t *testing.T) {
 	controller, fake := startBarrierTestProgram(t, "$G\n", false)
 	waitForStatusWritesAfter(t, fake, 0)
 	ensureLineWritesStayAt(t, fake, nil)
-	if err := controller.StopProgram(context.Background()); err != nil {
-		t.Fatalf("StopProgram() error = %v", err)
-	}
+	stopProgramAndConfirm(t, controller, fake)
 	waitForState(t, controller, func(s State) bool { return s.ProgramStatus == ProgramStopped })
 	if got := lineWrites(fake); len(got) != 0 {
 		t.Fatalf("program line writes = %#v, want none", got)
 	}
-	writes := fake.Written()
+	writes := nonStatusWrites(fake)
 	if len(writes) < 2 || writes[len(writes)-2].Display != "!" || writes[len(writes)-1].Display != "Ctrl-X" {
 		t.Fatalf("stop writes = %#v, want hold then Ctrl-X", writes)
 	}
@@ -1200,15 +1198,12 @@ func TestControllerProgramPauseResumeStopAndModalBlocking(t *testing.T) {
 		t.Fatalf("next program line = %q, want %q", got, want)
 	}
 
-	if err := controller.StopProgram(context.Background()); err != nil {
-		t.Fatalf("StopProgram() error = %v", err)
-	}
+	stopProgramAndConfirm(t, controller, fake)
 	stopEv := waitForEventText(t, controller.Events(), EventStateChanged, "program stopped")
 	if got, want := stopEv.State.ProgramStatus, ProgramStopped; got != want {
 		t.Fatalf("stop status = %q, want %q", got, want)
 	}
-	waitForWrites(t, fake, 6)
-	written = fake.Written()
+	written = nonStatusWrites(fake)
 	if got, want := written[4].Display, "!"; got != want {
 		t.Fatalf("stop hold write = %q, want %q", got, want)
 	}
@@ -1216,7 +1211,9 @@ func TestControllerProgramPauseResumeStopAndModalBlocking(t *testing.T) {
 		t.Fatalf("stop reset write = %q, want %q", got, want)
 	}
 	fake.InjectRX("ok")
-	ensureWritesStayAt(t, fake, 6, 150*time.Millisecond)
+	if got := nonStatusWrites(fake); len(got) != 6 {
+		t.Fatalf("non-status writes after Stop = %d, want 6", len(got))
+	}
 }
 
 func TestControllerProgramFailureAndStartValidation(t *testing.T) {
@@ -1390,6 +1387,85 @@ func nonStatusWrites(fake *transport.FakeTransport) []transport.Message {
 		}
 	}
 	return writes
+}
+
+// stopProgramAndConfirm supplies the GG3 reset evidence intentionally omitted
+// by FakeTransport: a post-Ctrl-X startup banner and a fresh Idle response.
+func stopProgramAndConfirm(t *testing.T, controller *Controller, fake *transport.FakeTransport) {
+	t.Helper()
+	beforeStatus := 0
+	beforeReset := 0
+	for _, msg := range fake.Written() {
+		if msg.Display == "?" {
+			beforeStatus++
+		}
+		if msg.Display == "Ctrl-X" {
+			beforeReset++
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- controller.StopProgram(context.Background()) }()
+	waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramStopping })
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		resets := 0
+		for _, msg := range fake.Written() {
+			if msg.Display == "Ctrl-X" {
+				resets++
+			}
+		}
+		if resets > beforeReset {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for Stop Ctrl-X")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	fake.InjectRX("Grbl 1.1g [help:'$']")
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("StopProgram() error = %v", err)
+			}
+			return
+		default:
+		}
+		statuses := 0
+		for _, msg := range fake.Written() {
+			if msg.Display == "?" {
+				statuses++
+			}
+		}
+		if statuses > beforeStatus {
+			fake.InjectRX("<Idle|MPos:0,0,0>")
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for Stop recovery status request")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("StopProgram() error = %v", err)
+	}
+}
+
+func reconnectAndConfirmReadiness(t *testing.T, controller *Controller, fake *transport.FakeTransport) {
+	t.Helper()
+	if controller.Snapshot().IsConnected() {
+		if err := controller.Disconnect(); err != nil {
+			t.Fatalf("Disconnect() for recovery error = %v", err)
+		}
+	}
+	fake.SetResponding(true)
+	if err := controller.Connect(context.Background(), transport.DefaultPortConfig("fake")); err != nil {
+		t.Fatalf("Connect() for recovery error = %v", err)
+	}
+	waitForState(t, controller, func(state State) bool {
+		return state.IsConnected() && state.MachineReadiness == MachineReadinessNormal
+	})
 }
 
 // lineWrites excludes realtime traffic so barrier tests remain focused on the

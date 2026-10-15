@@ -18,6 +18,7 @@ func TestFormatProgramStatus(t *testing.T) {
 		{name: "running", status: app.ProgramRunning, programName: "example.nc", want: "running (example.nc)"},
 		{name: "draining", status: app.ProgramDraining, programName: "example.nc", want: "finishing — waiting for machine Idle (example.nc)"},
 		{name: "paused", status: app.ProgramPaused, programName: "example.nc", want: "paused (example.nc)"},
+		{name: "stopping", status: app.ProgramStopping, programName: "example.nc", want: "stopping — verifying machine readiness (example.nc)"},
 		{name: "stopped", status: app.ProgramStopped, programName: "example.nc", want: "stopped (example.nc)"},
 		{name: "completed", status: app.ProgramCompleted, programName: "example.nc", want: "completed (example.nc)"},
 		{name: "failed", status: app.ProgramFailed, programName: "example.nc", want: "failed (example.nc)"},
