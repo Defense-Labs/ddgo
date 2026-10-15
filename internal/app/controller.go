@@ -32,6 +32,7 @@ var ErrEmergencyStopActive = errors.New("emergency stop is active; machine comma
 var ErrInvalidControllerLine = errors.New("controller command must contain exactly one physical line")
 var ErrDocumentIDRequired = errors.New("document ID is required")
 var ErrRunIDExhausted = errors.New("program run IDs exhausted")
+var ErrPauseInProgress = errors.New("program pause is already in progress")
 
 const defaultStatusPollInterval = 500 * time.Millisecond
 
@@ -90,6 +91,8 @@ const (
 
 type realtimeWriteOwner uint8
 
+type pauseTransitionID uint64
+
 const (
 	realtimeWriteOwnerNone realtimeWriteOwner = iota
 	realtimeWriteOwnerForeground
@@ -97,17 +100,17 @@ const (
 )
 
 type programRun struct {
-	program        gcode.Program
-	documentID     DocumentID
-	runID          RunID
-	session        *responseSession
-	rxCh           chan string
-	queryRxCh      chan string
-	cancel         context.CancelFunc
-	generation     transport.ConnectionGeneration
-	draining       bool
-	pausePending   bool
-	drainSyncEpoch uint64
+	program         gcode.Program
+	documentID      DocumentID
+	runID           RunID
+	session         *responseSession
+	rxCh            chan string
+	queryRxCh       chan string
+	cancel          context.CancelFunc
+	generation      transport.ConnectionGeneration
+	draining        bool
+	pauseTransition pauseTransitionID
+	drainSyncEpoch  uint64
 }
 
 type Controller struct {
@@ -124,6 +127,7 @@ type Controller struct {
 	loaded                                  gcode.Program
 	run                                     *programRun
 	nextRunID                               RunID
+	nextPauseTransitionID                   pauseTransitionID
 	responseOwner                           responseOwner
 	expectedSilencePolicy                   expectedSilencePolicy
 	nextExpectedSilenceID                   expectedSilenceID
@@ -1098,32 +1102,31 @@ func (c *Controller) startProgram(ctx context.Context, documentID DocumentID, su
 
 func (c *Controller) PauseProgram(ctx context.Context) error {
 	c.mu.Lock()
-	run := c.run
-	if run == nil || (c.state.ProgramStatus != ProgramRunning && c.state.ProgramStatus != ProgramDraining) {
-		c.mu.Unlock()
-		err := errors.New("program is not running")
+	run, transition, err := c.beginPauseTransitionLocked()
+	c.mu.Unlock()
+	if err != nil {
 		c.emitError(err)
 		return err
 	}
-	run.pausePending = true
-	if run.draining {
-		run.drainSyncEpoch++
-	}
-	c.mu.Unlock()
-	if err := c.writeProgramAction(ctx, grbl.ActionHold); err != nil {
+	if err := c.writeProgramActionForRun(ctx, run, transition, grbl.ActionHold); err != nil {
 		c.mu.Lock()
-		if c.run == run {
-			run.pausePending = false
-		}
+		c.endPauseTransitionLocked(run, transition)
 		c.mu.Unlock()
+		c.emitError(err)
 		return err
 	}
 	c.mu.Lock()
-	if c.run != run || (c.state.ProgramStatus != ProgramRunning && c.state.ProgramStatus != ProgramDraining) {
+	if run.pauseTransition != transition {
 		c.mu.Unlock()
 		return nil
 	}
-	run.pausePending = false
+	if c.run != run ||
+		(c.state.ProgramStatus != ProgramRunning && c.state.ProgramStatus != ProgramDraining) {
+		c.endPauseTransitionLocked(run, transition)
+		c.mu.Unlock()
+		return nil
+	}
+	c.endPauseTransitionLocked(run, transition)
 	c.state.ProgramStatus = ProgramPaused
 	snapshot := c.captureEventStateLocked()
 	c.mu.Unlock()
@@ -1134,6 +1137,11 @@ func (c *Controller) PauseProgram(ctx context.Context) error {
 func (c *Controller) ResumeProgram(ctx context.Context) error {
 	c.mu.Lock()
 	run := c.run
+	if run != nil && run.pauseTransition != 0 {
+		c.mu.Unlock()
+		c.emitError(ErrPauseInProgress)
+		return ErrPauseInProgress
+	}
 	if run == nil || c.state.ProgramStatus != ProgramPaused {
 		c.mu.Unlock()
 		err := errors.New("program is not paused")
@@ -1158,6 +1166,68 @@ func (c *Controller) ResumeProgram(ctx context.Context) error {
 	c.mu.Unlock()
 	c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: snapshot.state, StateRevision: snapshot.revision, Text: "program resumed"}
 	return nil
+}
+
+// beginPauseTransitionLocked gives one Pause call exclusive ownership of the
+// completion interlock for the current run. The exact token prevents rejected
+// or stale cleanup from releasing another operation's interlock.
+func (c *Controller) beginPauseTransitionLocked() (*programRun, pauseTransitionID, error) {
+	run := c.run
+	if run == nil || (c.state.ProgramStatus != ProgramRunning && c.state.ProgramStatus != ProgramDraining) {
+		return nil, 0, errors.New("program is not running")
+	}
+	if run.pauseTransition != 0 {
+		return nil, 0, ErrPauseInProgress
+	}
+	c.nextPauseTransitionID++
+	if c.nextPauseTransitionID == 0 {
+		c.nextPauseTransitionID++
+	}
+	transition := c.nextPauseTransitionID
+	run.pauseTransition = transition
+	if run.draining {
+		run.drainSyncEpoch++
+	}
+	return run, transition, nil
+}
+
+func (c *Controller) endPauseTransitionLocked(run *programRun, transition pauseTransitionID) bool {
+	if run == nil || transition == 0 || run.pauseTransition != transition {
+		return false
+	}
+	run.pauseTransition = 0
+	return true
+}
+
+// writeProgramActionForRun reserves realtime transport only if the Pause token
+// still belongs to the same current run at actual write admission. A Stop or
+// termination that wins this lock therefore prevents a late Hold from being
+// sent against a replacement run.
+func (c *Controller) writeProgramActionForRun(ctx context.Context, run *programRun, transition pauseTransitionID, action grbl.Action) error {
+	msg, err := grbl.BuildAction(action)
+	if err != nil {
+		return err
+	}
+	if err := c.beginForegroundAdmission(ctx); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	if c.run != run || run.pauseTransition != transition ||
+		c.connectionGeneration != run.generation ||
+		(c.state.ProgramStatus != ProgramRunning && c.state.ProgramStatus != ProgramDraining) {
+		c.endForegroundAdmissionLocked()
+		c.mu.Unlock()
+		return ErrCommandSessionCanceled
+	}
+	if err := c.beginRealtimeWriteLocked(); err != nil {
+		c.endForegroundAdmissionLocked()
+		c.mu.Unlock()
+		return err
+	}
+	c.endForegroundAdmissionLocked()
+	c.mu.Unlock()
+	defer c.endRealtimeWrite()
+	return c.transport.Write(ctx, msg)
 }
 
 func (c *Controller) StopProgram(ctx context.Context) error {
@@ -1499,12 +1569,12 @@ func (c *Controller) waitUntilRunnable(ctx context.Context, run *programRun) err
 		c.mu.RLock()
 		stillCurrent := c.run == run
 		status := c.state.ProgramStatus
-		pausePending := run.pausePending
+		pauseTransitionPending := run.pauseTransition != 0
 		c.mu.RUnlock()
 		if !stillCurrent {
 			return context.Canceled
 		}
-		if status != ProgramPaused && !pausePending {
+		if status != ProgramPaused && !pauseTransitionPending {
 			return nil
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -1541,7 +1611,7 @@ func (c *Controller) beginProgramDraining(run *programRun) bool {
 
 func (c *Controller) finishProgramSuccess(run *programRun) bool {
 	c.mu.Lock()
-	if c.run != run || !run.draining || run.pausePending || c.state.ProgramStatus != ProgramDraining {
+	if c.run != run || !run.draining || run.pauseTransition != 0 || c.state.ProgramStatus != ProgramDraining {
 		c.mu.Unlock()
 		return false
 	}

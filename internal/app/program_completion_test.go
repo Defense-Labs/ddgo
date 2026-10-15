@@ -4,10 +4,95 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/ianbruene/ddgo/internal/grbl"
 	"github.com/ianbruene/ddgo/internal/transport"
 )
+
+type blockingPauseTransport struct {
+	fake *transport.FakeTransport
+
+	mu          sync.Mutex
+	blockHold   bool
+	holdStarted chan struct{}
+	releaseHold chan struct{}
+	holdErr     error
+	holdOnce    sync.Once
+	holdWrites  int
+}
+
+func newBlockingPauseTransport() *blockingPauseTransport {
+	return &blockingPauseTransport{fake: transport.NewFakeTransport()}
+}
+
+func (t *blockingPauseTransport) Events() <-chan transport.Event { return t.fake.Events() }
+
+func (t *blockingPauseTransport) Open(ctx context.Context, cfg transport.PortConfig) (transport.ConnectionGeneration, error) {
+	return t.fake.Open(ctx, cfg)
+}
+
+func (t *blockingPauseTransport) Close() error { return t.fake.Close() }
+
+func (t *blockingPauseTransport) Write(ctx context.Context, msg transport.Message) error {
+	if msg.Display == "!" {
+		t.mu.Lock()
+		t.holdWrites++
+		block := t.blockHold
+		started := t.holdStarted
+		release := t.releaseHold
+		holdErr := t.holdErr
+		if block {
+			t.blockHold = false
+		}
+		t.mu.Unlock()
+		if block {
+			t.holdOnce.Do(func() { close(started) })
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-release:
+			}
+			if holdErr != nil {
+				return holdErr
+			}
+		}
+	}
+	return t.fake.Write(ctx, msg)
+}
+
+func (t *blockingPauseTransport) blockNextHold(err error) (<-chan struct{}, func()) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.blockHold = true
+	t.holdStarted = make(chan struct{})
+	t.releaseHold = make(chan struct{})
+	t.holdErr = err
+	t.holdOnce = sync.Once{}
+	release := t.releaseHold
+	return t.holdStarted, func() { close(release) }
+}
+
+func (t *blockingPauseTransport) holdWriteCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.holdWrites
+}
+
+func newBlockingPauseController(t *testing.T) (*Controller, *blockingPauseTransport) {
+	t.Helper()
+	tr := newBlockingPauseTransport()
+	tr.fake.SetResponding(false)
+	controller := NewController(tr, nil)
+	controller.statusPollInterval = time.Hour
+	if err := controller.Connect(context.Background(), transport.DefaultPortConfig("fake")); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	drainEvents(controller.Events())
+	return controller, tr
+}
 
 func startSingleLineDocumentRun(t *testing.T) (*Controller, *transport.FakeTransport, RunID) {
 	t.Helper()
@@ -103,6 +188,283 @@ func TestProgramPauseResumeDuringFinalDrain(t *testing.T) {
 	}
 	fake.InjectRX("<Idle|MPos:0,0,0>")
 	waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramCompleted })
+}
+
+func TestOverlappingPauseHasSingleOwnerDuringFinalDrain(t *testing.T) {
+	controller, tr := newBlockingPauseController(t)
+	runID, err := controller.StartDocumentProgram(context.Background(), 91, documentProgram(t, "pause.gcode", "G1 X1\n"))
+	if err != nil {
+		t.Fatalf("StartDocumentProgram() error = %v", err)
+	}
+	waitForLineWrites(t, tr.fake, "G1 X1")
+	enterProgramDrain(t, controller, tr.fake)
+
+	holdStarted, releaseHold := tr.blockNextHold(nil)
+	pauseDone := make(chan error, 1)
+	go func() { pauseDone <- controller.PauseProgram(context.Background()) }()
+	<-holdStarted
+
+	controller.mu.RLock()
+	run := controller.run
+	transition := run.pauseTransition
+	owner := controller.responseOwner
+	controller.mu.RUnlock()
+	if transition == 0 {
+		t.Fatal("accepted Pause did not install its transition token")
+	}
+	if err := controller.PauseProgram(context.Background()); !errors.Is(err, ErrPauseInProgress) {
+		t.Fatalf("overlapping Pause error = %v, want %v", err, ErrPauseInProgress)
+	}
+	if err := controller.ResumeProgram(context.Background()); !errors.Is(err, ErrPauseInProgress) {
+		t.Fatalf("Resume during pending Pause error = %v, want %v", err, ErrPauseInProgress)
+	}
+	controller.mu.RLock()
+	if controller.run != run || run.pauseTransition != transition || controller.responseOwner != owner {
+		controller.mu.RUnlock()
+		t.Fatal("rejected operation changed Pause ownership or response ownership")
+	}
+	controller.mu.RUnlock()
+	if got := tr.holdWriteCount(); got != 1 {
+		t.Fatalf("Hold write attempts = %d, want 1", got)
+	}
+
+	tr.fake.InjectRX("<Idle|MPos:0,0,0>")
+	waitForState(t, controller, func(state State) bool {
+		return state.MachineState == "Idle" && state.ProgramStatus == ProgramDraining
+	})
+	releaseHold()
+	if err := <-pauseDone; err != nil {
+		t.Fatalf("owning Pause error = %v", err)
+	}
+	paused := waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramPaused })
+	if paused.ProgramRunID != runID || paused.ProgramDocumentID != 91 {
+		t.Fatalf("paused identity = %+v", paused)
+	}
+	controller.mu.RLock()
+	if controller.run != run || run.pauseTransition != 0 || controller.responseOwner != owner {
+		controller.mu.RUnlock()
+		t.Fatal("successful Pause lost run ownership or retained its transition token")
+	}
+	controller.mu.RUnlock()
+
+	statusWrites := countStatusWrites(tr.fake.Written())
+	if err := controller.ResumeProgram(context.Background()); err != nil {
+		t.Fatalf("ResumeProgram() error = %v", err)
+	}
+	waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramDraining })
+	waitForStatusWritesAfter(t, tr.fake, statusWrites)
+	if got := lineWrites(tr.fake); len(got) != 1 {
+		t.Fatalf("program lines after Pause/Resume = %#v, want no resend", got)
+	}
+	tr.fake.InjectRX("<Idle|MPos:0,0,0>")
+	waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramCompleted })
+}
+
+func TestFailedPauseKeepsInterlockUntilOwnerFinishes(t *testing.T) {
+	controller, tr := newBlockingPauseController(t)
+	_, err := controller.StartDocumentProgram(context.Background(), 91, documentProgram(t, "pause-failure.gcode", "G1 X1\n"))
+	if err != nil {
+		t.Fatalf("StartDocumentProgram() error = %v", err)
+	}
+	waitForLineWrites(t, tr.fake, "G1 X1")
+	enterProgramDrain(t, controller, tr.fake)
+
+	wantErr := errors.New("Hold write failed")
+	holdStarted, releaseHold := tr.blockNextHold(wantErr)
+	pauseDone := make(chan error, 1)
+	go func() { pauseDone <- controller.PauseProgram(context.Background()) }()
+	<-holdStarted
+	controller.mu.RLock()
+	run := controller.run
+	transition := run.pauseTransition
+	controller.mu.RUnlock()
+	if err := controller.PauseProgram(context.Background()); !errors.Is(err, ErrPauseInProgress) {
+		t.Fatalf("overlapping Pause error = %v, want %v", err, ErrPauseInProgress)
+	}
+	controller.mu.RLock()
+	if run.pauseTransition != transition || transition == 0 {
+		controller.mu.RUnlock()
+		t.Fatal("rejected Pause cleared the owning transition")
+	}
+	controller.mu.RUnlock()
+
+	tr.fake.InjectRX("<Idle|MPos:0,0,0>")
+	waitForState(t, controller, func(state State) bool {
+		return state.MachineState == "Idle" && state.ProgramStatus == ProgramDraining
+	})
+	statusWrites := countStatusWrites(tr.fake.Written())
+	releaseHold()
+	if err := <-pauseDone; !errors.Is(err, wantErr) {
+		t.Fatalf("owning Pause error = %v, want %v", err, wantErr)
+	}
+	controller.mu.RLock()
+	transition = run.pauseTransition
+	controller.mu.RUnlock()
+	if transition != 0 {
+		t.Fatalf("failed owning Pause retained transition %d", transition)
+	}
+	if state := controller.Snapshot(); state.ProgramStatus != ProgramDraining || state.ProgramDocumentID != 91 {
+		t.Fatalf("state after failed Pause = %+v", state)
+	}
+
+	// The Idle observed while Pause owned the interlock was invalidated. The
+	// drain worker must issue and satisfy a new status synchronization.
+	waitForStatusWritesAfter(t, tr.fake, statusWrites)
+	if got := controller.Snapshot().ProgramStatus; got != ProgramDraining {
+		t.Fatalf("status before replacement Idle = %q, want draining", got)
+	}
+	tr.fake.InjectRX("<Idle|MPos:0,0,0>")
+	waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramCompleted })
+}
+
+func TestOverlappingPauseWhileRunningDoesNotAdvanceProgram(t *testing.T) {
+	controller, tr := newBlockingPauseController(t)
+	_, err := controller.StartDocumentProgram(context.Background(), 91, documentProgram(t, "running-pause.gcode", "G1 X1\nG1 X2\n"))
+	if err != nil {
+		t.Fatalf("StartDocumentProgram() error = %v", err)
+	}
+	waitForLineWrites(t, tr.fake, "G1 X1")
+	holdStarted, releaseHold := tr.blockNextHold(nil)
+	pauseDone := make(chan error, 1)
+	go func() { pauseDone <- controller.PauseProgram(context.Background()) }()
+	<-holdStarted
+	if err := controller.PauseProgram(context.Background()); !errors.Is(err, ErrPauseInProgress) {
+		t.Fatalf("overlapping Pause error = %v, want %v", err, ErrPauseInProgress)
+	}
+	tr.fake.InjectRX("ok")
+	waitForState(t, controller, func(state State) bool { return state.ProgramComplete == 1 })
+	if got := lineWrites(tr.fake); len(got) != 1 {
+		t.Fatalf("program advanced during pending Pause: %#v", got)
+	}
+	releaseHold()
+	if err := <-pauseDone; err != nil {
+		t.Fatalf("owning Pause error = %v", err)
+	}
+	waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramPaused })
+	if err := controller.ResumeProgram(context.Background()); err != nil {
+		t.Fatalf("ResumeProgram() error = %v", err)
+	}
+	waitForLineWrites(t, tr.fake, "G1 X1", "G1 X2")
+	if got := tr.holdWriteCount(); got != 1 {
+		t.Fatalf("Hold write attempts = %d, want 1", got)
+	}
+	if err := controller.StopProgram(context.Background()); err != nil {
+		t.Fatalf("StopProgram() error = %v", err)
+	}
+}
+
+func TestPauseRealtimeReservationSerializesStop(t *testing.T) {
+	controller, tr := newBlockingPauseController(t)
+	_, err := controller.StartDocumentProgram(context.Background(), 91, documentProgram(t, "pause-stop.gcode", "G1 X1\n"))
+	if err != nil {
+		t.Fatalf("StartDocumentProgram() error = %v", err)
+	}
+	waitForLineWrites(t, tr.fake, "G1 X1")
+	enterProgramDrain(t, controller, tr.fake)
+	holdStarted, releaseHold := tr.blockNextHold(nil)
+	pauseDone := make(chan error, 1)
+	go func() { pauseDone <- controller.PauseProgram(context.Background()) }()
+	<-holdStarted
+	if err := controller.StopProgram(context.Background()); !errors.Is(err, ErrControllerIOActive) {
+		t.Fatalf("StopProgram() during admitted Pause error = %v, want %v", err, ErrControllerIOActive)
+	}
+	releaseHold()
+	if err := <-pauseDone; err != nil {
+		t.Fatalf("PauseProgram() error = %v", err)
+	}
+	waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramPaused })
+	if err := controller.StopProgram(context.Background()); err != nil {
+		t.Fatalf("StopProgram() after Pause error = %v", err)
+	}
+	writes := nonStatusWrites(tr.fake)
+	if len(writes) < 4 || writes[len(writes)-2].Display != "!" || writes[len(writes)-1].Display != "Ctrl-X" {
+		t.Fatalf("final Stop writes = %#v, want Hold then Ctrl-X", writes)
+	}
+}
+
+func TestStopWinningBeforePauseWritePreventsLateHold(t *testing.T) {
+	controller, tr := newBlockingPauseController(t)
+	_, err := controller.StartDocumentProgram(context.Background(), 91, documentProgram(t, "stale-pause.gcode", "G1 X1\n"))
+	if err != nil {
+		t.Fatalf("StartDocumentProgram() error = %v", err)
+	}
+	waitForLineWrites(t, tr.fake, "G1 X1")
+	enterProgramDrain(t, controller, tr.fake)
+	controller.mu.Lock()
+	staleRun, transition, err := controller.beginPauseTransitionLocked()
+	controller.mu.Unlock()
+	if err != nil {
+		t.Fatalf("beginPauseTransitionLocked() error = %v", err)
+	}
+	if err := controller.StopProgram(context.Background()); err != nil {
+		t.Fatalf("StopProgram() error = %v", err)
+	}
+	replacementID, err := controller.StartDocumentProgram(context.Background(), 92, documentProgram(t, "replacement.gcode", "M5\n"))
+	if err != nil {
+		t.Fatalf("replacement StartDocumentProgram() error = %v", err)
+	}
+	holdsBefore := tr.holdWriteCount()
+	if err := controller.writeProgramActionForRun(context.Background(), staleRun, transition, grbl.ActionHold); !errors.Is(err, ErrCommandSessionCanceled) {
+		t.Fatalf("stale Pause write error = %v, want %v", err, ErrCommandSessionCanceled)
+	}
+	controller.mu.Lock()
+	controller.endPauseTransitionLocked(staleRun, transition)
+	controller.mu.Unlock()
+	if got := tr.holdWriteCount(); got != holdsBefore {
+		t.Fatalf("late Pause added Hold attempt: got %d, want %d", got, holdsBefore)
+	}
+	state := controller.Snapshot()
+	if state.ProgramStatus != ProgramRunning || state.ProgramRunID != replacementID || state.ProgramDocumentID != 92 {
+		t.Fatalf("late Pause changed replacement run: %+v", state)
+	}
+	if err := controller.StopProgram(context.Background()); err != nil {
+		t.Fatalf("replacement StopProgram() error = %v", err)
+	}
+}
+
+func TestPendingPauseCannotResurrectInterruptedRun(t *testing.T) {
+	tests := []struct {
+		name      string
+		interrupt func(*transport.FakeTransport)
+		wantEStop bool
+	}{
+		{name: "disconnect", interrupt: func(fake *transport.FakeTransport) { fake.InjectDisconnected() }},
+		{name: "emergency stop", interrupt: func(fake *transport.FakeTransport) { fake.InjectRX("ALARM:50") }, wantEStop: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			controller, tr := newBlockingPauseController(t)
+			runID, err := controller.StartDocumentProgram(context.Background(), 91, documentProgram(t, "interrupted-pause.gcode", "G1 X1\n"))
+			if err != nil {
+				t.Fatalf("StartDocumentProgram() error = %v", err)
+			}
+			waitForLineWrites(t, tr.fake, "G1 X1")
+			enterProgramDrain(t, controller, tr.fake)
+			holdStarted, releaseHold := tr.blockNextHold(nil)
+			pauseDone := make(chan error, 1)
+			go func() { pauseDone <- controller.PauseProgram(context.Background()) }()
+			<-holdStarted
+			controller.mu.RLock()
+			staleRun := controller.run
+			controller.mu.RUnlock()
+			tt.interrupt(tr.fake)
+			failed := waitForState(t, controller, func(state State) bool { return state.ProgramStatus == ProgramFailed })
+			if failed.ProgramRunID != runID || (tt.wantEStop && failed.EStopStatus != EStopActive) {
+				t.Fatalf("interrupted state = %+v", failed)
+			}
+			releaseHold()
+			<-pauseDone
+			controller.mu.RLock()
+			transition := staleRun.pauseTransition
+			controller.mu.RUnlock()
+			if transition != 0 {
+				t.Fatalf("interrupted Pause retained transition %d", transition)
+			}
+			if state := controller.Snapshot(); state.ProgramStatus != ProgramFailed || state.ProgramRunID != runID {
+				t.Fatalf("late Pause result changed terminal state: %+v", state)
+			}
+		})
+	}
 }
 
 func TestStopDuringFinalDrainPreventsLateCompletion(t *testing.T) {
