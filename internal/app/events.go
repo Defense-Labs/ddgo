@@ -10,6 +10,14 @@ type EventKind string
 
 type StateRevision uint64
 
+// DocumentID identifies the application document that originated a program
+// run. Zero is reserved for the legacy loaded-program workflow.
+type DocumentID uint64
+
+// RunID identifies one successfully admitted program execution. Run IDs are
+// allocated by a Controller and are never reused during its lifetime.
+type RunID uint64
+
 type ProgramStatus string
 
 type ConnectionStatus string
@@ -86,6 +94,8 @@ type State struct {
 	LastError               string
 	ProgramPath             string
 	ProgramName             string
+	ProgramDocumentID       DocumentID
+	ProgramRunID            RunID
 	ProgramStatus           ProgramStatus
 	ProgramTotal            int
 	ProgramComplete         int

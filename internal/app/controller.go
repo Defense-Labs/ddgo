@@ -30,6 +30,8 @@ var ErrControllerIOActive = errors.New("controller transport operation in progre
 var ErrEmergencyStop = errors.New("emergency stop")
 var ErrEmergencyStopActive = errors.New("emergency stop is active; machine commands are disabled")
 var ErrInvalidControllerLine = errors.New("controller command must contain exactly one physical line")
+var ErrDocumentIDRequired = errors.New("document ID is required")
+var ErrRunIDExhausted = errors.New("program run IDs exhausted")
 
 const defaultStatusPollInterval = 500 * time.Millisecond
 
@@ -96,6 +98,8 @@ const (
 
 type programRun struct {
 	program    gcode.Program
+	documentID DocumentID
+	runID      RunID
 	session    *responseSession
 	rxCh       chan string
 	queryRxCh  chan string
@@ -116,6 +120,7 @@ type Controller struct {
 	stateRevision                           StateRevision
 	loaded                                  gcode.Program
 	run                                     *programRun
+	nextRunID                               RunID
 	responseOwner                           responseOwner
 	expectedSilencePolicy                   expectedSilencePolicy
 	nextExpectedSilenceID                   expectedSilenceID
@@ -939,34 +944,79 @@ func actionProducesTerminalResponse(action grbl.Action) bool {
 }
 
 func (c *Controller) LoadProgramFile(path string) error {
+	return c.loadProgramFile(path, gcode.LoadFile)
+}
+
+func (c *Controller) loadProgramFile(path string, load func(string) (gcode.Program, error)) error {
 	if c.Snapshot().ProgramStatus.IsActive() {
 		c.emitError(ErrProgramActive)
 		return ErrProgramActive
 	}
-	prog, err := gcode.LoadFile(path)
+	prog, err := load(path)
 	if err != nil {
 		c.emitError(err)
 		return err
 	}
-	c.mu.Lock()
-	c.loaded = prog
-	c.state.ProgramPath = prog.Path
-	c.state.ProgramName = prog.Name
-	c.state.ProgramStatus = ProgramLoaded
-	c.state.ProgramTotal = len(prog.Lines)
-	c.state.ProgramComplete = 0
-	c.state.LastError = ""
-	snapshot := c.captureEventStateLocked()
-	c.mu.Unlock()
+	snapshot, err := c.commitLoadedProgram(prog)
+	if err != nil {
+		c.emitError(err)
+		return err
+	}
 	c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: snapshot.state, StateRevision: snapshot.revision, Text: fmt.Sprintf("loaded program %s (%d lines)", prog.Name, len(prog.Lines))}
 	return nil
 }
 
+// commitLoadedProgram revalidates the legacy load after file I/O. A program
+// start that wins the controller lock while the file is being read therefore
+// cannot have its execution snapshot or attribution replaced by the load.
+func (c *Controller) commitLoadedProgram(prog gcode.Program) (versionedState, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.run != nil || c.state.ProgramStatus.IsActive() {
+		return versionedState{}, ErrProgramActive
+	}
+	c.loaded = prog
+	c.state.ProgramPath = prog.Path
+	c.state.ProgramName = prog.Name
+	c.state.ProgramDocumentID = 0
+	c.state.ProgramRunID = 0
+	c.state.ProgramStatus = ProgramLoaded
+	c.state.ProgramTotal = len(prog.Lines)
+	c.state.ProgramComplete = 0
+	c.state.LastError = ""
+	return c.captureEventStateLocked(), nil
+}
+
 func (c *Controller) StartProgram(ctx context.Context) error {
+	_, err := c.startProgram(ctx, 0, nil)
+	return err
+}
+
+// StartDocumentProgram atomically admits an in-memory program snapshot with
+// the document that originated it. The returned RunID is nonzero only when
+// admission succeeds.
+func (c *Controller) StartDocumentProgram(ctx context.Context, documentID DocumentID, program gcode.Program) (RunID, error) {
+	if documentID == 0 {
+		c.emitError(ErrDocumentIDRequired)
+		return 0, ErrDocumentIDRequired
+	}
+	programSnapshot, err := program.Snapshot()
+	if err != nil {
+		c.emitError(err)
+		return 0, err
+	}
+	return c.startProgram(ctx, documentID, &programSnapshot)
+}
+
+// startProgram is the single program admission path. A nil suppliedProgram
+// selects the legacy loaded program while c.mu is held; a non-nil program is
+// already an independently owned document snapshot.
+func (c *Controller) startProgram(ctx context.Context, documentID DocumentID, suppliedProgram *gcode.Program) (RunID, error) {
 	var (
 		run      *programRun
 		runCtx   context.Context
 		snapshot versionedState
+		runID    RunID
 	)
 	err := c.withForegroundAdmission(ctx, func() error {
 		if err := c.admissionErrorLocked(admissionRealtime); err != nil {
@@ -981,8 +1031,21 @@ func (c *Controller) StartProgram(ctx context.Context) error {
 		if !c.state.IsConnected() {
 			return errors.New("connect to a machine before starting a program")
 		}
-		if len(c.loaded.Lines) == 0 {
-			return errors.New("load a program before starting")
+		var programSnapshot gcode.Program
+		if suppliedProgram == nil {
+			if len(c.loaded.Lines) == 0 {
+				return errors.New("load a program before starting")
+			}
+			var err error
+			programSnapshot, err = c.loaded.Snapshot()
+			if err != nil {
+				return err
+			}
+		} else {
+			programSnapshot = *suppliedProgram
+		}
+		if c.nextRunID == ^RunID(0) {
+			return ErrRunIDExhausted
 		}
 		var cancel context.CancelFunc
 		runCtx, cancel = context.WithCancel(ctx)
@@ -991,7 +1054,8 @@ func (c *Controller) StartProgram(ctx context.Context) error {
 			return err
 		}
 		run = &programRun{
-			program:    c.loaded,
+			program:    programSnapshot,
+			documentID: documentID,
 			rxCh:       make(chan string, 64),
 			cancel:     cancel,
 			generation: c.connectionGeneration,
@@ -1001,8 +1065,16 @@ func (c *Controller) StartProgram(ctx context.Context) error {
 			cancel()
 			return err
 		}
+		c.nextRunID++
+		runID = c.nextRunID
+		run.runID = runID
 		c.run = run
+		c.state.ProgramPath = run.program.Path
+		c.state.ProgramName = run.program.Name
+		c.state.ProgramDocumentID = run.documentID
+		c.state.ProgramRunID = run.runID
 		c.state.ProgramStatus = ProgramRunning
+		c.state.ProgramTotal = len(run.program.Lines)
 		c.state.ProgramComplete = 0
 		c.state.LastError = ""
 		c.contour.Disable()
@@ -1011,12 +1083,12 @@ func (c *Controller) StartProgram(ctx context.Context) error {
 	})
 	if err != nil {
 		c.emitError(err)
-		return err
+		return 0, err
 	}
 
 	c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: snapshot.state, StateRevision: snapshot.revision, Text: fmt.Sprintf("started program %s", run.program.Name)}
 	go c.runProgram(runCtx, run)
-	return nil
+	return runID, nil
 }
 
 func (c *Controller) PauseProgram(ctx context.Context) error {

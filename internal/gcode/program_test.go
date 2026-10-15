@@ -85,3 +85,61 @@ func TestLoadFile(t *testing.T) {
 		t.Fatalf("len(Lines) = %d, want %d", got, want)
 	}
 }
+
+func TestProgramFromDocumentUsesRetainedSource(t *testing.T) {
+	t.Parallel()
+
+	document := Document{
+		Name:   "memory.gcode",
+		Source: "(heading)\nG0 X1\n\nG1 Y2 ; move\n",
+	}
+	program, err := ProgramFromDocument(document)
+	if err != nil {
+		t.Fatalf("ProgramFromDocument() error = %v", err)
+	}
+	if program.Path != "" || program.Name != document.Name {
+		t.Fatalf("program metadata = path %q name %q", program.Path, program.Name)
+	}
+	want := []Line{
+		{Number: 2, Raw: "G0 X1", Text: "G0 X1"},
+		{Number: 4, Raw: "G1 Y2 ; move", Text: "G1 Y2"},
+	}
+	if !reflect.DeepEqual(program.Lines, want) {
+		t.Fatalf("program lines = %#v, want %#v", program.Lines, want)
+	}
+}
+
+func TestProgramSnapshotOwnsLineSlice(t *testing.T) {
+	t.Parallel()
+
+	original := Program{
+		Name:  "memory.gcode",
+		Lines: []Line{{Number: 7, Raw: "G0 X1", Text: "G0 X1"}},
+	}
+	snapshot, err := original.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	original.Lines[0] = Line{Number: 8, Raw: "G0 X9", Text: "G0 X9"}
+	original.Lines = append(original.Lines, Line{Number: 9, Raw: "M5", Text: "M5"})
+
+	want := []Line{{Number: 7, Raw: "G0 X1", Text: "G0 X1"}}
+	if !reflect.DeepEqual(snapshot.Lines, want) {
+		t.Fatalf("snapshot lines = %#v, want %#v", snapshot.Lines, want)
+	}
+}
+
+func TestProgramSnapshotRejectsInvalidPrograms(t *testing.T) {
+	t.Parallel()
+
+	tests := []Program{
+		{},
+		{Lines: []Line{{Number: 1, Text: "   "}}},
+		{Lines: []Line{{Number: 1, Text: "G0 X1\nG0 X2"}}},
+	}
+	for _, program := range tests {
+		if _, err := program.Snapshot(); err == nil {
+			t.Fatalf("Snapshot(%#v) error = nil, want non-nil", program)
+		}
+	}
+}

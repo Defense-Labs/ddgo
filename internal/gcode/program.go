@@ -21,6 +21,38 @@ type Program struct {
 	Lines []Line
 }
 
+// ProgramFromDocument parses the source already retained by a document. It
+// does not reread Document.Path, so pathless documents and future packaged
+// documents can provide executable programs from their in-memory source.
+func ProgramFromDocument(document Document) (Program, error) {
+	lines, err := Parse(document.Source)
+	if err != nil {
+		return Program{}, err
+	}
+	return Program{
+		Path:  document.Path,
+		Name:  document.Name,
+		Lines: lines,
+	}, nil
+}
+
+// Snapshot returns an independently owned, validated execution snapshot.
+// Line strings are immutable; copying the slice prevents callers from
+// replacing or reordering instructions after a run has been admitted.
+func (p Program) Snapshot() (Program, error) {
+	if len(p.Lines) == 0 {
+		return Program{}, errors.New("program contains no runnable gcode lines")
+	}
+	lines := make([]Line, len(p.Lines))
+	copy(lines, p.Lines)
+	for _, line := range lines {
+		if strings.TrimSpace(line.Text) == "" || strings.ContainsAny(line.Text, "\r\n") {
+			return Program{}, errors.New("program contains an invalid executable line")
+		}
+	}
+	return Program{Path: p.Path, Name: p.Name, Lines: lines}, nil
+}
+
 func LoadFile(path string) (Program, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
