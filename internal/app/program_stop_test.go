@@ -384,6 +384,117 @@ func TestStopAcceptsResetAssociatedAlarm3OnlyAfterResetWrite(t *testing.T) {
 	}
 }
 
+func TestDuplicateResetAssociatedAlarm3InvalidatesStopVerification(t *testing.T) {
+	controller, fake, runID := startSingleLineDocumentRun(t)
+	fake.SetResponding(false)
+	done := make(chan error, 1)
+	go func() { done <- controller.StopProgram(context.Background()) }()
+	waitForDisplayWrite(t, fake, "Ctrl-X")
+
+	fake.InjectRX("ALARM:3") // The one reset-associated allowance.
+	fake.InjectRX("ALARM:3") // Duplicate feedback is not ambiguous-safe.
+	fake.InjectRX("Grbl 1.1g [help:'$']")
+	fake.InjectRX("<Idle|MPos:0,0,0>")
+	if err := <-done; err == nil {
+		t.Fatal("StopProgram() succeeded after duplicate ALARM:3")
+	}
+	state := controller.Snapshot()
+	if state.ProgramStatus != ProgramFailed || state.MachineReadiness != MachineReadinessRecoveryRequired || state.ProgramRunID != runID {
+		t.Fatalf("duplicate ALARM:3 state = %+v", state)
+	}
+}
+
+func TestResetAssociatedAlarm3AfterBannerInvalidatesStopVerification(t *testing.T) {
+	controller, fake, _ := startSingleLineDocumentRun(t)
+	fake.SetResponding(false)
+	statusBefore := countStatusWrites(fake.Written())
+	done := make(chan error, 1)
+	go func() { done <- controller.StopProgram(context.Background()) }()
+	waitForDisplayWrite(t, fake, "Ctrl-X")
+	fake.InjectRX("ALARM:3")
+	fake.InjectRX("Grbl 1.1g [help:'$']")
+	// The status request can only be sent after the banner event has closed the
+	// allowance under the controller mutex.
+	waitForStatusWritesAfter(t, fake, statusBefore)
+	fake.InjectRX("ALARM:3")
+	fake.InjectRX("<Idle|MPos:0,0,0>")
+	if err := <-done; err == nil {
+		t.Fatal("StopProgram() succeeded after late ALARM:3")
+	}
+	if state := controller.Snapshot(); state.ProgramStatus != ProgramFailed || state.MachineReadiness != MachineReadinessRecoveryRequired {
+		t.Fatalf("late ALARM:3 state = %+v", state)
+	}
+}
+
+func TestAlarm3AfterBannerCannotUseUnconsumedResetAllowance(t *testing.T) {
+	controller, fake, _ := startSingleLineDocumentRun(t)
+	fake.SetResponding(false)
+	statusBefore := countStatusWrites(fake.Written())
+	done := make(chan error, 1)
+	go func() { done <- controller.StopProgram(context.Background()) }()
+	waitForDisplayWrite(t, fake, "Ctrl-X")
+	fake.InjectRX("Grbl 1.1g [help:'$']")
+	waitForStatusWritesAfter(t, fake, statusBefore)
+	fake.InjectRX("ALARM:3")
+	fake.InjectRX("<Idle|MPos:0,0,0>")
+	if err := <-done; err == nil {
+		t.Fatal("StopProgram() succeeded when ALARM:3 arrived after banner")
+	}
+	if state := controller.Snapshot(); state.ProgramStatus != ProgramFailed || state.MachineReadiness != MachineReadinessRecoveryRequired {
+		t.Fatalf("post-banner ALARM:3 state = %+v", state)
+	}
+}
+
+func TestAlarm3BeforeStopResetWriteInvalidatesVerification(t *testing.T) {
+	fake := transport.NewFakeTransport()
+	tr := &blockingStopWriteTransport{fake: fake, started: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() {
+		select {
+		case <-tr.release:
+		default:
+			close(tr.release)
+		}
+	})
+	controller := NewController(tr, nil)
+	controller.statusPollInterval = time.Hour
+	if err := controller.Connect(context.Background(), transport.DefaultPortConfig("fake")); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	_, err := controller.StartDocumentProgram(context.Background(), 91, documentProgram(t, "before-reset-alarm.gcode", "M5\n"))
+	if err != nil {
+		t.Fatalf("StartDocumentProgram() error = %v", err)
+	}
+	waitForLineWrites(t, fake, "M5")
+	done := make(chan error, 1)
+	go func() { done <- controller.StopProgram(context.Background()) }()
+	<-tr.started // The Hold write is blocking; Ctrl-X has not begun.
+	fake.InjectRX("ALARM:3")
+	waitForEventText(t, controller.Events(), EventConsoleRX, "ALARM:3")
+	close(tr.release)
+	if err := <-done; err == nil {
+		t.Fatal("StopProgram() succeeded after ALARM:3 before Ctrl-X")
+	}
+	if state := controller.Snapshot(); state.ProgramStatus != ProgramFailed || state.MachineReadiness != MachineReadinessRecoveryRequired {
+		t.Fatalf("pre-reset ALARM:3 state = %+v", state)
+	}
+}
+
+func TestStaleGenerationAlarm3CannotConsumeCurrentStopAllowance(t *testing.T) {
+	controller, fake, _ := startSingleLineDocumentRun(t)
+	fake.SetResponding(false)
+	statusBefore := countStatusWrites(fake.Written())
+	done := make(chan error, 1)
+	go func() { done <- controller.StopProgram(context.Background()) }()
+	waitForDisplayWrite(t, fake, "Ctrl-X")
+	fake.InjectRXForGeneration(fake.Generation()+1, "ALARM:3")
+	fake.InjectRX("Grbl 1.1g [help:'$']")
+	waitForStatusWritesAfter(t, fake, statusBefore)
+	fake.InjectRX("<Idle|MPos:0,0,0>")
+	if err := <-done; err != nil {
+		t.Fatalf("StopProgram() error after stale ALARM:3 = %v", err)
+	}
+}
+
 func TestUnexpectedAlarmAfterResetAssociatedAlarm3InvalidatesVerification(t *testing.T) {
 	controller, fake, runID := startSingleLineDocumentRun(t)
 	fake.SetResponding(false)

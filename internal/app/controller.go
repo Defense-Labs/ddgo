@@ -2110,6 +2110,7 @@ func (c *Controller) runTransportEventBridge() {
 				if bannerAt.After(c.lastStartupBannerAt) {
 					c.lastStartupBannerAt = bannerAt
 				}
+				c.noteStopResetBannerLocked(ev.Generation, c.startupBannerRevision, bannerAt)
 				close(c.startupBannerChanged)
 				c.startupBannerChanged = make(chan struct{})
 			}

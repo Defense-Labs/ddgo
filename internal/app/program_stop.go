@@ -26,6 +26,10 @@ type programStopOperation struct {
 	verificationInvalidated bool
 	verificationErr         error
 	resetWriteIssued        bool
+	resetBannerBaseline     uint64
+	resetStartedAt          time.Time
+	resetBannerObserved     bool
+	resetAlarm3Consumed     bool
 }
 
 // noteStopVerificationAlarmLocked records every current-generation alarm,
@@ -35,13 +39,15 @@ func (c *Controller) noteStopVerificationAlarmLocked(generation transport.Connec
 	if generation == 0 || generation != c.connectionGeneration {
 		return
 	}
-	// GG3's mc_reset() deliberately raises EXEC_ALARM_ABORT_CYCLE (ALARM:3)
-	// when Ctrl-X interrupts motion. Accept only that reset-associated report
-	// from the active Stop coordinator; banner and fresh-Idle verification still
-	// remain mandatory, and every other alarm invalidates the attempt.
+	// GG3's mc_reset() may raise EXEC_ALARM_ABORT_CYCLE (ALARM:3) when Ctrl-X
+	// interrupts motion. Admit exactly one such standalone response for this
+	// Stop, and only until the reset's qualifying banner is processed. The
+	// banner and fresh-Idle verification remain mandatory.
 	if alarmCode == 3 {
 		if op := c.stopOperation; op != nil && !op.completed && !op.invalidated &&
-			op.generation == generation && op.resetWriteIssued {
+			!op.verificationInvalidated && op.generation == generation && op.resetWriteIssued &&
+			!op.resetBannerObserved && !op.resetAlarm3Consumed {
+			op.resetAlarm3Consumed = true
 			return
 		}
 	}
@@ -63,7 +69,22 @@ func (c *Controller) markStopResetWriteIssued(op *programStopOperation) bool {
 		return false
 	}
 	op.resetWriteIssued = true
+	op.resetBannerBaseline = c.startupBannerRevision
+	op.resetStartedAt = c.now()
 	return true
+}
+
+// noteStopResetBannerLocked closes the one-use ALARM:3 allowance as soon as
+// the current Stop's qualifying reset banner is processed, rather than when
+// its waiting goroutine later observes the notification.
+func (c *Controller) noteStopResetBannerLocked(generation transport.ConnectionGeneration, revision uint64, at time.Time) {
+	op := c.stopOperation
+	if op == nil || op.completed || op.invalidated || op.generation != generation || !op.resetWriteIssued {
+		return
+	}
+	if revision > op.resetBannerBaseline && !at.Before(op.resetStartedAt) {
+		op.resetBannerObserved = true
+	}
 }
 
 func (c *Controller) stopVerificationErrorLocked(op *programStopOperation) error {
@@ -178,8 +199,6 @@ func (c *Controller) executeProgramStop(op *programStopOperation) {
 	}
 	c.mu.RLock()
 	stopStillCurrent := c.stopOperation == op && c.run == op.run && c.connectionGeneration == op.generation && !op.invalidated
-	bannerBaseline := c.startupBannerRevision
-	resetStartedAt := c.now()
 	c.mu.RUnlock()
 	if !stopStillCurrent {
 		return
@@ -224,7 +243,7 @@ func (c *Controller) executeProgramStop(op *programStopOperation) {
 	c.events <- Event{Kind: EventStateChanged, When: time.Now(), State: verifying.state, StateRevision: verifying.revision, Text: "verifying controller after program reset"}
 
 	bannerCtx, cancelBanner := context.WithTimeout(context.Background(), c.stopResetBannerTimeout)
-	err = c.waitForStartupBannerAfter(bannerCtx, op, bannerBaseline, resetStartedAt)
+	err = c.waitForStartupBannerAfter(bannerCtx, op)
 	cancelBanner()
 	if err != nil {
 		c.failProgramStop(op, fmt.Errorf("%w: %v", errResetBannerNotObserved, err))
@@ -259,7 +278,7 @@ func (c *Controller) writeStopActionBounded(ctx context.Context, action grbl.Act
 	}
 }
 
-func (c *Controller) waitForStartupBannerAfter(ctx context.Context, op *programStopOperation, baseline uint64, notBefore time.Time) error {
+func (c *Controller) waitForStartupBannerAfter(ctx context.Context, op *programStopOperation) error {
 	for {
 		c.mu.RLock()
 		generation := op.generation
@@ -271,12 +290,11 @@ func (c *Controller) waitForStartupBannerAfter(ctx context.Context, op *programS
 			c.mu.RUnlock()
 			return err
 		}
-		revision := c.startupBannerRevision
-		bannerAt := c.lastStartupBannerAt
+		bannerObserved := op.resetBannerObserved
 		changed := c.startupBannerChanged
 		alarmChanged := c.alarmChanged
 		c.mu.RUnlock()
-		if revision > baseline && !bannerAt.Before(notBefore) {
+		if bannerObserved {
 			return nil
 		}
 		select {
