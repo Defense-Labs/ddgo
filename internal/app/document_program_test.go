@@ -80,6 +80,29 @@ func TestStartDocumentProgramUsesAtomicSnapshotAndRetainsIdentity(t *testing.T) 
 	}
 }
 
+func TestStopProgramRunRejectsStaleDocumentOrRunWithoutStoppingCurrentExecution(t *testing.T) {
+	controller, fake := newConnectedDocumentProgramController(t)
+	runID, err := controller.StartDocumentProgram(context.Background(), 81, documentProgram(t, "run-aware-stop.gcode", "G1 X1\n"))
+	if err != nil {
+		t.Fatalf("StartDocumentProgram() error = %v", err)
+	}
+	waitForLineWrites(t, fake, "G1 X1")
+	writesBefore := len(fake.Written())
+	if err := controller.StopProgramRun(context.Background(), 82, runID); !errors.Is(err, ErrProgramRunMismatch) {
+		t.Fatalf("StopProgramRun(wrong document) error = %v, want %v", err, ErrProgramRunMismatch)
+	}
+	if err := controller.StopProgramRun(context.Background(), 81, runID+1); !errors.Is(err, ErrProgramRunMismatch) {
+		t.Fatalf("StopProgramRun(wrong run) error = %v, want %v", err, ErrProgramRunMismatch)
+	}
+	state := controller.Snapshot()
+	if state.ProgramStatus != ProgramRunning || state.ProgramDocumentID != 81 || state.ProgramRunID != runID {
+		t.Fatalf("stale stop altered active execution: %+v", state)
+	}
+	if got := len(fake.Written()); got != writesBefore {
+		t.Fatalf("stale stop wrote %d messages, want %d", got-writesBefore, 0)
+	}
+}
+
 func TestDocumentProgramRunIDsAreUniqueAndRevisionsDistinguishRuns(t *testing.T) {
 	controller, fake := newConnectedDocumentProgramController(t)
 	program := documentProgram(t, "repeat.gcode", "M5\n")

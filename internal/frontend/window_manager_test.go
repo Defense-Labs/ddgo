@@ -111,3 +111,16 @@ func TestWindowManagerRetainsLargeArbitraryCountAndRemovesAll(t *testing.T) {
 		t.Fatalf("managed = %d after closing all; want 0", manager.len())
 	}
 }
+
+func TestWindowManagerCloseHookRunsOnlyAfterOneActualRemoval(t *testing.T) {
+	t.Parallel()
+	manager, _ := newTestWindowManager(app.State{})
+	window := &fakeApplicationWindow{}
+	called := 0
+	manager.AddWithClose(window, func() { called++ })
+	window.close()
+	window.close()
+	if called != 1 || manager.len() != 0 {
+		t.Fatalf("close hook calls=%d managed=%d, want 1 and 0", called, manager.len())
+	}
+}

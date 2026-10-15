@@ -17,9 +17,10 @@ type GCodeWindow struct {
 	toolpathPlaceholder *qt.QWidget
 	executionPanel      *qt.QGroupBox
 
-	onClose       func()
-	onOpen        func()
-	closeNotified bool
+	onClose        func()
+	onOpen         func()
+	onCloseRequest func() bool
+	closeNotified  bool
 }
 
 func newGCodeWindow(document gcode.Document, onOpen func()) *GCodeWindow {
@@ -53,6 +54,10 @@ func newGCodeWindow(document gcode.Document, onOpen func()) *GCodeWindow {
 		}
 	})
 	w.window.OnCloseEvent(func(super func(*qt.QCloseEvent), event *qt.QCloseEvent) {
+		if w.onCloseRequest != nil && !w.onCloseRequest() {
+			event.SetAccepted(false)
+			return
+		}
 		super(event)
 		if event.IsAccepted() && !w.closeNotified {
 			w.closeNotified = true
@@ -96,7 +101,14 @@ func newExecutionPanel() *qt.QGroupBox {
 	return panel
 }
 
-func (w *GCodeWindow) show()                { w.window.Show() }
-func (w *GCodeWindow) SetOnClose(fn func()) { w.onClose = fn }
+func (w *GCodeWindow) show()                            { w.window.Show() }
+func (w *GCodeWindow) SetOnClose(fn func())             { w.onClose = fn }
+func (w *GCodeWindow) SetOnCloseRequest(fn func() bool) { w.onCloseRequest = fn }
+func (w *GCodeWindow) Focus() {
+	w.window.ShowNormal()
+	w.window.Raise()
+	w.window.ActivateWindow()
+}
+func (w *GCodeWindow) Close()               { w.window.Close() }
 func (w *GCodeWindow) ApplyState(app.State) {}
 func (w *GCodeWindow) ApplyEvent(app.Event) {}

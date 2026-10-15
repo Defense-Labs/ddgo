@@ -35,7 +35,19 @@ func (m *WindowManager) Add(window ApplicationWindow) {
 	m.add(window)
 }
 
+// AddWithClose is Add with an application-owned close hook. The hook runs
+// only after the window manager has removed the window and its event view.
+// It lets a higher-level owner (such as the document registry) keep its
+// logical lifetime synchronized with the native top-level window lifetime.
+func (m *WindowManager) AddWithClose(window ApplicationWindow, afterClose func()) {
+	m.addWithClose(window, afterClose)
+}
+
 func (m *WindowManager) add(window ApplicationWindow) windowID {
+	return m.addWithClose(window, nil)
+}
+
+func (m *WindowManager) addWithClose(window ApplicationWindow, afterClose func()) windowID {
 	if m.windows == nil {
 		m.windows = make(map[windowID]managedWindow)
 	}
@@ -44,17 +56,22 @@ func (m *WindowManager) add(window ApplicationWindow) windowID {
 	id := m.nextID
 	viewID := m.dispatcher.Register(window)
 	m.windows[id] = managedWindow{window: window, viewID: viewID}
-	window.SetOnClose(func() { m.remove(id) })
+	window.SetOnClose(func() {
+		if m.remove(id) && afterClose != nil {
+			afterClose()
+		}
+	})
 	return id
 }
 
-func (m *WindowManager) remove(id windowID) {
+func (m *WindowManager) remove(id windowID) bool {
 	managed, ok := m.windows[id]
 	if !ok {
-		return
+		return false
 	}
 	delete(m.windows, id)
 	m.dispatcher.Unregister(managed.viewID)
+	return true
 }
 
 func (m *WindowManager) len() int { return len(m.windows) }

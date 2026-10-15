@@ -14,10 +14,11 @@ import (
 )
 
 type MainWindow struct {
-	controller    *app.Controller
-	onOpen        func()
-	onClose       func()
-	closeNotified bool
+	controller     *app.Controller
+	onOpen         func()
+	onClose        func()
+	onCloseRequest func() bool
+	closeNotified  bool
 
 	window *qt.QMainWindow
 
@@ -96,6 +97,10 @@ func (w *MainWindow) build() {
 		}
 	})
 	w.window.OnCloseEvent(func(super func(*qt.QCloseEvent), event *qt.QCloseEvent) {
+		if w.onCloseRequest != nil && !w.onCloseRequest() {
+			event.SetAccepted(false)
+			return
+		}
 		super(event)
 		if event.IsAccepted() && !w.closeNotified {
 			w.closeNotified = true
@@ -351,7 +356,9 @@ func (w *MainWindow) build() {
 
 func (w *MainWindow) show() { w.window.Show() }
 
-func (w *MainWindow) SetOnClose(fn func()) { w.onClose = fn }
+func (w *MainWindow) SetOnClose(fn func())             { w.onClose = fn }
+func (w *MainWindow) SetOnCloseRequest(fn func() bool) { w.onCloseRequest = fn }
+func (w *MainWindow) Close()                           { w.window.Close() }
 
 func (w *MainWindow) bind() {
 	w.sendButton.OnClicked(func() { w.sendCommand() })

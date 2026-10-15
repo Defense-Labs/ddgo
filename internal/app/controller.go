@@ -32,6 +32,10 @@ var ErrEmergencyStopActive = errors.New("emergency stop is active; machine comma
 var ErrInvalidControllerLine = errors.New("controller command must contain exactly one physical line")
 var ErrDocumentIDRequired = errors.New("document ID is required")
 var ErrRunIDExhausted = errors.New("program run IDs exhausted")
+
+// ErrProgramRunMismatch means a run-aware operation was requested for an
+// execution that is no longer the controller's current program run.
+var ErrProgramRunMismatch = errors.New("program run no longer matches the requested document and run ID")
 var ErrPauseInProgress = errors.New("program pause is already in progress")
 var ErrStopInProgress = errors.New("program stop is already in progress")
 var ErrMachineNotReady = errors.New("machine execution readiness has not been established")
@@ -1367,7 +1371,24 @@ func (c *Controller) writeProgramActionForRun(ctx context.Context, run *programR
 	return c.transport.Write(ctx, msg)
 }
 
+// StopProgram stops whichever active program owns execution when the request
+// is admitted. Legacy callers retain this behavior.
 func (c *Controller) StopProgram(ctx context.Context) error {
+	return c.stopProgram(ctx, 0, 0, false)
+}
+
+// StopProgramRun stops exactly the specified document execution. It is used
+// by document-lifecycle operations so a delayed close callback cannot stop a
+// newer run that has replaced the one it originally observed.
+func (c *Controller) StopProgramRun(ctx context.Context, documentID DocumentID, runID RunID) error {
+	if documentID == 0 || runID == 0 {
+		c.emitError(ErrProgramRunMismatch)
+		return ErrProgramRunMismatch
+	}
+	return c.stopProgram(ctx, documentID, runID, true)
+}
+
+func (c *Controller) stopProgram(ctx context.Context, documentID DocumentID, runID RunID, requireRunMatch bool) error {
 	if err := ctx.Err(); err != nil {
 		c.emitError(err)
 		return err
@@ -1384,6 +1405,11 @@ func (c *Controller) StopProgram(ctx context.Context) error {
 		err := errors.New("program is not running")
 		c.emitError(err)
 		return err
+	}
+	if requireRunMatch && (run.documentID != documentID || run.runID != runID) {
+		c.mu.Unlock()
+		c.emitError(ErrProgramRunMismatch)
+		return ErrProgramRunMismatch
 	}
 	c.nextStopOperationID++
 	if c.nextStopOperationID == 0 {
