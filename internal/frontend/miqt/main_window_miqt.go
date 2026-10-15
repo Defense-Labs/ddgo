@@ -358,7 +358,7 @@ func (w *MainWindow) show() { w.window.Show() }
 
 func (w *MainWindow) SetOnClose(fn func())             { w.onClose = fn }
 func (w *MainWindow) SetOnCloseRequest(fn func() bool) { w.onCloseRequest = fn }
-func (w *MainWindow) Close()                           { w.window.Close() }
+func (w *MainWindow) Close() bool                      { return w.window.Close() }
 
 func (w *MainWindow) bind() {
 	w.sendButton.OnClicked(func() { w.sendCommand() })

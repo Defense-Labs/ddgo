@@ -16,7 +16,7 @@ import (
 type DocumentWindow interface {
 	ApplicationWindow
 	Focus()
-	Close()
+	Close() bool
 }
 
 // DocumentEntry is one currently open file-backed document. Its ID is an

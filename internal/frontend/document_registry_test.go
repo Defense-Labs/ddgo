@@ -16,7 +16,10 @@ type fakeDocumentWindow struct {
 }
 
 func (w *fakeDocumentWindow) Focus() { w.focused++ }
-func (w *fakeDocumentWindow) Close() { w.close() }
+func (w *fakeDocumentWindow) Close() bool {
+	w.close()
+	return true
+}
 
 func newTestDocumentRegistry(t *testing.T) (*DocumentRegistry, *WindowManager) {
 	t.Helper()
@@ -26,7 +29,12 @@ func newTestDocumentRegistry(t *testing.T) (*DocumentRegistry, *WindowManager) {
 
 func writeDocument(t *testing.T, name, source string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), name)
+	return writeDocumentInDir(t, t.TempDir(), name, source)
+}
+
+func writeDocumentInDir(t *testing.T, dir, name, source string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
 		t.Fatalf("WriteFile(%q): %v", path, err)
 	}
@@ -59,7 +67,19 @@ func TestDocumentRegistryOpensOneDocumentWithStableIdentity(t *testing.T) {
 
 func TestDocumentRegistryDuplicateFocusesWithoutReloading(t *testing.T) {
 	registry, manager := newTestDocumentRegistry(t)
-	path := writeDocument(t, "duplicate.gcode", "G0 X1\n")
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep this fixture on the package working directory's volume. Windows
+	// filepath.Rel correctly rejects paths crossing drives, while t.TempDir()
+	// may be on a different drive in CI.
+	fixtureDir, err := os.MkdirTemp(cwd, ".document-registry-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(fixtureDir) })
+	path := writeDocumentInDir(t, fixtureDir, "duplicate.gcode", "G0 X1\n")
 	loads := 0
 	load := func(path string) (gcode.Document, error) {
 		loads++
@@ -71,10 +91,6 @@ func TestDocumentRegistryDuplicateFocusesWithoutReloading(t *testing.T) {
 		t.Fatalf("first OpenFile() = (%v, %v)", opened, err)
 	}
 	if err := os.WriteFile(path, []byte("G0 X99\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cwd, err := os.Getwd()
-	if err != nil {
 		t.Fatal(err)
 	}
 	relativePath, err := filepath.Rel(cwd, path)

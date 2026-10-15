@@ -1377,11 +1377,12 @@ func (c *Controller) StopProgram(ctx context.Context) error {
 	return c.stopProgram(ctx, 0, 0, false)
 }
 
-// StopProgramRun stops exactly the specified document execution. It is used
-// by document-lifecycle operations so a delayed close callback cannot stop a
-// newer run that has replaced the one it originally observed.
+// StopProgramRun stops exactly the specified execution. A zero DocumentID is
+// valid for the legacy loaded-program workflow. It is used by document and
+// shutdown lifecycle operations so a delayed callback cannot stop a newer run
+// that has replaced the one it originally observed.
 func (c *Controller) StopProgramRun(ctx context.Context, documentID DocumentID, runID RunID) error {
-	if documentID == 0 || runID == 0 {
+	if runID == 0 {
 		c.emitError(ErrProgramRunMismatch)
 		return ErrProgramRunMismatch
 	}

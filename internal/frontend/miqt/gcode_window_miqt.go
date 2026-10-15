@@ -109,6 +109,6 @@ func (w *GCodeWindow) Focus() {
 	w.window.Raise()
 	w.window.ActivateWindow()
 }
-func (w *GCodeWindow) Close()               { w.window.Close() }
+func (w *GCodeWindow) Close() bool          { return w.window.Close() }
 func (w *GCodeWindow) ApplyState(app.State) {}
 func (w *GCodeWindow) ApplyEvent(app.Event) {}

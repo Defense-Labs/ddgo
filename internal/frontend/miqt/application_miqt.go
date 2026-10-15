@@ -4,6 +4,7 @@ package miqt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
@@ -22,15 +23,15 @@ type Application struct {
 	dispatcher *frontend.ViewDispatcher
 	windows    *frontend.WindowManager
 	documents  *frontend.DocumentRegistry
+	mainWindow *MainWindow
 
 	pendingDocumentCloses  map[app.DocumentID]app.RunID
 	approvedDocumentCloses map[app.DocumentID]bool
 	documentCloseResults   chan documentCloseResult
-	pendingMainStop        bool
-	mainStopResults        chan error
-	shutdownRequested      bool
-	mainCloseApproved      bool
-	mainWindow             *MainWindow
+
+	shutdown            frontend.ShutdownCoordinator
+	shutdownStopResults chan shutdownStopResult
+	mainCloseIssued     bool
 }
 
 type documentCloseResult struct {
@@ -39,14 +40,18 @@ type documentCloseResult struct {
 	err        error
 }
 
+type shutdownStopResult struct {
+	attempt frontend.ShutdownAttemptID
+	target  frontend.ShutdownStopTarget
+	err     error
+}
+
 func newApplication(controller *app.Controller) *Application {
 	return &Application{controller: controller}
 }
 
 // Run creates and runs the UI application.
-func Run(controller *app.Controller) error {
-	return newApplication(controller).Run()
-}
+func Run(controller *app.Controller) error { return newApplication(controller).Run() }
 
 func (a *Application) Run() error {
 	qt.NewQApplication(os.Args)
@@ -59,7 +64,7 @@ func (a *Application) Run() error {
 	a.pendingDocumentCloses = make(map[app.DocumentID]app.RunID)
 	a.approvedDocumentCloses = make(map[app.DocumentID]bool)
 	a.documentCloseResults = make(chan documentCloseResult, 16)
-	a.mainStopResults = make(chan error, 1)
+	a.shutdownStopResults = make(chan shutdownStopResult, 2)
 
 	mainWindow := newMainWindow(a.controller, func() { a.openGCodeFile() })
 	a.mainWindow = mainWindow
@@ -106,15 +111,22 @@ func (a *Application) drainControllerEvents() {
 			a.dispatcher.Dispatch(event)
 		default:
 			a.drainDocumentCloseResults()
-			a.drainMainStopResults()
+			a.drainShutdownStopResults()
+			a.progressShutdown()
 			return
 		}
 	}
 }
 
+// requestDocumentClose governs independent document closure. An application
+// shutdown is the sole closer while its coordinator is active, preventing a
+// second document Stop request or an accidental partial shutdown.
 func (a *Application) requestDocumentClose(id app.DocumentID) bool {
 	if a.approvedDocumentCloses[id] {
 		return true
+	}
+	if a.shutdown.Active() {
+		return a.shutdown.AllowsDocumentClose(a.shutdown.Attempt(), id)
 	}
 	entry, ok := a.documents.Entry(id)
 	if !ok {
@@ -127,10 +139,7 @@ func (a *Application) requestDocumentClose(id app.DocumentID) bool {
 	if !state.ProgramStatus.IsActive() || state.ProgramDocumentID != id {
 		return true
 	}
-	if !confirmStopAndClose(documentParent(entry)) {
-		return false
-	}
-	if !a.documents.MarkClosePending(id) {
+	if !confirmStopAndClose(documentParent(entry)) || !a.documents.MarkClosePending(id) {
 		return false
 	}
 	runID := state.ProgramRunID
@@ -157,16 +166,15 @@ func (a *Application) drainDocumentCloseResults() {
 				state.ProgramStatus != app.ProgramStopped || state.MachineReadiness != app.MachineReadinessNormal {
 				a.documents.ClearClosePending(result.documentID)
 				if stillOpen {
-					reason := "the program could not be stopped safely; the document remains open for recovery"
-					if result.err != nil {
-						reason = reason + ": " + result.err.Error()
-					}
-					qt.QMessageBox_Warning(documentParent(entry), "Program Still Active", reason)
+					a.warnDocumentStopFailure(entry, result.err)
 				}
 				continue
 			}
 			a.approvedDocumentCloses[result.documentID] = true
-			entry.Window.Close()
+			if !entry.Window.Close() {
+				delete(a.approvedDocumentCloses, result.documentID)
+				a.warnDocumentStopFailure(entry, nil)
+			}
 		default:
 			return
 		}
@@ -176,81 +184,164 @@ func (a *Application) drainDocumentCloseResults() {
 func (a *Application) documentClosed(entry frontend.DocumentEntry) {
 	delete(a.pendingDocumentCloses, entry.ID)
 	delete(a.approvedDocumentCloses, entry.ID)
-	if a.shutdownRequested {
-		a.maybeFinishShutdown()
+	// Do not close the main window here: this callback runs inside native
+	// document destruction. The next UI timer turn advances the coordinator.
+	if a.shutdown.Active() {
+		a.shutdown.DocumentClosed(a.shutdown.Attempt(), entry.ID)
 	}
 }
 
 func (a *Application) requestMainClose() bool {
-	if a.mainCloseApproved {
+	if a.mainCloseIssued {
 		return true
+	}
+	if a.shutdown.Active() {
+		return false
 	}
 	state := a.controller.Snapshot()
 	if state.MachineReadiness != app.MachineReadinessNormal {
-		qt.QMessageBox_Warning(a.mainWindow.window.QWidget, "Machine Recovery Required", "DDGo has not verified the controller's safe condition. Complete recovery before exiting.")
+		a.warnMain("Machine Recovery Required", "DDGo has not verified the controller's safe condition. Complete recovery before exiting.")
 		return false
 	}
-	if a.documents.Len() > 0 {
-		if !a.shutdownRequested {
-			answer := qt.QMessageBox_Question(a.mainWindow.window.QWidget, "Close DDGo?", "Close all open documents and exit DDGo?")
-			if answer != qt.QMessageBox__Yes {
-				return false
-			}
-			a.shutdownRequested = true
-		}
-		for _, entry := range a.documents.Entries() {
-			entry.Window.Close()
-		}
-		a.maybeFinishShutdown()
-		return false
+
+	documents := a.documents.Entries()
+	documentIDs := make([]app.DocumentID, 0, len(documents))
+	for _, entry := range documents {
+		documentIDs = append(documentIDs, entry.ID)
 	}
+	target := frontend.ShutdownStopTarget{}
 	if state.ProgramStatus.IsActive() {
-		if !confirmStopAndClose(a.mainWindow.window.QWidget) {
+		target = frontend.ShutdownStopTarget{DocumentID: state.ProgramDocumentID, RunID: state.ProgramRunID}
+	}
+	attempt, ok := a.shutdown.Begin(documentIDs, target)
+	if !ok {
+		return false
+	}
+	if !confirmApplicationClose(a.mainParent(), len(documentIDs)) {
+		a.shutdown.ConfirmApplication(attempt, false)
+		return false
+	}
+	phase := a.shutdown.ConfirmApplication(attempt, true)
+	if phase == frontend.ShutdownWaitingForStopConfirmation {
+		if !confirmStopAndClose(a.mainParent()) {
+			a.shutdown.ConfirmStop(attempt, false)
 			return false
 		}
-		a.pendingMainStop = true
-		go func() { a.mainStopResults <- a.controller.StopProgram(context.Background()) }()
-		return false
+		if target, ok := a.shutdown.ConfirmStop(attempt, true); ok {
+			a.startShutdownStop(attempt, target)
+		}
 	}
-	a.mainCloseApproved = true
-	return true
+	// Closing is always progressed on a later timer turn, never recursively
+	// from this native main-window close event.
+	return false
 }
 
-func (a *Application) drainMainStopResults() {
-	if !a.pendingMainStop {
-		return
-	}
-	select {
-	case err := <-a.mainStopResults:
-		a.pendingMainStop = false
-		if err != nil || a.controller.Snapshot().MachineReadiness != app.MachineReadinessNormal {
-			reason := "the legacy program could not be stopped safely; DDGo remains open for recovery"
-			if err != nil {
-				reason += ": " + err.Error()
+func (a *Application) startShutdownStop(attempt frontend.ShutdownAttemptID, target frontend.ShutdownStopTarget) {
+	go func() {
+		err := a.controller.StopProgramRun(context.Background(), target.DocumentID, target.RunID)
+		a.shutdownStopResults <- shutdownStopResult{attempt: attempt, target: target, err: err}
+	}()
+}
+
+func (a *Application) drainShutdownStopResults() {
+	for {
+		select {
+		case result := <-a.shutdownStopResults:
+			if result.attempt != a.shutdown.Attempt() || a.shutdown.Phase() != frontend.ShutdownWaitingForStop {
+				continue
 			}
-			qt.QMessageBox_Warning(a.mainWindow.window.QWidget, "Program Still Active", reason)
+			if errors.Is(result.err, app.ErrStopInProgress) {
+				a.shutdown.StopAlreadyInProgress(result.attempt, result.target)
+				continue
+			}
+			state := a.controller.Snapshot()
+			verified := result.err == nil && state.ProgramStatus == app.ProgramStopped && state.MachineReadiness == app.MachineReadinessNormal &&
+				state.ProgramDocumentID == result.target.DocumentID && state.ProgramRunID == result.target.RunID
+			if !a.shutdown.StopResult(result.attempt, result.target, verified) {
+				a.warnMain("Program Stop Failed", stopFailureText(result.err))
+			}
+		default:
 			return
 		}
-		a.mainCloseApproved = true
-		a.mainWindow.Close()
-	default:
 	}
 }
 
-func (a *Application) maybeFinishShutdown() {
-	if !a.shutdownRequested || a.documents.Len() != 0 || a.pendingMainStop {
+func (a *Application) progressShutdown() {
+	if !a.shutdown.Active() || a.mainCloseIssued {
 		return
 	}
+	attempt := a.shutdown.Attempt()
 	state := a.controller.Snapshot()
-	if state.ProgramStatus.IsActive() || state.MachineReadiness != app.MachineReadinessNormal {
+	if a.shutdown.Phase() == frontend.ShutdownWaitingForStop {
+		if a.shutdown.ObserveExternalStop(state) {
+			return
+		}
+		if state.ProgramStatus == app.ProgramFailed || state.MachineReadiness == app.MachineReadinessRecoveryRequired {
+			a.shutdown.Cancel(attempt)
+			a.warnMain("Program Stop Failed", "The active program did not reach a verified stopped state. DDGo remains open for recovery.")
+		}
 		return
 	}
-	a.mainCloseApproved = true
-	a.mainWindow.Close()
+	if a.shutdown.Phase() == frontend.ShutdownClosingDocuments {
+		if state.ProgramStatus.IsActive() || state.MachineReadiness != app.MachineReadinessNormal {
+			a.shutdown.Cancel(attempt)
+			a.warnMain("Shutdown Cancelled", "Controller execution or machine recovery became active before documents could close.")
+			return
+		}
+		id, ok := a.shutdown.NextDocumentToClose(attempt)
+		if !ok {
+			return
+		}
+		entry, exists := a.documents.Entry(id)
+		if !exists {
+			a.shutdown.DocumentClosed(attempt, id)
+			return
+		}
+		if !entry.Window.Close() {
+			a.shutdown.DocumentCloseRejected(attempt, id)
+			a.warnMain("Shutdown Cancelled", "A document refused to close. DDGo remains open.")
+		}
+		return
+	}
+	if a.shutdown.Phase() == frontend.ShutdownReadyToCloseMain {
+		if a.documents.Len() != 0 || state.ProgramStatus.IsActive() || state.MachineReadiness != app.MachineReadinessNormal {
+			a.shutdown.Cancel(attempt)
+			a.warnMain("Shutdown Cancelled", "DDGo state changed before final shutdown could be verified.")
+			return
+		}
+		if a.shutdown.CommitMainClose(attempt) {
+			// Commit first; WA_DeleteOnClose means no later callback may safely
+			// invoke this window again.
+			a.mainCloseIssued = true
+			mainWindow := a.mainWindow
+			a.mainWindow = nil
+			mainWindow.Close()
+		}
+	}
 }
 
-// confirmStopAndClose is modal only for the user decision. It never waits for
-// controller I/O; Stop completion returns through Application's UI timer.
+func (a *Application) mainParent() *qt.QWidget {
+	if a.mainWindow == nil {
+		return nil
+	}
+	return a.mainWindow.window.QWidget
+}
+
+func (a *Application) warnMain(title, text string) {
+	qt.QMessageBox_Warning(a.mainParent(), title, text)
+}
+
+func (a *Application) warnDocumentStopFailure(entry frontend.DocumentEntry, err error) {
+	qt.QMessageBox_Warning(documentParent(entry), "Program Still Active", stopFailureText(err))
+}
+
+func stopFailureText(err error) string {
+	if err != nil {
+		return "The program could not be stopped safely; DDGo remains open for recovery: " + err.Error()
+	}
+	return "The program did not reach a verified stopped state; DDGo remains open for recovery."
+}
+
 func documentParent(entry frontend.DocumentEntry) *qt.QWidget {
 	if window, ok := entry.Window.(*GCodeWindow); ok {
 		return window.window.QWidget
@@ -258,8 +349,18 @@ func documentParent(entry frontend.DocumentEntry) *qt.QWidget {
 	return nil
 }
 
+// Dialogs are modal only for user choices. Controller Stop completion is
+// asynchronous and returns through the application's regular UI timer.
+func confirmApplicationClose(parent *qt.QWidget, documentCount int) bool {
+	message := "Exit DDGo?"
+	if documentCount > 0 {
+		message = "Close all open documents and exit DDGo?"
+	}
+	return qt.QMessageBox_Question(parent, "Close DDGo?", message) == qt.QMessageBox__Yes
+}
+
 func confirmStopAndClose(parent *qt.QWidget) bool {
-	box := qt.NewQMessageBox3(qt.QMessageBox__Warning, "Program Is Still Executing", "This document owns an active program. Stop the program safely before closing?")
+	box := qt.NewQMessageBox3(qt.QMessageBox__Warning, "Program Is Still Executing", "Stop the active program safely before closing?")
 	box.SetParent(parent)
 	stop := box.AddButton2("Stop Program and Close", qt.QMessageBox__DestructiveRole)
 	cancel := box.AddButton2("Cancel", qt.QMessageBox__RejectRole)

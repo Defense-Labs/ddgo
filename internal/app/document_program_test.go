@@ -103,6 +103,33 @@ func TestStopProgramRunRejectsStaleDocumentOrRunWithoutStoppingCurrentExecution(
 	}
 }
 
+func TestStopProgramRunSupportsExactLegacyRunIdentity(t *testing.T) {
+	controller, fake := newConnectedDocumentProgramController(t)
+	if err := controller.LoadProgramFile(writeProgramFile(t, "legacy-stop.gcode", "G1 X1\n")); err != nil {
+		t.Fatalf("LoadProgramFile() error = %v", err)
+	}
+	if err := controller.StartProgram(context.Background()); err != nil {
+		t.Fatalf("StartProgram() error = %v", err)
+	}
+	waitForLineWrites(t, fake, "G1 X1")
+	runID := controller.Snapshot().ProgramRunID
+	if runID == 0 {
+		t.Fatal("legacy RunID = 0")
+	}
+	done := make(chan error, 1)
+	go func() { done <- controller.StopProgramRun(context.Background(), 0, runID) }()
+	waitForDisplayWrite(t, fake, "Ctrl-X")
+	fake.InjectRX("Grbl 1.1g [help:'$']")
+	waitForFinalDrainStatusRequest(t, controller)
+	fake.InjectRX("<Idle|MPos:0,0,0>")
+	if err := <-done; err != nil {
+		t.Fatalf("StopProgramRun(legacy) error = %v", err)
+	}
+	if state := controller.Snapshot(); state.ProgramStatus != ProgramStopped || state.ProgramDocumentID != 0 || state.ProgramRunID != runID {
+		t.Fatalf("legacy stopped state = %+v", state)
+	}
+}
+
 func TestDocumentProgramRunIDsAreUniqueAndRevisionsDistinguishRuns(t *testing.T) {
 	controller, fake := newConnectedDocumentProgramController(t)
 	program := documentProgram(t, "repeat.gcode", "M5\n")
