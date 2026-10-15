@@ -1568,6 +1568,7 @@ func TestDDGoProgramFailureThenSuccessfulRunAgainstMock(t *testing.T) {
 	})
 	requestStatus(t, controller)
 	requireControllerIdle(t, controller)
+	recoverFailedProgramAgainstMock(t, controller, m)
 
 	successPath := writeIntegrationProgramFile(t, "success-after-failure.gcode", "$G\n")
 	if err := controller.LoadProgramFile(successPath); err != nil {
@@ -1776,7 +1777,7 @@ func TestDDGoProgramControlsRejectAfterFailureAgainstMock(t *testing.T) {
 
 	controllerEventsAfter = h.eventCount()
 	err = controller.ResumeProgram(ctx)
-	requireProgramControlError(t, h, controllerEventsAfter, err, "program is not paused")
+	requireProgramControlError(t, h, controllerEventsAfter, err, app.ErrMachineNotReady.Error())
 
 	controllerEventsAfter = h.eventCount()
 	err = controller.StopProgram(ctx)
@@ -2239,6 +2240,7 @@ func TestDDGoProgramTimeoutFailureThenSuccessfulRunAgainstMock(t *testing.T) {
 	requireProgramFailedWithError(t, controller, "context deadline exceeded")
 	requestStatus(t, controller)
 	requireControllerIdle(t, controller)
+	recoverFailedProgramAgainstMock(t, controller, m)
 
 	recoveryPath := writeIntegrationProgramFile(t, "program-timeout-recovery.gcode", "$I\n")
 	if err := controller.LoadProgramFile(recoveryPath); err != nil {
@@ -2614,6 +2616,7 @@ func TestDDGoProgramFailsWhenWCSWriteRejectedAgainstMock(t *testing.T) {
 	if idle.ProgramStatus != app.ProgramFailed {
 		t.Fatalf("final status = %+v after failure %+v, want ProgramFailed", idle, failed)
 	}
+	recoverFailedProgramAgainstMock(t, controller, m)
 
 	controller.SetMotionRewriter(nil)
 	recoveryPath := writeIntegrationProgramFile(t, "program-after-wcs-rejection.gcode", "$I\n")
@@ -2939,6 +2942,7 @@ func TestDDGoDefaultM101FailurePreventsNextLineAgainstMock(t *testing.T) {
 	assertNoNewMockCommandContainingFor(t, m, eventsAfter, 300*time.Millisecond, "$G", "M101")
 	requestStatus(t, controller)
 	requireControllerIdle(t, controller)
+	recoverFailedProgramAgainstMock(t, controller, m)
 
 	recoveryResponses := mockResponseCount(t, m)
 	startLoadedProgram(t, controller, "m101-failure-recovery.gcode", "$I\n")
@@ -3090,6 +3094,7 @@ func TestDDGoRunProbeControllerErrorFailsAndRecoversAgainstMock(t *testing.T) {
 		t.Fatalf("rejected probe stored LastProbePoint %+v", point)
 	}
 	assertNoNewMockCommandContainingFor(t, m, eventsAfter, 250*time.Millisecond, "$G")
+	recoverFailedProgramAgainstMock(t, controller, m)
 
 	recoveryResponses := mockResponseCount(t, m)
 	startLoadedProgram(t, controller, "probe-error-recovery.gcode", "$I\n")
@@ -4118,21 +4123,7 @@ func requireProgramCompletedClean(t *testing.T, c *app.Controller, total int) ap
 
 func requireUnlockAndRecoveryProgram(t *testing.T, controller *app.Controller, m *mockProcess, programName string) {
 	t.Helper()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	eventsAfter, responsesAfter := mockEventCount(t, m), mockResponseCount(t, m)
-	if err := controller.Action(ctx, grbl.ActionUnlock); err != nil {
-		t.Fatalf("unlock after alarm: %v", err)
-	}
-	waitForNewMockEvents(t, m, eventsAfter, 5*time.Second, func(events []mockLogEntry) bool {
-		return hasMockLogEntry(events, "command", "$X")
-	})
-	waitForNewMockResponses(t, m, responsesAfter, 5*time.Second, func(responses []mockLogEntry) bool {
-		return hasMockResponse(responses, "ok")
-	})
-	requestStatus(t, controller)
-	requireControllerIdle(t, controller)
+	recoverFailedProgramAgainstMock(t, controller, m)
 
 	path := writeIntegrationProgramFile(t, programName, "$I\n")
 	if err := controller.LoadProgramFile(path); err != nil {
@@ -4140,7 +4131,7 @@ func requireUnlockAndRecoveryProgram(t *testing.T, controller *app.Controller, m
 	}
 	requireLoadedProgram(t, controller, programName, 1)
 
-	responsesAfter = mockResponseCount(t, m)
+	responsesAfter := mockResponseCount(t, m)
 	runCtx, runCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer runCancel()
 	if err := controller.StartProgram(runCtx); err != nil {
@@ -4152,6 +4143,83 @@ func requireUnlockAndRecoveryProgram(t *testing.T, controller *app.Controller, m
 	requireProgramCompletedClean(t, controller, 1)
 	requestStatus(t, controller)
 	requireControllerIdle(t, controller)
+}
+
+// recoverFailedProgramAgainstMock exercises the public recovery path. A
+// program failure leaves controller work potentially pending, so an explicit
+// disconnect/reconnect and fresh current-generation Idle—not an ordinary
+// status request—are required before another run can start.
+func recoverFailedProgramAgainstMock(t *testing.T, controller *app.Controller, m *mockProcess) {
+	t.Helper()
+
+	failed := controller.Snapshot()
+	if failed.ProgramStatus != app.ProgramFailed || failed.MachineReadiness != app.MachineReadinessRecoveryRequired {
+		t.Fatalf("failed program is not recovery-gated: %+v", failed)
+	}
+	if failed.ProgramRunID == 0 || failed.ProgramError == "" {
+		t.Fatalf("failed program lost run attribution: %+v", failed)
+	}
+	runID, programError := failed.ProgramRunID, failed.ProgramError
+
+	blockedCtx, cancelBlocked := context.WithTimeout(context.Background(), 2*time.Second)
+	err := controller.StartProgram(blockedCtx)
+	cancelBlocked()
+	if !errors.Is(err, app.ErrMachineNotReady) {
+		t.Fatalf("start while recovery is required = %v, want %v", err, app.ErrMachineNotReady)
+	}
+	blocked := controller.Snapshot()
+	if blocked.ProgramStatus != app.ProgramFailed || blocked.ProgramRunID != runID || blocked.ProgramError != programError ||
+		blocked.MachineReadiness != app.MachineReadinessRecoveryRequired {
+		t.Fatalf("blocked start changed failed-run attribution: before=%+v after=%+v", failed, blocked)
+	}
+
+	if strings.EqualFold(failed.MachineState, "Alarm") {
+		eventsAfter, responsesAfter := mockEventCount(t, m), mockResponseCount(t, m)
+		unlockCtx, cancelUnlock := context.WithTimeout(context.Background(), 2*time.Second)
+		err = controller.Action(unlockCtx, grbl.ActionUnlock)
+		cancelUnlock()
+		if err != nil {
+			t.Fatalf("unlock ordinary alarm during recovery: %v", err)
+		}
+		waitForNewMockEvents(t, m, eventsAfter, 5*time.Second, func(events []mockLogEntry) bool {
+			return hasMockLogEntry(events, "command", "$X")
+		})
+		waitForNewMockResponses(t, m, responsesAfter, 5*time.Second, func(responses []mockLogEntry) bool {
+			return hasMockResponse(responses, "ok")
+		})
+		unlocked := controller.Snapshot()
+		if unlocked.MachineReadiness != app.MachineReadinessRecoveryRequired {
+			t.Fatalf("unlock incorrectly cleared recovery requirement: %+v", unlocked)
+		}
+	}
+
+	responsesBeforeReconnect := mockResponseCount(t, m)
+	if err := controller.Disconnect(); err != nil {
+		t.Fatalf("disconnect for validated recovery: %v", err)
+	}
+	disconnected := controller.Snapshot()
+	if disconnected.IsConnected() || disconnected.MachineReadiness != app.MachineReadinessRecoveryRequired {
+		t.Fatalf("disconnect cleared recovery requirement: %+v", disconnected)
+	}
+	// The MockGRBL PTY deliberately re-arms a sentinel serial peer and emits a
+	// startup banner between clients. Wait for that reset boundary before the
+	// new controller generation opens the stable slave path.
+	waitForNewMockResponses(t, m, responsesBeforeReconnect, 5*time.Second, func(responses []mockLogEntry) bool {
+		return hasMockResponse(responses, "Grbl ")
+	})
+
+	connectCtx, cancelConnect := context.WithTimeout(context.Background(), 5*time.Second)
+	err = controller.Connect(connectCtx, transport.DefaultPortConfig(m.SerialPath))
+	cancelConnect()
+	if err != nil {
+		t.Fatalf("reconnect for validated recovery: %v", err)
+	}
+	ready := waitForControllerState(t, controller, 5*time.Second, func(state app.State) bool {
+		return state.IsConnected() && state.MachineReadiness == app.MachineReadinessNormal && state.MachineState == "Idle"
+	})
+	if ready.ProgramStatus != app.ProgramFailed || ready.ProgramRunID != runID || ready.ProgramError != programError {
+		t.Fatalf("validated recovery changed or resumed failed program: before=%+v after=%+v", failed, ready)
+	}
 }
 
 func programStatusIsAny(status app.ProgramStatus, allowed ...app.ProgramStatus) bool {

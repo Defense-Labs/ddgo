@@ -1,6 +1,10 @@
 package frontend
 
-import "github.com/ianbruene/ddgo/internal/app"
+import (
+	"strings"
+
+	"github.com/ianbruene/ddgo/internal/app"
+)
 
 type MainWindowControlState struct {
 	RefreshPortsEnabled  bool
@@ -27,6 +31,7 @@ func MainWindowControls(state app.State) MainWindowControlState {
 	machineReady := state.MachineReadiness == app.MachineReadinessNormal
 	machineRecoveryRequired := state.MachineReadiness == app.MachineReadinessRecoveryRequired
 	recovering := state.EStopStatus == app.EStopRecovery
+	ordinaryAlarmRecovery := machineRecoveryRequired && strings.EqualFold(state.MachineState, "Alarm")
 	loaded := state.ProgramTotal > 0
 
 	canManual := connected && safetyClear && machineReady && !programActive
@@ -46,7 +51,7 @@ func MainWindowControls(state app.State) MainWindowControlState {
 
 		ManualControlsEnabled: canManual,
 		UnlockEnabled: canManual ||
-			(connected && recovering && !programActive),
+			(connected && !programActive && (recovering || ordinaryAlarmRecovery)),
 		ResetEnabled: canManual ||
 			(connected && (recovering || machineRecoveryRequired) && !programActive),
 		JogToEndEnabled: canManual && state.HasMachinePosition,

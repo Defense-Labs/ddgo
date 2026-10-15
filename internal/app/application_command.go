@@ -159,6 +159,9 @@ func (c *Controller) admissionErrorLocked(request admissionKind) error {
 	if c.connectionTransition != connectionStable {
 		return ErrConnectionTransition
 	}
+	if request == admissionRecoveryUnlock {
+		return c.unlockAdmissionErrorLocked()
+	}
 	if c.state.MachineReadiness != MachineReadinessNormal {
 		switch request {
 		case admissionConnect, admissionDisconnect, admissionStatusPoll, admissionRecoveryManual, admissionRecoveryRealtime, admissionSafetyRealtime, admissionStop:
@@ -216,6 +219,37 @@ func (c *Controller) admissionErrorLocked(request admissionKind) error {
 		requested = responseOwnerInteractiveMacro
 	}
 	return c.responseOwnerBusyErrorLocked(requested)
+}
+
+// unlockAdmissionErrorLocked gives only the explicit $X action a narrow path
+// through RecoveryRequired for an observed ordinary GRBL Alarm. It does not
+// establish readiness; reconnect plus a fresh Idle remains required.
+func (c *Controller) unlockAdmissionErrorLocked() error {
+	if c.stopOperation != nil {
+		return ErrStopInProgress
+	}
+	if c.realtimeWriteActive {
+		return ErrControllerIOActive
+	}
+	if c.run != nil || c.state.ProgramStatus.IsActive() {
+		return ErrProgramActive
+	}
+	if c.state.EStopStatus != EStopClear && c.state.EStopStatus != EStopRecovery {
+		return ErrEmergencyStopActive
+	}
+	if c.state.EStopStatus == EStopRecovery {
+		return c.responseOwnerBusyErrorLocked(responseOwnerManualLine)
+	}
+	if c.state.MachineReadiness == MachineReadinessNormal {
+		return c.responseOwnerBusyErrorLocked(responseOwnerManualLine)
+	}
+	if c.state.MachineReadiness == MachineReadinessRecoveryRequired && strings.EqualFold(c.state.MachineState, "Alarm") {
+		return c.responseOwnerBusyErrorLocked(responseOwnerManualLine)
+	}
+	if c.state.MachineReadinessReason == "" {
+		return ErrMachineNotReady
+	}
+	return fmt.Errorf("%w: %s", ErrMachineNotReady, c.state.MachineReadinessReason)
 }
 
 func (c *Controller) responseOwnerBusyErrorLocked(requested responseOwnerKind) error {

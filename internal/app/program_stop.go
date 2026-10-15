@@ -25,14 +25,25 @@ type programStopOperation struct {
 	invalidated             bool
 	verificationInvalidated bool
 	verificationErr         error
+	resetWriteIssued        bool
 }
 
 // noteStopVerificationAlarmLocked records every current-generation alarm,
 // including standalone ALARM:n feedback. A later Idle cannot prove readiness
 // for a reset attempt once the firmware has reported an alarm.
-func (c *Controller) noteStopVerificationAlarmLocked(generation transport.ConnectionGeneration, err error) {
+func (c *Controller) noteStopVerificationAlarmLocked(generation transport.ConnectionGeneration, alarmCode int, err error) {
 	if generation == 0 || generation != c.connectionGeneration {
 		return
+	}
+	// GG3's mc_reset() deliberately raises EXEC_ALARM_ABORT_CYCLE (ALARM:3)
+	// when Ctrl-X interrupts motion. Accept only that reset-associated report
+	// from the active Stop coordinator; banner and fresh-Idle verification still
+	// remain mandatory, and every other alarm invalidates the attempt.
+	if alarmCode == 3 {
+		if op := c.stopOperation; op != nil && !op.completed && !op.invalidated &&
+			op.generation == generation && op.resetWriteIssued {
+			return
+		}
 	}
 	c.alarmRevision++
 	close(c.alarmChanged)
@@ -43,6 +54,16 @@ func (c *Controller) noteStopVerificationAlarmLocked(generation transport.Connec
 			op.verificationErr = err
 		}
 	}
+}
+
+func (c *Controller) markStopResetWriteIssued(op *programStopOperation) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopOperation != op || c.run != op.run || c.connectionGeneration != op.generation || op.invalidated {
+		return false
+	}
+	op.resetWriteIssued = true
+	return true
 }
 
 func (c *Controller) stopVerificationErrorLocked(op *programStopOperation) error {
@@ -161,6 +182,9 @@ func (c *Controller) executeProgramStop(op *programStopOperation) {
 	resetStartedAt := c.now()
 	c.mu.RUnlock()
 	if !stopStillCurrent {
+		return
+	}
+	if !c.markStopResetWriteIssued(op) {
 		return
 	}
 	writeCtx, cancelWrite = context.WithTimeout(context.Background(), c.stopTransportTimeout)

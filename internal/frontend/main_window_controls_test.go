@@ -140,6 +140,26 @@ func TestMainWindowControls(t *testing.T) {
 			},
 		},
 		{
+			name: "ordinary alarm recovery permits unlock only",
+			state: app.State{
+				ConnectionStatus: app.ConnectionConnected,
+				EStopStatus:      app.EStopClear,
+				MachineState:     "Alarm",
+				ProgramStatus:    app.ProgramFailed,
+				MachineReadiness: app.MachineReadinessRecoveryRequired,
+				ProgramTotal:     10,
+			},
+			want: MainWindowControlState{
+				RefreshPortsEnabled:  true,
+				ConnectEnabled:       true,
+				PortSelectionEnabled: true,
+				ProgramPathEnabled:   true,
+				BrowseProgramEnabled: true,
+				UnlockEnabled:        true,
+				ResetEnabled:         true,
+			},
+		},
+		{
 			name: "E-stop active",
 			state: app.State{
 				ConnectionStatus: app.ConnectionConnected,

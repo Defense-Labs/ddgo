@@ -116,12 +116,24 @@ func main() {
 }
 
 func armSerialClient(slave string, ptm io.Writer, ctl *mockgrbl.Controller, responseDelay time.Duration) (*os.File, error) {
-	heldSlave, err := os.OpenFile(slave, os.O_RDWR, 0)
-	if err != nil {
-		return nil, fmt.Errorf("open sentinel slave %q: %w", slave, err)
+	// Closing the serial peer can briefly leave a PTY slave busy while the
+	// kernel releases its prior line discipline. Reconnect is an intentional
+	// integration path, so tolerate that transient rather than terminating the
+	// mock process between a controller Disconnect and its next Connect.
+	var heldSlave *os.File
+	var err error
+	for attempt := 0; attempt < 100; attempt++ {
+		heldSlave, err = os.OpenFile(slave, os.O_RDWR, 0)
+		if err == nil {
+			writeResponses(ptm, ctl.Connect(), responseDelay)
+			return heldSlave, nil
+		}
+		if !errors.Is(err, syscall.EBUSY) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	writeResponses(ptm, ctl.Connect(), responseDelay)
-	return heldSlave, nil
+	return nil, fmt.Errorf("open sentinel slave %q: %w", slave, err)
 }
 
 func parseFloatTripleFlag(name, raw string) ([3]float64, bool, error) {

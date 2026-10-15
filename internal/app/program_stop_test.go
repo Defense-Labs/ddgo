@@ -338,6 +338,9 @@ func TestGenericSoftResetCannotOverlapProgramStop(t *testing.T) {
 	if err := controller.SoftReset(context.Background()); !errors.Is(err, ErrStopInProgress) {
 		t.Fatalf("SoftReset() during Stop error = %v, want %v", err, ErrStopInProgress)
 	}
+	if err := controller.Action(context.Background(), grbl.ActionUnlock); !errors.Is(err, ErrStopInProgress) {
+		t.Fatalf("Unlock during Stop error = %v, want %v", err, ErrStopInProgress)
+	}
 	resets := 0
 	for _, msg := range fake.Written() {
 		if msg.Display == "Ctrl-X" {
@@ -354,6 +357,49 @@ func TestGenericSoftResetCannotOverlapProgramStop(t *testing.T) {
 	fake.InjectRX("<Idle|MPos:0,0,0>")
 	if err := <-done; err != nil {
 		t.Fatalf("StopProgram() error = %v", err)
+	}
+}
+
+func TestStopAcceptsResetAssociatedAlarm3OnlyAfterResetWrite(t *testing.T) {
+	controller, fake, runID := startSingleLineDocumentRun(t)
+	fake.SetResponding(false)
+	statusBefore := countStatusWrites(fake.Written())
+	done := make(chan error, 1)
+	go func() { done <- controller.StopProgram(context.Background()) }()
+	waitForDisplayWrite(t, fake, "Ctrl-X")
+
+	// GG3 mc_reset() reports EXEC_ALARM_ABORT_CYCLE (ALARM:3) when Ctrl-X
+	// interrupts motion. It is not readiness evidence by itself: the startup
+	// banner and a current Idle report are still required below.
+	fake.InjectRX("ALARM:3")
+	fake.InjectRX("Grbl 1.1g [help:'$']")
+	waitForStatusWritesAfter(t, fake, statusBefore)
+	fake.InjectRX("<Idle|MPos:0,0,0>")
+	if err := <-done; err != nil {
+		t.Fatalf("StopProgram() error after reset-associated ALARM:3 = %v", err)
+	}
+	state := controller.Snapshot()
+	if state.ProgramStatus != ProgramStopped || state.MachineReadiness != MachineReadinessNormal || state.ProgramRunID != runID {
+		t.Fatalf("ALARM:3 reset stop state = %+v", state)
+	}
+}
+
+func TestUnexpectedAlarmAfterResetAssociatedAlarm3InvalidatesVerification(t *testing.T) {
+	controller, fake, runID := startSingleLineDocumentRun(t)
+	fake.SetResponding(false)
+	done := make(chan error, 1)
+	go func() { done <- controller.StopProgram(context.Background()) }()
+	waitForDisplayWrite(t, fake, "Ctrl-X")
+	fake.InjectRX("ALARM:3")
+	fake.InjectRX("ALARM:1")
+	fake.InjectRX("Grbl 1.1g [help:'$']")
+	fake.InjectRX("<Idle|MPos:0,0,0>")
+	if err := <-done; err == nil {
+		t.Fatal("StopProgram() succeeded after unexpected ALARM:1")
+	}
+	state := controller.Snapshot()
+	if state.ProgramStatus != ProgramFailed || state.MachineReadiness != MachineReadinessRecoveryRequired || state.ProgramRunID != runID {
+		t.Fatalf("ALARM:3 then ALARM:1 state = %+v", state)
 	}
 }
 
@@ -478,5 +524,29 @@ func TestProgramFailureBlocksUnsafeAdmissionUntilValidatedReconnect(t *testing.T
 	reconnectAndConfirmReadiness(t, controller, fake)
 	if err := controller.SendConsoleLine(context.Background(), "M5"); err != nil {
 		t.Fatalf("manual command after recovery error = %v", err)
+	}
+}
+
+func TestUnlockPermittedOnlyForOrdinaryAlarmRecovery(t *testing.T) {
+	controller, fake := newConnectedResetController(t)
+	controller.mu.Lock()
+	controller.state.ProgramStatus = ProgramFailed
+	controller.state.ProgramRunID = 77
+	controller.state.ProgramError = "program failed at line 1: ALARM:1"
+	controller.state.MachineState = "Alarm"
+	controller.requireMachineRecoveryLocked("program failed with controller work potentially pending")
+	controller.mu.Unlock()
+
+	if err := controller.Action(context.Background(), grbl.ActionUnlock); err != nil {
+		t.Fatalf("Unlock() during ordinary alarm recovery error = %v", err)
+	}
+	waitForDisplayWrite(t, fake, "$X")
+	fake.InjectRX("ok")
+	waitForState(t, controller, func(state State) bool { return state.MachineReadiness == MachineReadinessRecoveryRequired })
+	if err := controller.SendConsoleLine(context.Background(), "M5"); !errors.Is(err, ErrMachineNotReady) {
+		t.Fatalf("manual command after Unlock error = %v, want %v", err, ErrMachineNotReady)
+	}
+	if _, err := controller.StartDocumentProgram(context.Background(), 78, documentProgram(t, "blocked.gcode", "M5\n")); !errors.Is(err, ErrMachineNotReady) {
+		t.Fatalf("program start after Unlock error = %v, want %v", err, ErrMachineNotReady)
 	}
 }

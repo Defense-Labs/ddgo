@@ -96,6 +96,7 @@ const (
 	admissionDisconnect
 	admissionSafetyRealtime
 	admissionStop
+	admissionRecoveryUnlock
 )
 
 type realtimeWriteOwner uint8
@@ -860,11 +861,7 @@ func (c *Controller) Action(ctx context.Context, action grbl.Action) error {
 		}
 		request := admissionManual
 		if action == grbl.ActionUnlock {
-			c.mu.RLock()
-			if c.state.EStopStatus == EStopRecovery {
-				request = admissionRecoveryManual
-			}
-			c.mu.RUnlock()
+			request = admissionRecoveryUnlock
 		}
 		return c.writeManualResponseMessageForAdmission(ctx, msg, request)
 	}
@@ -2102,7 +2099,7 @@ func (c *Controller) runTransportEventBridge() {
 			c.noteControllerActivityLocked(ev.Generation, ev.When)
 			alarmCode, standaloneAlarm := grbl.ParseAlarm(ev.Text)
 			if standaloneAlarm {
-				c.noteStopVerificationAlarmLocked(ev.Generation, fmt.Errorf("controller reported ALARM:%d during reset verification", alarmCode))
+				c.noteStopVerificationAlarmLocked(ev.Generation, alarmCode, fmt.Errorf("controller reported ALARM:%d during reset verification", alarmCode))
 			}
 			if _, ok := grbl.ParseStartupBanner(ev.Text); ok {
 				c.startupBannerRevision++
@@ -2129,7 +2126,7 @@ func (c *Controller) runTransportEventBridge() {
 			if report, ok := grbl.ParseStatusReport(ev.Text); ok {
 				statusReport = true
 				if strings.EqualFold(strings.TrimSpace(report.State), "Alarm") {
-					c.noteStopVerificationAlarmLocked(ev.Generation, errors.New("controller reported Alarm status during reset verification"))
+					c.noteStopVerificationAlarmLocked(ev.Generation, 0, errors.New("controller reported Alarm status during reset verification"))
 				}
 				if c.pendingQuietStatusReports > 0 {
 					c.pendingQuietStatusReports--
