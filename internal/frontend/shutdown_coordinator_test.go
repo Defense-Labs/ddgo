@@ -9,11 +9,26 @@ import (
 func beginShutdown(t *testing.T, documents []app.DocumentID, target ShutdownStopTarget) (*ShutdownCoordinator, ShutdownAttemptID) {
 	t.Helper()
 	var coordinator ShutdownCoordinator
-	attempt, ok := coordinator.Begin(documents, target)
+	attempt, ok := coordinator.Begin(documents)
 	if !ok || attempt == 0 {
 		t.Fatalf("Begin() = %d, %v", attempt, ok)
 	}
 	return &coordinator, attempt
+}
+
+func resolveRunAdmission(coordinator *ShutdownCoordinator, attempt ShutdownAttemptID, target ShutdownStopTarget) ShutdownPhase {
+	state := app.State{MachineReadiness: app.MachineReadinessNormal}
+	if target.RunID != 0 {
+		state.ProgramDocumentID = target.DocumentID
+		state.ProgramRunID = target.RunID
+		state.ProgramStatus = app.ProgramRunning
+	}
+	return coordinator.ResolveRunAdmission(attempt, state)
+}
+
+func confirmShutdown(coordinator *ShutdownCoordinator, attempt ShutdownAttemptID, target ShutdownStopTarget) ShutdownPhase {
+	coordinator.ConfirmApplication(attempt, true)
+	return resolveRunAdmission(coordinator, attempt, target)
 }
 
 func TestShutdownCoordinatorCancelledConfirmationCannotResume(t *testing.T) {
@@ -24,14 +39,14 @@ func TestShutdownCoordinatorCancelledConfirmationCannotResume(t *testing.T) {
 	if _, ok := coordinator.NextDocumentToClose(attempt); ok || coordinator.DocumentClosed(attempt, 1) || coordinator.CommitMainClose(attempt) {
 		t.Fatal("cancelled attempt still accepted shutdown work")
 	}
-	if next, ok := coordinator.Begin([]app.DocumentID{1}, ShutdownStopTarget{}); !ok || next == attempt {
+	if next, ok := coordinator.Begin([]app.DocumentID{1}); !ok || next == attempt {
 		t.Fatalf("new attempt = %d, %v after cancellation", next, ok)
 	}
 }
 
 func TestShutdownCoordinatorEmptyApplicationCommitsOneMainClose(t *testing.T) {
 	coordinator, attempt := beginShutdown(t, nil, ShutdownStopTarget{})
-	if phase := coordinator.ConfirmApplication(attempt, true); phase != ShutdownClosingDocuments {
+	if phase := confirmShutdown(coordinator, attempt, ShutdownStopTarget{}); phase != ShutdownClosingDocuments {
 		t.Fatalf("empty confirmation phase = %v", phase)
 	}
 	if _, ok := coordinator.NextDocumentToClose(attempt); ok || coordinator.Phase() != ShutdownReadyToCloseMain {
@@ -42,10 +57,66 @@ func TestShutdownCoordinatorEmptyApplicationCommitsOneMainClose(t *testing.T) {
 	}
 }
 
+func TestShutdownCoordinatorWaitsForFreshRunAdmissionState(t *testing.T) {
+	coordinator, attempt := beginShutdown(t, []app.DocumentID{8}, ShutdownStopTarget{})
+	if phase := coordinator.ConfirmApplication(attempt, true); phase != ShutdownWaitingForRunAdmission {
+		t.Fatalf("confirmation phase = %v, want waiting for run admission", phase)
+	}
+	if _, ok := coordinator.NextDocumentToClose(attempt); ok {
+		t.Fatal("document closure began before run admission settled")
+	}
+	state := app.State{
+		ProgramDocumentID: 8,
+		ProgramRunID:      17,
+		ProgramStatus:     app.ProgramRunning,
+		MachineReadiness:  app.MachineReadinessNormal,
+	}
+	if phase := coordinator.ResolveRunAdmission(attempt, state); phase != ShutdownWaitingForStopConfirmation {
+		t.Fatalf("fresh active run resolved to %v", phase)
+	}
+	target, ok := coordinator.ConfirmStop(attempt, true)
+	if !ok || target.DocumentID != 8 || target.RunID != 17 {
+		t.Fatalf("fresh stop target = %+v, %v", target, ok)
+	}
+}
+
+func TestShutdownCoordinatorRunAdmissionFailureCanProceed(t *testing.T) {
+	coordinator, attempt := beginShutdown(t, []app.DocumentID{8}, ShutdownStopTarget{})
+	coordinator.ConfirmApplication(attempt, true)
+	if phase := coordinator.ResolveRunAdmission(attempt, app.State{MachineReadiness: app.MachineReadinessNormal}); phase != ShutdownClosingDocuments {
+		t.Fatalf("failed/idle run admission resolved to %v", phase)
+	}
+}
+
+func TestShutdownCoordinatorObservesAlreadyStoppingRun(t *testing.T) {
+	coordinator, attempt := beginShutdown(t, []app.DocumentID{8}, ShutdownStopTarget{})
+	coordinator.ConfirmApplication(attempt, true)
+	state := app.State{
+		ProgramDocumentID: 8,
+		ProgramRunID:      17,
+		ProgramStatus:     app.ProgramStopping,
+		MachineReadiness:  app.MachineReadinessStopping,
+	}
+	if phase := coordinator.ResolveRunAdmission(attempt, state); phase != ShutdownWaitingForStop {
+		t.Fatalf("already-stopping run resolved to %v", phase)
+	}
+	if _, ok := coordinator.ConfirmStop(attempt, true); ok {
+		t.Fatal("shutdown claimed a second Stop for an already-stopping run")
+	}
+}
+
+func TestShutdownCoordinatorRestrictedReadinessCancelsRunAdmissionWait(t *testing.T) {
+	coordinator, attempt := beginShutdown(t, nil, ShutdownStopTarget{})
+	coordinator.ConfirmApplication(attempt, true)
+	if phase := coordinator.ResolveRunAdmission(attempt, app.State{MachineReadiness: app.MachineReadinessRecoveryRequired}); phase != ShutdownIdle {
+		t.Fatalf("restricted readiness resolved to %v", phase)
+	}
+}
+
 func TestShutdownCoordinatorStopAndFinalCloseAreExactOnce(t *testing.T) {
 	target := ShutdownStopTarget{DocumentID: 7, RunID: 9}
 	coordinator, attempt := beginShutdown(t, []app.DocumentID{7, 8}, target)
-	if phase := coordinator.ConfirmApplication(attempt, true); phase != ShutdownWaitingForStopConfirmation {
+	if phase := confirmShutdown(coordinator, attempt, target); phase != ShutdownWaitingForStopConfirmation {
 		t.Fatalf("application confirmation phase = %v", phase)
 	}
 	gotTarget, ok := coordinator.ConfirmStop(attempt, true)
@@ -75,19 +146,19 @@ func TestShutdownCoordinatorStopAndFinalCloseAreExactOnce(t *testing.T) {
 func TestShutdownCoordinatorFailedAndStaleStopResultsDoNotClose(t *testing.T) {
 	target := ShutdownStopTarget{DocumentID: 4, RunID: 5}
 	coordinator, first := beginShutdown(t, []app.DocumentID{4}, target)
-	coordinator.ConfirmApplication(first, true)
+	confirmShutdown(coordinator, first, target)
 	coordinator.ConfirmStop(first, true)
 	if coordinator.StopResult(first, target, false) || coordinator.Phase() != ShutdownIdle {
 		t.Fatalf("failed stop phase = %v", coordinator.Phase())
 	}
-	second, ok := coordinator.Begin([]app.DocumentID{6}, ShutdownStopTarget{})
+	second, ok := coordinator.Begin([]app.DocumentID{6})
 	if !ok {
 		t.Fatal("second shutdown attempt was rejected")
 	}
 	if coordinator.StopResult(first, target, true) || coordinator.Phase() != ShutdownConfirming {
 		t.Fatalf("stale result affected second attempt: %v", coordinator.Phase())
 	}
-	coordinator.ConfirmApplication(second, true)
+	confirmShutdown(coordinator, second, ShutdownStopTarget{})
 	if id, ok := coordinator.NextDocumentToClose(second); !ok || id != 6 {
 		t.Fatalf("second attempt next document = %d, %v", id, ok)
 	}
@@ -96,7 +167,7 @@ func TestShutdownCoordinatorFailedAndStaleStopResultsDoNotClose(t *testing.T) {
 func TestShutdownCoordinatorObservesExistingExactStopOnly(t *testing.T) {
 	target := ShutdownStopTarget{DocumentID: 0, RunID: 11}
 	coordinator, attempt := beginShutdown(t, []app.DocumentID{3}, target)
-	coordinator.ConfirmApplication(attempt, true)
+	confirmShutdown(coordinator, attempt, target)
 	coordinator.ConfirmStop(attempt, true)
 	coordinator.StopAlreadyInProgress(attempt, target)
 	if coordinator.ObserveExternalStop(app.State{ProgramDocumentID: 1, ProgramRunID: 11, ProgramStatus: app.ProgramStopped, MachineReadiness: app.MachineReadinessNormal}) {
@@ -107,7 +178,7 @@ func TestShutdownCoordinatorObservesExistingExactStopOnly(t *testing.T) {
 	}
 
 	coordinator, attempt = beginShutdown(t, []app.DocumentID{3}, target)
-	coordinator.ConfirmApplication(attempt, true)
+	confirmShutdown(coordinator, attempt, target)
 	coordinator.ConfirmStop(attempt, true)
 	coordinator.StopAlreadyInProgress(attempt, target)
 	if !coordinator.ObserveExternalStop(app.State{ProgramDocumentID: 0, ProgramRunID: 11, ProgramStatus: app.ProgramStopped, MachineReadiness: app.MachineReadinessNormal}) {
@@ -117,7 +188,7 @@ func TestShutdownCoordinatorObservesExistingExactStopOnly(t *testing.T) {
 
 func TestShutdownCoordinatorRejectedDocumentCloseCancelsAttempt(t *testing.T) {
 	coordinator, attempt := beginShutdown(t, []app.DocumentID{1, 2}, ShutdownStopTarget{})
-	coordinator.ConfirmApplication(attempt, true)
+	confirmShutdown(coordinator, attempt, ShutdownStopTarget{})
 	if id, ok := coordinator.NextDocumentToClose(attempt); !ok || id == 0 {
 		t.Fatal("missing document to close")
 	} else if !coordinator.DocumentCloseRejected(attempt, id) || coordinator.Phase() != ShutdownIdle {
@@ -127,7 +198,7 @@ func TestShutdownCoordinatorRejectedDocumentCloseCancelsAttempt(t *testing.T) {
 
 func TestShutdownCoordinatorAuthorizesOnlySelectedDocument(t *testing.T) {
 	coordinator, attempt := beginShutdown(t, []app.DocumentID{1, 2, 3}, ShutdownStopTarget{})
-	coordinator.ConfirmApplication(attempt, true)
+	confirmShutdown(coordinator, attempt, ShutdownStopTarget{})
 	first, ok := coordinator.NextDocumentToClose(attempt)
 	if !ok {
 		t.Fatal("missing first selected document")
@@ -159,7 +230,7 @@ func TestShutdownCoordinatorAuthorizesOnlySelectedDocument(t *testing.T) {
 
 func TestShutdownCoordinatorStaleCloseAuthorizationCannotCrossAttempts(t *testing.T) {
 	coordinator, first := beginShutdown(t, []app.DocumentID{7}, ShutdownStopTarget{})
-	coordinator.ConfirmApplication(first, true)
+	confirmShutdown(coordinator, first, ShutdownStopTarget{})
 	id, ok := coordinator.NextDocumentToClose(first)
 	if !ok || !coordinator.AllowsDocumentClose(first, id) {
 		t.Fatal("first attempt did not select its document")
@@ -167,11 +238,11 @@ func TestShutdownCoordinatorStaleCloseAuthorizationCannotCrossAttempts(t *testin
 	if !coordinator.Cancel(first) {
 		t.Fatal("first attempt was not cancelled")
 	}
-	second, ok := coordinator.Begin([]app.DocumentID{7}, ShutdownStopTarget{})
+	second, ok := coordinator.Begin([]app.DocumentID{7})
 	if !ok {
 		t.Fatal("second attempt was not created")
 	}
-	coordinator.ConfirmApplication(second, true)
+	confirmShutdown(coordinator, second, ShutdownStopTarget{})
 	if coordinator.AllowsDocumentClose(first, id) {
 		t.Fatal("old attempt authorization survived cancellation")
 	}
@@ -182,7 +253,7 @@ func TestShutdownCoordinatorStaleCloseAuthorizationCannotCrossAttempts(t *testin
 
 func TestShutdownCoordinatorRejectedSelectedCloseStopsFurtherProgress(t *testing.T) {
 	coordinator, attempt := beginShutdown(t, []app.DocumentID{1, 2}, ShutdownStopTarget{})
-	coordinator.ConfirmApplication(attempt, true)
+	confirmShutdown(coordinator, attempt, ShutdownStopTarget{})
 	id, ok := coordinator.NextDocumentToClose(attempt)
 	if !ok || !coordinator.DocumentCloseRejected(attempt, id) {
 		t.Fatal("selected close rejection was not accepted")
@@ -197,7 +268,7 @@ func TestShutdownCoordinatorRejectedSelectedCloseStopsFurtherProgress(t *testing
 
 func TestShutdownCoordinatorRejectsSelectedCloseWhenExecutionChanges(t *testing.T) {
 	coordinator, attempt := beginShutdown(t, []app.DocumentID{6}, ShutdownStopTarget{})
-	coordinator.ConfirmApplication(attempt, true)
+	confirmShutdown(coordinator, attempt, ShutdownStopTarget{})
 	id, ok := coordinator.NextDocumentToClose(attempt)
 	if !ok {
 		t.Fatal("missing selected document")
@@ -219,7 +290,7 @@ func TestShutdownCoordinatorRejectsSelectedCloseWhenExecutionChanges(t *testing.
 func TestShutdownCoordinatorExternalStopTerminalFailureCancels(t *testing.T) {
 	target := ShutdownStopTarget{DocumentID: 4, RunID: 10}
 	coordinator, attempt := beginShutdown(t, []app.DocumentID{4}, target)
-	coordinator.ConfirmApplication(attempt, true)
+	confirmShutdown(coordinator, attempt, target)
 	coordinator.ConfirmStop(attempt, true)
 	coordinator.StopAlreadyInProgress(attempt, target)
 	if coordinator.ObserveExternalStop(app.State{ProgramDocumentID: 4, ProgramRunID: 10, ProgramStatus: app.ProgramFailed, MachineReadiness: app.MachineReadinessNormal}) {

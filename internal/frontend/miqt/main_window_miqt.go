@@ -16,6 +16,7 @@ import (
 type MainWindow struct {
 	controller     *app.Controller
 	onOpen         func()
+	onStartProgram func()
 	onClose        func()
 	onCloseRequest func() bool
 	closeNotified  bool
@@ -77,8 +78,8 @@ type MainWindow struct {
 	lastErrorLabel    *qt.QLabel
 }
 
-func newMainWindow(controller *app.Controller, onOpen func()) *MainWindow {
-	w := &MainWindow{controller: controller, onOpen: onOpen}
+func newMainWindow(controller *app.Controller, onOpen func(), onStartProgram func()) *MainWindow {
+	w := &MainWindow{controller: controller, onOpen: onOpen, onStartProgram: onStartProgram}
 	w.build()
 	w.bind()
 	return w
@@ -460,6 +461,10 @@ func (w *MainWindow) browseAndLoadProgram() {
 }
 
 func (w *MainWindow) startProgram() {
+	if w.onStartProgram != nil {
+		w.onStartProgram()
+		return
+	}
 	go func() { _ = w.controller.StartProgram(context.Background()) }()
 }
 

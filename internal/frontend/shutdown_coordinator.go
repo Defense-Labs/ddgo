@@ -11,6 +11,7 @@ type ShutdownPhase uint8
 const (
 	ShutdownIdle ShutdownPhase = iota
 	ShutdownConfirming
+	ShutdownWaitingForRunAdmission
 	ShutdownWaitingForStopConfirmation
 	ShutdownWaitingForStop
 	ShutdownClosingDocuments
@@ -52,9 +53,10 @@ func (c *ShutdownCoordinator) Active() bool {
 	return c.phase != ShutdownIdle && c.phase != ShutdownFinished
 }
 
-// Begin records a preflight snapshot. The caller must still obtain the user
-// confirmation through ConfirmApplication before any document is closed.
-func (c *ShutdownCoordinator) Begin(documents []app.DocumentID, target ShutdownStopTarget) (ShutdownAttemptID, bool) {
+// Begin records a preflight document set. The eventual Stop target is selected
+// only after all frontend program-start admissions already accepted before
+// shutdown have returned from controller admission.
+func (c *ShutdownCoordinator) Begin(documents []app.DocumentID) (ShutdownAttemptID, bool) {
 	if c.Active() || c.finalIssued {
 		return 0, false
 	}
@@ -64,7 +66,7 @@ func (c *ShutdownCoordinator) Begin(documents []app.DocumentID, target ShutdownS
 	}
 	c.attempt = c.nextAttempt
 	c.phase = ShutdownConfirming
-	c.stopTarget = target
+	c.stopTarget = ShutdownStopTarget{}
 	c.stopOwned = false
 	c.documents = make(map[app.DocumentID]bool, len(documents))
 	for _, id := range documents {
@@ -85,11 +87,36 @@ func (c *ShutdownCoordinator) ConfirmApplication(attempt ShutdownAttemptID, acce
 		c.cancelCurrent()
 		return c.phase
 	}
-	if c.stopTarget.RunID != 0 {
-		c.phase = ShutdownWaitingForStopConfirmation
-	} else {
-		c.phase = ShutdownClosingDocuments
+	c.phase = ShutdownWaitingForRunAdmission
+	return c.phase
+}
+
+// ResolveRunAdmission chooses the exact Stop target from a fresh controller
+// snapshot once the application has observed its ProgramStartGate quiescent.
+// Restricted readiness fails closed and abandons automatic shutdown.
+func (c *ShutdownCoordinator) ResolveRunAdmission(attempt ShutdownAttemptID, state app.State) ShutdownPhase {
+	if !c.current(attempt) || c.phase != ShutdownWaitingForRunAdmission {
+		return c.phase
 	}
+	if state.ProgramStatus == app.ProgramStopping {
+		c.stopTarget = ShutdownStopTarget{DocumentID: state.ProgramDocumentID, RunID: state.ProgramRunID}
+		// An independently accepted Stop already owns controller abort work.
+		// Observe its exact outcome instead of prompting for or issuing a
+		// competing Stop request.
+		c.stopOwned = false
+		c.phase = ShutdownWaitingForStop
+		return c.phase
+	}
+	if state.MachineReadiness != app.MachineReadinessNormal {
+		c.cancelCurrent()
+		return c.phase
+	}
+	if state.ProgramStatus.IsActive() {
+		c.stopTarget = ShutdownStopTarget{DocumentID: state.ProgramDocumentID, RunID: state.ProgramRunID}
+		c.phase = ShutdownWaitingForStopConfirmation
+		return c.phase
+	}
+	c.phase = ShutdownClosingDocuments
 	return c.phase
 }
 

@@ -32,6 +32,7 @@ type Application struct {
 	shutdown            frontend.ShutdownCoordinator
 	shutdownStopResults chan shutdownStopResult
 	mainCloseIssued     bool
+	programStarts       frontend.ProgramStartGate
 }
 
 type documentCloseResult struct {
@@ -66,7 +67,7 @@ func (a *Application) Run() error {
 	a.documentCloseResults = make(chan documentCloseResult, 16)
 	a.shutdownStopResults = make(chan shutdownStopResult, 2)
 
-	mainWindow := newMainWindow(a.controller, func() { a.openGCodeFile() })
+	mainWindow := newMainWindow(a.controller, func() { a.openGCodeFile() }, func() { a.startLegacyProgram() })
 	a.mainWindow = mainWindow
 	mainWindow.SetOnCloseRequest(a.requestMainClose)
 	a.windows.Add(mainWindow)
@@ -113,15 +114,43 @@ func (a *Application) drainControllerEvents() {
 			a.drainDocumentCloseResults()
 			a.drainShutdownStopResults()
 			a.progressShutdown()
+			a.syncProgramStartGate()
 			return
 		}
 	}
+}
+
+// startLegacyProgram acquires frontend admission on the UI thread before the
+// controller goroutine is launched. The controller remains authoritative for
+// actual program admission and all machine-safety checks.
+func (a *Application) startLegacyProgram() {
+	admission, ok := a.programStarts.Acquire()
+	if !ok {
+		return
+	}
+	go func() {
+		defer admission.Release()
+		_ = a.controller.StartProgram(context.Background())
+	}()
+}
+
+func (a *Application) syncProgramStartGate() {
+	if a.mainCloseIssued || a.shutdown.Phase() == frontend.ShutdownFinished {
+		a.programStarts.Finalize()
+		return
+	}
+	if a.shutdown.Active() {
+		a.programStarts.Freeze()
+		return
+	}
+	a.programStarts.Reopen()
 }
 
 // requestDocumentClose governs independent document closure. An application
 // shutdown is the sole closer while its coordinator is active, preventing a
 // second document Stop request or an accidental partial shutdown.
 func (a *Application) requestDocumentClose(id app.DocumentID) bool {
+	defer a.syncProgramStartGate()
 	if a.shutdown.Active() {
 		attempt := a.shutdown.Attempt()
 		state := a.controller.Snapshot()
@@ -182,18 +211,30 @@ func (a *Application) drainDocumentCloseResults() {
 			delete(a.pendingDocumentCloses, result.documentID)
 			entry, stillOpen := a.documents.Entry(result.documentID)
 			state := a.controller.Snapshot()
-			if result.err != nil || !stillOpen || state.ProgramDocumentID != result.documentID || state.ProgramRunID != result.runID ||
-				state.ProgramStatus != app.ProgramStopped || state.MachineReadiness != app.MachineReadinessNormal {
+			disposition := frontend.ClassifyDocumentStopResult(result.err, stillOpen, result.documentID, result.runID, state, a.shutdown.Active())
+			if disposition == frontend.DocumentStopInvalid {
 				a.documents.ClearClosePending(result.documentID)
 				if stillOpen {
 					a.warnDocumentStopFailure(entry, result.err)
 				}
+				if a.shutdown.Active() {
+					a.shutdown.Cancel(a.shutdown.Attempt())
+					a.warnMain("Shutdown Cancelled", "An active document stop did not reach a verified stopped state. DDGo remains open for recovery.")
+				}
+				continue
+			}
+			if disposition == frontend.DocumentStopTransferToShutdown {
+				// Shutdown owns native close selection. This independently accepted
+				// Stop remains valid, but it may not borrow shutdown authorization.
+				a.documents.ClearClosePending(result.documentID)
+				delete(a.approvedDocumentCloses, result.documentID)
 				continue
 			}
 			a.approvedDocumentCloses[result.documentID] = true
 			if !entry.Window.Close() {
 				delete(a.approvedDocumentCloses, result.documentID)
-				a.warnDocumentStopFailure(entry, nil)
+				a.documents.ClearClosePending(result.documentID)
+				qt.QMessageBox_Warning(documentParent(entry), "Document Remains Open", "The program stopped safely, but the document window did not close. You may try closing it again.")
 			}
 		default:
 			return
@@ -212,6 +253,7 @@ func (a *Application) documentClosed(entry frontend.DocumentEntry) {
 }
 
 func (a *Application) requestMainClose() bool {
+	defer a.syncProgramStartGate()
 	if a.mainCloseIssued {
 		return true
 	}
@@ -229,28 +271,19 @@ func (a *Application) requestMainClose() bool {
 	for _, entry := range documents {
 		documentIDs = append(documentIDs, entry.ID)
 	}
-	target := frontend.ShutdownStopTarget{}
-	if state.ProgramStatus.IsActive() {
-		target = frontend.ShutdownStopTarget{DocumentID: state.ProgramDocumentID, RunID: state.ProgramRunID}
-	}
-	attempt, ok := a.shutdown.Begin(documentIDs, target)
+	attempt, ok := a.shutdown.Begin(documentIDs)
 	if !ok {
 		return false
 	}
+	// Freeze before the confirmation dialog can return control to Qt. A Run
+	// click already accepted by the UI is now visible through Outstanding(),
+	// even if its controller goroutine has not started yet.
+	a.programStarts.Freeze()
 	if !confirmApplicationClose(a.mainParent(), len(documentIDs)) {
 		a.shutdown.ConfirmApplication(attempt, false)
 		return false
 	}
-	phase := a.shutdown.ConfirmApplication(attempt, true)
-	if phase == frontend.ShutdownWaitingForStopConfirmation {
-		if !confirmStopAndClose(a.mainParent()) {
-			a.shutdown.ConfirmStop(attempt, false)
-			return false
-		}
-		if target, ok := a.shutdown.ConfirmStop(attempt, true); ok {
-			a.startShutdownStop(attempt, target)
-		}
-	}
+	a.shutdown.ConfirmApplication(attempt, true)
 	// Closing is always progressed on a later timer turn, never recursively
 	// from this native main-window close event.
 	return false
@@ -287,10 +320,34 @@ func (a *Application) drainShutdownStopResults() {
 }
 
 func (a *Application) progressShutdown() {
+	defer a.syncProgramStartGate()
 	if !a.shutdown.Active() || a.mainCloseIssued {
 		return
 	}
 	attempt := a.shutdown.Attempt()
+	if a.shutdown.Phase() == frontend.ShutdownWaitingForRunAdmission {
+		if !a.programStarts.Quiescent() {
+			return
+		}
+		// StartProgram updates controller state before its goroutine releases
+		// the gate admission. Read only after observing quiescence so this
+		// snapshot cannot predate the last accepted start's controller result.
+		state := a.controller.Snapshot()
+		if phase := a.shutdown.ResolveRunAdmission(attempt, state); phase == frontend.ShutdownIdle {
+			a.warnMain("Shutdown Cancelled", "Machine recovery became necessary while program start admission was settling.")
+		}
+		return
+	}
+	if a.shutdown.Phase() == frontend.ShutdownWaitingForStopConfirmation {
+		if !confirmStopAndClose(a.mainParent()) {
+			a.shutdown.ConfirmStop(attempt, false)
+			return
+		}
+		if target, ok := a.shutdown.ConfirmStop(attempt, true); ok {
+			a.startShutdownStop(attempt, target)
+		}
+		return
+	}
 	state := a.controller.Snapshot()
 	if a.shutdown.Phase() == frontend.ShutdownWaitingForStop {
 		if a.shutdown.ObserveExternalStop(state) {
