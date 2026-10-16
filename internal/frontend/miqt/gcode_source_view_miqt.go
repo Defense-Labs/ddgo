@@ -6,38 +6,55 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/ianbruene/ddgo/internal/frontend"
 	qt "github.com/mappu/miqt/qt6"
 )
 
 // GCodeSourceView presents faithful source text and a physical-line gutter.
-// The source remains in the QPlainTextEdit unchanged, allowing future use of
-// SetExtraSelections for execution highlighting.
+// The source remains in the QPlainTextEdit unchanged. MIQT 0.14 exposes an
+// extra-selection setter but not a default ExtraSelection constructor, so the
+// execution marker is rendered in the existing gutter rather than changing
+// the editor's user cursor or source document formatting.
 type GCodeSourceView struct {
-	editor          *qt.QPlainTextEdit
-	gutter          *qt.QWidget
-	highlightedLine int
+	editor           *qt.QPlainTextEdit
+	gutter           *qt.QWidget
+	highlightedLine  int
+	followWasEnabled bool
 }
 
-// HighlightPhysicalLine selects one original physical source line without
-// modifying document text. The source is read-only; this is presentation only.
-func (v *GCodeSourceView) HighlightPhysicalLine(line int, follow bool) {
-	if line <= 0 {
+// SetExecutionHighlight renders a non-destructive marker for one physical
+// source line. The editor cursor remains under user control. A zero line
+// explicitly clears a prior marker.
+func (v *GCodeSourceView) SetExecutionHighlight(line int, follow bool) {
+	if line > 0 {
+		block := v.editor.Document().FindBlockByNumber(line - 1)
+		if !block.IsValid() {
+			line = 0
+		}
+	}
+	action := frontend.SourceHighlightUpdate(v.highlightedLine, line, follow, v.followWasEnabled)
+	v.followWasEnabled = follow
+	if !action.Apply {
 		return
 	}
-	if line == v.highlightedLine && !follow {
+	v.highlightedLine = line
+	v.gutter.Update()
+	if !action.Reveal {
 		return
 	}
 	block := v.editor.Document().FindBlockByNumber(line - 1)
-	if !block.IsValid() {
-		return
+	geometry := v.editor.BlockBoundingGeometry(block)
+	offset := v.editor.ContentOffset()
+	top := int(math.Round(geometry.TranslatedWithQPointF(&offset).Top()))
+	blockRect := v.editor.BlockBoundingRect(block)
+	bottom := top + int(math.Round(blockRect.Height()))
+	viewportHeight := v.editor.Viewport().Height()
+	if top < 0 || bottom > viewportHeight {
+		// QPlainTextEdit's embedded QAbstractScrollArea exposes its vertical
+		// scrollbar through MIQT. Moving it reveals the block without changing
+		// the user's QTextCursor or selection.
+		v.editor.VerticalScrollBar().SetValue(block.BlockNumber())
 	}
-	cursor := qt.NewQTextCursor4(block)
-	cursor.Select(qt.QTextCursor__LineUnderCursor)
-	v.editor.SetTextCursor(cursor)
-	if follow && line != v.highlightedLine {
-		v.editor.EnsureCursorVisible()
-	}
-	v.highlightedLine = line
 }
 
 func newGCodeSourceView(source string) *GCodeSourceView {
@@ -96,6 +113,9 @@ func (v *GCodeSourceView) paintLineNumbers(event *qt.QPaintEvent) {
 	bottom := top + int(math.Round(blockRect.Height()))
 	for block.IsValid() && top <= event.Rect().Bottom() {
 		if block.IsVisible() && bottom >= event.Rect().Top() {
+			if block.BlockNumber()+1 == v.highlightedLine {
+				painter.FillRect5(0, top, v.gutter.Width(), int(math.Round(blockRect.Height())), qt.NewQColor2(qt.Yellow))
+			}
 			painter.DrawText7(0, top, v.gutter.Width()-5, v.editor.FontMetrics().Height(), int(qt.AlignRight), fmt.Sprintf("%d", block.BlockNumber()+1))
 		}
 		block = *block.Next()

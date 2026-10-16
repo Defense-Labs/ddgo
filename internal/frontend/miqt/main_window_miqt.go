@@ -627,8 +627,11 @@ func (w *MainWindow) ApplyState(state app.State) {
 		w.feedSpindle.SetText("Feed: unknown  Spindle: unknown")
 		w.spindleReported.SetText("Reported RPM: unknown")
 	}
-	if state.ProgramPath != "" && strings.TrimSpace(w.programPath.Text()) == "" {
-		w.programPath.SetText(state.ProgramPath)
+	if state.LegacyProgramLoaded && state.LegacyProgramPath != "" && w.programPath.Text() != state.LegacyProgramPath {
+		// ProgramPath follows the current or most recent execution and may be
+		// document-owned. The main-window selector always reflects the retained
+		// legacy program instead.
+		w.programPath.SetText(state.LegacyProgramPath)
 	}
 	w.programStatus.SetText("Program: " + frontend.FormatProgramStatus(state))
 	w.programProgress.SetText(fmt.Sprintf("Progress: %d / %d", state.ProgramComplete, state.ProgramTotal))

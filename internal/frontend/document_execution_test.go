@@ -46,6 +46,36 @@ func TestDocumentExecutionPresentationAttributesOnlyExactRunErrors(t *testing.T)
 	}
 }
 
+func TestDocumentExecutionPresentationAdmissionResultCannotEraseFailure(t *testing.T) {
+	p := NewDocumentExecutionPresentation(7, gcode.Program{Lines: []gcode.Line{{Number: 2, Text: "G0 X1"}}})
+	p.ApplyState(app.State{ProgramDocumentID: 7, ProgramRunID: 11, ProgramStatus: app.ProgramRunning, ProgramTotal: 1})
+	p.ApplyState(app.State{ProgramDocumentID: 7, ProgramRunID: 11, ProgramStatus: app.ProgramFailed, ProgramTotal: 1, ProgramComplete: 1, ProgramError: "controller rejected line"})
+	p.ReconcileAdmission(11, nil)
+	if p.RunID != 11 || p.Status != app.ProgramFailed || p.Error != "controller rejected line" || p.Complete != 1 {
+		t.Fatalf("late admission overwrote failure: %+v", p)
+	}
+
+	// A stale completion for an older admission cannot replace a later run.
+	p.ReconcileAdmission(10, nil)
+	if p.RunID != 11 || p.Status != app.ProgramFailed || p.Error != "controller rejected line" {
+		t.Fatalf("stale admission overwrote current run: %+v", p)
+	}
+
+	p.ReconcileAdmission(12, nil)
+	if p.RunID != 12 || p.Status != app.ProgramRunning || p.Error != "" || p.NextLine != 2 {
+		t.Fatalf("new admission did not replace old failure: %+v", p)
+	}
+}
+
+func TestDocumentExecutionPresentationUnscopedErrorDoesNotReplaceRunFailure(t *testing.T) {
+	p := NewDocumentExecutionPresentation(7, gcode.Program{Lines: []gcode.Line{{Number: 1, Text: "M5"}}})
+	p.ApplyState(app.State{ProgramDocumentID: 7, ProgramRunID: 11, ProgramStatus: app.ProgramFailed, ProgramError: "run failure"})
+	p.ApplyEvent(app.Event{Kind: app.EventError, Err: errors.New("general failure")})
+	if p.Error != "run failure" {
+		t.Fatalf("general error replaced run error: %q", p.Error)
+	}
+}
+
 func TestDocumentExecutionControlsAreOwnerScoped(t *testing.T) {
 	state := app.State{ConnectionStatus: app.ConnectionConnected, EStopStatus: app.EStopClear, MachineReadiness: app.MachineReadinessNormal, ProgramDocumentID: 7, ProgramRunID: 4, ProgramStatus: app.ProgramPaused}
 	owner := DocumentExecutionControlState(7, true, false, false, state)
@@ -55,5 +85,27 @@ func TestDocumentExecutionControlsAreOwnerScoped(t *testing.T) {
 	}
 	if other.Run || other.Pause || other.Resume || other.Stop {
 		t.Fatalf("other controls = %+v", other)
+	}
+}
+
+func TestSourceHighlightUpdate(t *testing.T) {
+	tests := []struct {
+		name                 string
+		current, next        int
+		follow, wasFollowing bool
+		want                 SourceHighlightAction
+	}{
+		{"new line follows", 0, 2, true, true, SourceHighlightAction{Apply: true, Reveal: true}},
+		{"unchanged line is inert", 2, 2, true, true, SourceHighlightAction{}},
+		{"follow disabled updates only", 2, 5, false, false, SourceHighlightAction{Apply: true}},
+		{"reenable reveals current", 5, 5, true, false, SourceHighlightAction{Apply: true, Reveal: true}},
+		{"clear marker", 5, 0, true, true, SourceHighlightAction{Apply: true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := SourceHighlightUpdate(tt.current, tt.next, tt.follow, tt.wasFollowing); got != tt.want {
+				t.Fatalf("SourceHighlightUpdate() = %+v, want %+v", got, tt.want)
+			}
+		})
 	}
 }

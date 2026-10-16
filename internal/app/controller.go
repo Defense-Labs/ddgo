@@ -1103,6 +1103,10 @@ func (c *Controller) commitLoadedProgram(prog gcode.Program) (versionedState, er
 		return versionedState{}, ErrProgramActive
 	}
 	c.loaded = prog
+	c.state.LegacyProgramLoaded = true
+	c.state.LegacyProgramPath = prog.Path
+	c.state.LegacyProgramName = prog.Name
+	c.state.LegacyProgramTotal = len(prog.Lines)
 	c.state.ProgramPath = prog.Path
 	c.state.ProgramName = prog.Name
 	c.state.ProgramDocumentID = 0

@@ -16,6 +16,23 @@ type DocumentExecutionControls struct {
 	Stop   bool
 }
 
+// SourceHighlightAction separates logical execution highlighting from native
+// widget behavior. Reveal is requested only when a new line is highlighted or
+// Follow Execution was just enabled; repeated state repainting is inert.
+type SourceHighlightAction struct {
+	Apply  bool
+	Reveal bool
+}
+
+func SourceHighlightUpdate(currentLine, nextLine int, follow, wasFollowing bool) SourceHighlightAction {
+	changed := currentLine != nextLine
+	followEnabled := follow && !wasFollowing
+	return SourceHighlightAction{
+		Apply:  changed || followEnabled,
+		Reveal: nextLine > 0 && follow && (changed || followEnabled),
+	}
+}
+
 func DocumentExecutionControlState(documentID app.DocumentID, executable bool, startPending, operationPending bool, state app.State) DocumentExecutionControls {
 	owner := state.ProgramDocumentID == documentID && state.ProgramRunID != 0
 	active := state.ProgramStatus.IsActive()
@@ -94,6 +111,36 @@ func (p *DocumentExecutionPresentation) ApplyEvent(event app.Event) {
 		p.Error = event.Err.Error()
 	} else if event.Text != "" {
 		p.Error = event.Text
+	}
+}
+
+// ReconcileAdmission records the result of this document's asynchronous Run
+// request. A successful admission only confirms a RunID: controller state may
+// already have advanced to a terminal result by the time the UI drains this
+// result, so it must not clear a same-run failure or replace a newer run.
+func (p *DocumentExecutionPresentation) ReconcileAdmission(runID app.RunID, err error) {
+	if err != nil {
+		p.Error = err.Error()
+		p.Message = "Run was not admitted"
+		return
+	}
+	if runID == 0 || p.RunID > runID {
+		return
+	}
+	if p.RunID == runID {
+		return
+	}
+	// This is a genuinely newer run for this document. State events may still
+	// arrive later, but the old run's local terminal error cannot carry over.
+	p.RunID = runID
+	p.Status = app.ProgramRunning
+	p.Total = len(p.lines)
+	p.Complete = 0
+	p.Error = ""
+	p.Message = "Running"
+	p.NextLine = 0
+	if len(p.lines) != 0 {
+		p.NextLine = p.lines[0].Number
 	}
 }
 

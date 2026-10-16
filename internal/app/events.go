@@ -109,10 +109,17 @@ type State struct {
 	// MachineReadinessReason explains any non-normal restriction.
 	MachineReadiness       MachineReadiness
 	MachineReadinessReason string
-	ProgramPath            string
-	ProgramName            string
-	ProgramDocumentID      DocumentID
-	ProgramRunID           RunID
+	// LegacyProgram* describes the separately retained program selected by the
+	// main-window workflow. It is independent of Program*, which describes the
+	// current or most recently reported execution and may belong to a document.
+	LegacyProgramLoaded bool
+	LegacyProgramPath   string
+	LegacyProgramName   string
+	LegacyProgramTotal  int
+	ProgramPath         string
+	ProgramName         string
+	ProgramDocumentID   DocumentID
+	ProgramRunID        RunID
 	// ProgramError belongs only to ProgramRunID. General controller errors use
 	// LastError and must not modify this field.
 	ProgramError    string

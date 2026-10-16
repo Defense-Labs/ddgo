@@ -355,7 +355,8 @@ func TestLegacyProgramRunsReceiveIdentityAndLoadCommitRevalidates(t *testing.T) 
 		})
 	}()
 	<-loadEntered
-	if state := controller.Snapshot(); state.ProgramDocumentID != 0 || state.ProgramRunID != 0 || state.ProgramStatus != ProgramLoaded {
+	if state := controller.Snapshot(); state.ProgramDocumentID != 0 || state.ProgramRunID != 0 || state.ProgramStatus != ProgramLoaded ||
+		!state.LegacyProgramLoaded || state.LegacyProgramPath != firstPath || state.LegacyProgramName != "first-legacy.gcode" || state.LegacyProgramTotal != 1 {
 		t.Fatalf("loaded legacy state = %+v", state)
 	}
 	if err := controller.StartProgram(context.Background()); err != nil {
@@ -389,7 +390,8 @@ func TestLegacyProgramRunsReceiveIdentityAndLoadCommitRevalidates(t *testing.T) 
 		t.Fatalf("replacement LoadProgramFile() error = %v", err)
 	}
 	reloaded := controller.Snapshot()
-	if reloaded.ProgramStatus != ProgramLoaded || reloaded.ProgramDocumentID != 0 || reloaded.ProgramRunID != 0 || reloaded.ProgramName != "replacement.gcode" {
+	if reloaded.ProgramStatus != ProgramLoaded || reloaded.ProgramDocumentID != 0 || reloaded.ProgramRunID != 0 || reloaded.ProgramName != "replacement.gcode" ||
+		!reloaded.LegacyProgramLoaded || reloaded.LegacyProgramName != "replacement.gcode" || reloaded.LegacyProgramTotal != 1 {
 		t.Fatalf("replacement loaded state = %+v", reloaded)
 	}
 	if err := controller.StartProgram(context.Background()); err != nil {
@@ -402,4 +404,28 @@ func TestLegacyProgramRunsReceiveIdentityAndLoadCommitRevalidates(t *testing.T) 
 	waitForLineWrites(t, fake, "G0 X1", "M5")
 	fake.InjectRX("ok")
 	completeProgramAfterFreshIdle(t, controller, fake)
+}
+
+func TestDocumentExecutionDoesNotReplaceLegacyProgramMetadata(t *testing.T) {
+	controller, fake := newConnectedDocumentProgramController(t)
+	legacyPath := writeProgramFile(t, "retained-legacy.gcode", "M5\n")
+	if err := controller.LoadProgramFile(legacyPath); err != nil {
+		t.Fatalf("LoadProgramFile() error = %v", err)
+	}
+	runID, err := controller.StartDocumentProgram(context.Background(), 77, documentProgram(t, "document.gcode", "G0 X1\n"))
+	if err != nil {
+		t.Fatalf("StartDocumentProgram() error = %v", err)
+	}
+	state := controller.Snapshot()
+	if state.ProgramDocumentID != 77 || state.ProgramRunID != runID || !state.LegacyProgramLoaded ||
+		state.LegacyProgramPath != legacyPath || state.LegacyProgramName != "retained-legacy.gcode" || state.LegacyProgramTotal != 1 {
+		t.Fatalf("document execution changed legacy metadata: %+v", state)
+	}
+	waitForLineWrites(t, fake, "G0 X1")
+	fake.InjectRX("ok")
+	completeProgramAfterFreshIdle(t, controller, fake)
+	completed := controller.Snapshot()
+	if completed.ProgramStatus != ProgramCompleted || !completed.LegacyProgramLoaded || completed.LegacyProgramPath != legacyPath {
+		t.Fatalf("document completion changed retained legacy metadata: %+v", completed)
+	}
 }

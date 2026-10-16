@@ -26,7 +26,7 @@ type Application struct {
 	mainWindow *MainWindow
 
 	pendingDocumentCloses  map[app.DocumentID]app.RunID
-	approvedDocumentCloses map[app.DocumentID]bool
+	approvedDocumentCloses map[app.DocumentID]app.RunID
 	documentCloseResults   chan documentCloseResult
 	pendingDocumentStarts  map[app.DocumentID]documentStartRequest
 	documentStartResults   chan documentStartResult
@@ -81,7 +81,7 @@ func (a *Application) Run() error {
 	a.documents = frontend.NewDocumentRegistry(a.windows)
 	a.documents.SetOnClose(a.documentClosed)
 	a.pendingDocumentCloses = make(map[app.DocumentID]app.RunID)
-	a.approvedDocumentCloses = make(map[app.DocumentID]bool)
+	a.approvedDocumentCloses = make(map[app.DocumentID]app.RunID)
 	a.documentCloseResults = make(chan documentCloseResult, 16)
 	a.pendingDocumentStarts = make(map[app.DocumentID]documentStartRequest)
 	a.documentStartResults = make(chan documentStartResult, 16)
@@ -337,12 +337,13 @@ func (a *Application) requestDocumentClose(id app.DocumentID) bool {
 		}
 		return true
 	}
-	if a.approvedDocumentCloses[id] {
+	if approvedRunID, approved := a.approvedDocumentCloses[id]; approved {
 		state := a.controller.Snapshot()
-		if state.ProgramStatus.IsActive() && state.ProgramDocumentID == id {
+		if frontend.DocumentCloseApprovalSuperseded(id, approvedRunID, state) {
 			// A new run for this document supersedes an earlier Stop-and-Close
 			// approval and requires a fresh explicit close request.
 			delete(a.approvedDocumentCloses, id)
+			a.documents.ClearClosePending(id)
 			return false
 		}
 		return true
@@ -406,7 +407,7 @@ func (a *Application) drainDocumentCloseResults() {
 				delete(a.approvedDocumentCloses, result.documentID)
 				continue
 			}
-			a.approvedDocumentCloses[result.documentID] = true
+			a.approvedDocumentCloses[result.documentID] = result.runID
 			if !entry.Window.Close() {
 				delete(a.approvedDocumentCloses, result.documentID)
 				a.documents.ClearClosePending(result.documentID)

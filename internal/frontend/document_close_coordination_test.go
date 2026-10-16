@@ -41,3 +41,17 @@ func TestClassifyDocumentStopResult(t *testing.T) {
 		})
 	}
 }
+
+func TestDocumentCloseApprovalSuperseded(t *testing.T) {
+	const documentID app.DocumentID = 7
+	const runID app.RunID = 11
+	if DocumentCloseApprovalSuperseded(documentID, runID, app.State{ProgramDocumentID: documentID, ProgramRunID: runID, ProgramStatus: app.ProgramRunning}) {
+		t.Fatal("approval was superseded by its own run")
+	}
+	if !DocumentCloseApprovalSuperseded(documentID, runID, app.State{ProgramDocumentID: documentID, ProgramRunID: runID + 1, ProgramStatus: app.ProgramRunning}) {
+		t.Fatal("approval remained valid for replacement run")
+	}
+	if DocumentCloseApprovalSuperseded(documentID, runID, app.State{ProgramDocumentID: documentID + 1, ProgramRunID: runID + 1, ProgramStatus: app.ProgramRunning}) {
+		t.Fatal("other document superseded approval")
+	}
+}

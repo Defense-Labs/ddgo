@@ -63,10 +63,12 @@ func TestMainWindowControls(t *testing.T) {
 		{
 			name: "connected idle loaded program",
 			state: app.State{
-				ConnectionStatus: app.ConnectionConnected,
-				EStopStatus:      app.EStopClear,
-				ProgramStatus:    app.ProgramLoaded,
-				ProgramTotal:     10,
+				ConnectionStatus:    app.ConnectionConnected,
+				EStopStatus:         app.EStopClear,
+				ProgramStatus:       app.ProgramLoaded,
+				ProgramTotal:        10,
+				LegacyProgramLoaded: true,
+				LegacyProgramTotal:  10,
 			},
 			want: loaded,
 		},
@@ -214,24 +216,57 @@ func TestMainWindowControls(t *testing.T) {
 		{
 			name: "jog to end without machine position",
 			state: app.State{
-				ConnectionStatus: app.ConnectionConnected,
-				EStopStatus:      app.EStopClear,
-				ProgramStatus:    app.ProgramLoaded,
-				ProgramTotal:     10,
+				ConnectionStatus:    app.ConnectionConnected,
+				EStopStatus:         app.EStopClear,
+				ProgramStatus:       app.ProgramLoaded,
+				ProgramTotal:        10,
+				LegacyProgramLoaded: true,
+				LegacyProgramTotal:  10,
 			},
 			want: loaded,
 		},
 		{
 			name: "jog to end with machine position",
 			state: app.State{
-				ConnectionStatus:   app.ConnectionConnected,
-				EStopStatus:        app.EStopClear,
-				ProgramStatus:      app.ProgramLoaded,
-				ProgramTotal:       10,
-				HasMachinePosition: true,
+				ConnectionStatus:    app.ConnectionConnected,
+				EStopStatus:         app.EStopClear,
+				ProgramStatus:       app.ProgramLoaded,
+				ProgramTotal:        10,
+				HasMachinePosition:  true,
+				LegacyProgramLoaded: true,
+				LegacyProgramTotal:  10,
 			},
 			want: jogToEnd,
 		},
+	}
+
+	// Current execution fields can describe a completed document, not a
+	// program selected by the legacy main-window workflow.
+	documentCompleted := MainWindowControls(app.State{
+		ConnectionStatus:  app.ConnectionConnected,
+		EStopStatus:       app.EStopClear,
+		ProgramStatus:     app.ProgramCompleted,
+		ProgramDocumentID: 8,
+		ProgramRunID:      3,
+		ProgramTotal:      10,
+	})
+	if documentCompleted.RunProgramEnabled {
+		t.Fatal("document completion enabled legacy Run without a loaded legacy program")
+	}
+	legacyRetained := MainWindowControls(app.State{
+		ConnectionStatus:    app.ConnectionConnected,
+		EStopStatus:         app.EStopClear,
+		ProgramStatus:       app.ProgramCompleted,
+		ProgramDocumentID:   8,
+		ProgramRunID:        3,
+		ProgramTotal:        10,
+		LegacyProgramLoaded: true,
+		LegacyProgramTotal:  2,
+		LegacyProgramPath:   "legacy.gcode",
+		LegacyProgramName:   "legacy.gcode",
+	})
+	if !legacyRetained.RunProgramEnabled {
+		t.Fatal("retained legacy program was not runnable after document completion")
 	}
 
 	for _, tt := range tests {

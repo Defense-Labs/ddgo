@@ -32,7 +32,7 @@ func MainWindowControls(state app.State) MainWindowControlState {
 	machineRecoveryRequired := state.MachineReadiness == app.MachineReadinessRecoveryRequired
 	recovering := state.EStopStatus == app.EStopRecovery
 	ordinaryAlarmRecovery := machineRecoveryRequired && strings.EqualFold(state.MachineState, "Alarm")
-	loaded := state.ProgramTotal > 0
+	loaded := state.LegacyProgramLoaded && state.LegacyProgramTotal > 0
 	legacyRun := state.ProgramDocumentID == 0 && state.ProgramRunID != 0
 
 	canManual := connected && safetyClear && machineReady && !programActive

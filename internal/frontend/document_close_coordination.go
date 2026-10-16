@@ -28,3 +28,11 @@ func ClassifyDocumentStopResult(err error, documentOpen bool, documentID app.Doc
 	}
 	return DocumentStopCloseIndependently
 }
+
+// DocumentCloseApprovalSuperseded reports whether an independently verified
+// Stop-and-Close approval belongs to an older run for this document. It is a
+// presentation/lifecycle check only; a stale approval must never authorize a
+// native close or a new Stop request.
+func DocumentCloseApprovalSuperseded(documentID app.DocumentID, approvedRunID app.RunID, state app.State) bool {
+	return approvedRunID != 0 && state.ProgramStatus.IsActive() && state.ProgramDocumentID == documentID && state.ProgramRunID != approvedRunID
+}

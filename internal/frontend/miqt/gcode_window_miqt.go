@@ -199,13 +199,7 @@ func (w *GCodeWindow) SetOperationPending(pending bool) {
 
 func (w *GCodeWindow) StartResult(runID app.RunID, err error) {
 	w.startPending = false
-	if err != nil {
-		w.presentation.Error = err.Error()
-		w.presentation.Message = "Run was not admitted"
-	} else if runID != 0 && (w.presentation.RunID == 0 || runID >= w.presentation.RunID) {
-		w.presentation.RunID = runID
-		w.presentation.Error = ""
-	}
+	w.presentation.ReconcileAdmission(runID, err)
 	w.renderExecution()
 }
 
@@ -233,12 +227,14 @@ func (w *GCodeWindow) renderExecution() {
 	w.progressBar.SetValue(w.presentation.Complete)
 	if w.presentation.NextLine > 0 {
 		w.lineLabel.SetText(fmt.Sprintf("Next command: source line %d", w.presentation.NextLine))
-		w.sourceView.HighlightPhysicalLine(w.presentation.NextLine, w.followCheck.IsChecked())
 	} else if w.presentation.Status == app.ProgramDraining {
 		w.lineLabel.SetText("All commands acknowledged — awaiting Idle")
 	} else {
 		w.lineLabel.SetText("Next command: none")
 	}
+	// This is intentionally called for zero too: completed, draining, stopped,
+	// and failed runs must not leave a stale pending-command marker behind.
+	w.sourceView.SetExecutionHighlight(w.presentation.NextLine, w.followCheck.IsChecked())
 	w.errorLabel.SetText(w.presentation.Error)
 }
 
