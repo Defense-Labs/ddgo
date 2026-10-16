@@ -446,15 +446,19 @@ func (w *MainWindow) showExecutionDocument() {
 		w.canShowDocument(target.DocumentID, target.RunID) {
 		w.onShowDocument(target.DocumentID, target.RunID)
 	}
-	// Document lifetime can change without a controller event; refresh from a
-	// current snapshot after every focus attempt.
-	w.refreshExecutionSummary(w.controller.Snapshot())
+	// Document lifetime can change without a controller event. Re-evaluate
+	// only focus eligibility: applying a direct controller snapshot here could
+	// overtake the ViewDispatcher's accepted revision and regress when an
+	// already-queued event is delivered.
+	w.RefreshExecutionFocusAvailability()
 }
 
-// RefreshExecutionSummary updates only the controller-derived read-only
-// execution panel. Application calls it after document lifecycle changes.
-func (w *MainWindow) RefreshExecutionSummary() {
-	w.refreshExecutionSummary(w.controller.Snapshot())
+// RefreshExecutionFocusAvailability updates only the Show Document action
+// after document lifecycle changes. Controller-derived execution fields are
+// updated exclusively by ApplyState through the revision-aware dispatcher.
+func (w *MainWindow) RefreshExecutionFocusAvailability() {
+	canShow := frontend.CanFocusDisplayedExecutionSummary(w.executionSummary, w.canShowDocument)
+	w.showDocumentButton.SetEnabled(canShow)
 }
 
 func (w *MainWindow) sendCommand() {
@@ -637,7 +641,7 @@ func (w *MainWindow) refreshExecutionSummary(state app.State) {
 	w.executionStatus.SetText("Status: " + w.executionSummary.Status)
 	w.executionProgress.SetText(w.executionSummary.Progress)
 	w.executionDetail.SetText(w.executionSummary.Detail)
-	canShow := w.canShowDocument != nil && w.canShowDocument(w.executionSummary.DocumentID, w.executionSummary.RunID)
+	canShow := frontend.CanFocusDisplayedExecutionSummary(w.executionSummary, w.canShowDocument)
 	w.showDocumentButton.SetEnabled(canShow)
 }
 

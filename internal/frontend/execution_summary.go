@@ -93,3 +93,12 @@ func CanFocusExecutionSummary(state app.State, documentID app.DocumentID, runID 
 	return documentOpen && documentID != 0 && runID != 0 &&
 		state.ProgramDocumentID == documentID && state.ProgramRunID == runID
 }
+
+// CanFocusDisplayedExecutionSummary asks the application to validate the
+// identity stored in an already-displayed summary. It deliberately does not
+// adopt a new controller state: document lifecycle updates may change focus
+// availability, but only the revision-aware dispatcher may replace summary
+// contents.
+func CanFocusDisplayedExecutionSummary(summary ExecutionSummary, canFocus func(app.DocumentID, app.RunID) bool) bool {
+	return canFocus != nil && canFocus(summary.DocumentID, summary.RunID)
+}

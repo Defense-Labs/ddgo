@@ -129,7 +129,7 @@ func (a *Application) openGCodeFile() {
 		a.configureDocumentExecution(entry, window)
 		window.Focus()
 	}
-	a.refreshExecutionSummary()
+	a.refreshExecutionFocusAvailability()
 }
 
 func (a *Application) configureDocumentExecution(entry frontend.DocumentEntry, window *GCodeWindow) {
@@ -413,12 +413,12 @@ func (a *Application) documentClosed(entry frontend.DocumentEntry) {
 	if a.shutdown.Active() {
 		a.shutdown.DocumentClosed(a.shutdown.Attempt(), entry.ID)
 	}
-	a.refreshExecutionSummary()
+	a.refreshExecutionFocusAvailability()
 }
 
-func (a *Application) refreshExecutionSummary() {
+func (a *Application) refreshExecutionFocusAvailability() {
 	if a.mainWindow != nil {
-		a.mainWindow.RefreshExecutionSummary()
+		a.mainWindow.RefreshExecutionFocusAvailability()
 	}
 }
 
@@ -433,15 +433,16 @@ func (a *Application) canShowExecutionDocument(documentID app.DocumentID, runID 
 
 func (a *Application) showExecutionDocument(documentID app.DocumentID, runID app.RunID) {
 	if !a.canShowExecutionDocument(documentID, runID) {
-		a.refreshExecutionSummary()
+		a.refreshExecutionFocusAvailability()
 		return
 	}
 	entry, open := a.documents.Entry(documentID)
 	if !open {
-		a.refreshExecutionSummary()
+		a.refreshExecutionFocusAvailability()
 		return
 	}
 	entry.Window.Focus()
+	a.refreshExecutionFocusAvailability()
 }
 
 func (a *Application) requestMainClose() bool {

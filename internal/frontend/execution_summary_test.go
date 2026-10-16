@@ -164,3 +164,98 @@ func TestExecutionSummaryUsesNewestDispatchedState(t *testing.T) {
 		t.Fatalf("stale state regressed execution summary: %+v", view.summary)
 	}
 }
+
+func TestExecutionSummaryLifecycleRefreshDoesNotBypassDispatcherRevision(t *testing.T) {
+	state10 := app.State{
+		ProgramName:       "a.gcode",
+		ProgramDocumentID: 7,
+		ProgramRunID:      10,
+		ProgramStatus:     app.ProgramRunning,
+		ProgramComplete:   1,
+		ProgramTotal:      4,
+	}
+	state11 := state10
+	state11.ProgramComplete = 2
+	state12 := app.State{
+		ProgramName:       "b.gcode",
+		ProgramDocumentID: 8,
+		ProgramRunID:      11,
+		ProgramStatus:     app.ProgramRunning,
+		ProgramComplete:   3,
+		ProgramTotal:      5,
+	}
+
+	dispatcher := NewViewDispatcher(state10, 10)
+	view := &executionSummaryView{}
+	dispatcher.Register(view)
+
+	// A document lifecycle callback may consult a fresh controller snapshot to
+	// validate focus, but it must not apply that snapshot to the summary.
+	if CanFocusDisplayedExecutionSummary(view.summary, func(documentID app.DocumentID, runID app.RunID) bool {
+		return CanFocusExecutionSummary(state12, documentID, runID, true)
+	}) {
+		t.Fatal("newer undispatched execution unexpectedly matched displayed focus target")
+	}
+	if view.summary.DocumentID != 7 || view.summary.RunID != 10 || view.summary.Complete != 1 {
+		t.Fatalf("lifecycle focus validation changed undispatched summary: %+v", view.summary)
+	}
+
+	dispatcher.Dispatch(app.Event{State: state11, StateRevision: 11})
+	if view.summary.DocumentID != 7 || view.summary.RunID != 10 || view.summary.Complete != 2 {
+		t.Fatalf("revision 11 summary = %+v", view.summary)
+	}
+	dispatcher.Dispatch(app.Event{State: state12, StateRevision: 12})
+	if view.summary.DocumentID != 8 || view.summary.RunID != 11 || view.summary.Complete != 3 {
+		t.Fatalf("revision 12 summary = %+v", view.summary)
+	}
+}
+
+func TestExecutionSummaryLifecycleFocusAvailabilityDoesNotReplaceHistory(t *testing.T) {
+	state := app.State{
+		ProgramName:       "a.gcode",
+		ProgramDocumentID: 7,
+		ProgramRunID:      10,
+		ProgramStatus:     app.ProgramCompleted,
+		ProgramComplete:   4,
+		ProgramTotal:      4,
+	}
+	summary := ExecutionSummaryForState(state)
+	if !CanFocusDisplayedExecutionSummary(summary, func(documentID app.DocumentID, runID app.RunID) bool {
+		return CanFocusExecutionSummary(state, documentID, runID, true)
+	}) {
+		t.Fatal("open document was not focusable")
+	}
+
+	// Closing the document changes only focus eligibility; the historical
+	// controller presentation remains exactly the state accepted earlier.
+	if CanFocusDisplayedExecutionSummary(summary, func(documentID app.DocumentID, runID app.RunID) bool {
+		return CanFocusExecutionSummary(state, documentID, runID, false)
+	}) {
+		t.Fatal("closed document remained focusable")
+	}
+	if summary.Name != "a.gcode" || summary.Status != "Completed" || summary.Complete != 4 || summary.DocumentID != 7 || summary.RunID != 10 {
+		t.Fatalf("lifecycle focus update changed historical summary: %+v", summary)
+	}
+
+	// A same-path replacement has a distinct DocumentID and cannot become the
+	// focus target for the old execution.
+	if CanFocusDisplayedExecutionSummary(summary, func(documentID app.DocumentID, runID app.RunID) bool {
+		return CanFocusExecutionSummary(state, 8, runID, true)
+	}) {
+		t.Fatal("reopened document became focusable for historical execution")
+	}
+}
+
+func TestExecutionSummaryStaleFocusValidationDoesNotChangeDisplayedRun(t *testing.T) {
+	stateA := app.State{ProgramName: "a.gcode", ProgramDocumentID: 7, ProgramRunID: 10, ProgramStatus: app.ProgramCompleted}
+	summary := ExecutionSummaryForState(stateA)
+	stateB := app.State{ProgramName: "b.gcode", ProgramDocumentID: 8, ProgramRunID: 11, ProgramStatus: app.ProgramRunning}
+	if CanFocusDisplayedExecutionSummary(summary, func(documentID app.DocumentID, runID app.RunID) bool {
+		return CanFocusExecutionSummary(stateB, documentID, runID, true)
+	}) {
+		t.Fatal("stale focus request matched replacement execution")
+	}
+	if summary.DocumentID != 7 || summary.RunID != 10 || summary.Name != "a.gcode" {
+		t.Fatalf("stale focus validation changed displayed execution: %+v", summary)
+	}
+}
