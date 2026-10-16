@@ -277,17 +277,36 @@ func TestDocumentRunIdentitySurvivesPauseResumeFailureAndStop(t *testing.T) {
 		t.Fatalf("StartDocumentProgram() error = %v", err)
 	}
 	waitForLineWrites(t, fake, "G0 X1")
+	writesBeforeStaleAction := len(fake.Written())
 
-	if err := controller.PauseProgram(context.Background()); err != nil {
-		t.Fatalf("PauseProgram() error = %v", err)
+	if err := controller.PauseProgramRun(context.Background(), documentID+1, runID); !errors.Is(err, ErrProgramRunMismatch) {
+		t.Fatalf("PauseProgramRun(wrong document) error = %v, want %v", err, ErrProgramRunMismatch)
+	}
+	if err := controller.PauseProgramRun(context.Background(), documentID, runID+1); !errors.Is(err, ErrProgramRunMismatch) {
+		t.Fatalf("PauseProgramRun(wrong run) error = %v, want %v", err, ErrProgramRunMismatch)
+	}
+	if got := len(fake.Written()); got != writesBeforeStaleAction {
+		t.Fatalf("stale PauseProgramRun wrote %d messages, want 0", got-writesBeforeStaleAction)
+	}
+	if err := controller.PauseProgramRun(context.Background(), documentID, runID); err != nil {
+		t.Fatalf("PauseProgramRun() error = %v", err)
 	}
 	pauseEvent := waitForEventText(t, controller.Events(), EventStateChanged, "program paused")
 	paused := pauseEvent.State
 	if paused.ProgramDocumentID != documentID || paused.ProgramRunID != runID {
 		t.Fatalf("paused identity = %+v", paused)
 	}
-	if err := controller.ResumeProgram(context.Background()); err != nil {
-		t.Fatalf("ResumeProgram() error = %v", err)
+	if err := controller.ResumeProgramRun(context.Background(), documentID+1, runID); !errors.Is(err, ErrProgramRunMismatch) {
+		t.Fatalf("ResumeProgramRun(wrong document) error = %v, want %v", err, ErrProgramRunMismatch)
+	}
+	if err := controller.ResumeProgramRun(context.Background(), documentID, runID+1); !errors.Is(err, ErrProgramRunMismatch) {
+		t.Fatalf("ResumeProgramRun(wrong run) error = %v, want %v", err, ErrProgramRunMismatch)
+	}
+	if got := len(fake.Written()); got != writesBeforeStaleAction+1 {
+		t.Fatalf("stale ResumeProgramRun wrote %d messages, want 0", got-(writesBeforeStaleAction+1))
+	}
+	if err := controller.ResumeProgramRun(context.Background(), documentID, runID); err != nil {
+		t.Fatalf("ResumeProgramRun() error = %v", err)
 	}
 	resumeEvent := waitForEventText(t, controller.Events(), EventStateChanged, "program resumed")
 	resumed := resumeEvent.State

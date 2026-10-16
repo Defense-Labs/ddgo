@@ -3,7 +3,10 @@
 package miqt
 
 import (
+	"fmt"
+
 	"github.com/ianbruene/ddgo/internal/app"
+	"github.com/ianbruene/ddgo/internal/frontend"
 	"github.com/ianbruene/ddgo/internal/gcode"
 	qt "github.com/mappu/miqt/qt6"
 )
@@ -16,6 +19,28 @@ type GCodeWindow struct {
 	sourceView          *GCodeSourceView
 	toolpathPlaceholder *qt.QWidget
 	executionPanel      *qt.QGroupBox
+	runButton           *qt.QPushButton
+	pauseButton         *qt.QPushButton
+	resumeButton        *qt.QPushButton
+	stopButton          *qt.QPushButton
+	statusLabel         *qt.QLabel
+	progressLabel       *qt.QLabel
+	lineLabel           *qt.QLabel
+	errorLabel          *qt.QLabel
+	progressBar         *qt.QProgressBar
+	followCheck         *qt.QCheckBox
+
+	documentID       app.DocumentID
+	program          gcode.Program
+	programErr       error
+	presentation     frontend.DocumentExecutionPresentation
+	state            app.State
+	startPending     bool
+	operationPending bool
+	onRun            func()
+	onPause          func()
+	onResume         func()
+	onStop           func()
 
 	onClose        func()
 	onOpen         func()
@@ -34,7 +59,7 @@ func newGCodeWindow(document gcode.Document, onOpen func()) *GCodeWindow {
 	w.window.SetAttribute(qt.WA_DeleteOnClose)
 	w.sourceView = newGCodeSourceView(document.Source)
 	w.toolpathPlaceholder = newToolpathPlaceholder()
-	w.executionPanel = newExecutionPanel()
+	w.executionPanel = w.newExecutionPanel()
 
 	w.splitter = qt.NewQSplitter3(qt.Horizontal)
 	w.splitter.AddWidget(w.sourceView.editor.QWidget)
@@ -85,20 +110,136 @@ func newToolpathPlaceholder() *qt.QWidget {
 	return panel
 }
 
-func newExecutionPanel() *qt.QGroupBox {
+func (w *GCodeWindow) newExecutionPanel() *qt.QGroupBox {
 	panel := qt.NewQGroupBox(nil)
 	panel.SetTitle("Execution")
 
 	layout := qt.NewQVBoxLayout(nil)
 	panel.SetLayout(layout.QLayout)
 
-	explanation := qt.NewQLabel(nil)
-	explanation.SetText("Document-specific execution controls are not implemented yet.\n\nUse the main DDGo window for existing program controls.")
-	explanation.SetWordWrap(true)
-	explanation.SetAlignment(qt.AlignLeft | qt.AlignTop)
-	layout.AddWidget(explanation.QWidget)
+	w.statusLabel = qt.NewQLabel(nil)
+	w.statusLabel.SetWordWrap(true)
+	layout.AddWidget(w.statusLabel.QWidget)
+	w.progressLabel = qt.NewQLabel(nil)
+	layout.AddWidget(w.progressLabel.QWidget)
+	w.progressBar = qt.NewQProgressBar(nil)
+	w.progressBar.SetMinimum(0)
+	w.progressBar.SetMaximum(1)
+	layout.AddWidget(w.progressBar.QWidget)
+	w.lineLabel = qt.NewQLabel(nil)
+	w.lineLabel.SetWordWrap(true)
+	layout.AddWidget(w.lineLabel.QWidget)
+	w.followCheck = qt.NewQCheckBox(nil)
+	w.followCheck.SetText("Follow Execution")
+	w.followCheck.SetChecked(true)
+	layout.AddWidget(w.followCheck.QWidget)
+	for _, item := range []struct {
+		text string
+		set  func(*qt.QPushButton)
+	}{
+		{"Run", func(b *qt.QPushButton) { w.runButton = b }},
+		{"Pause", func(b *qt.QPushButton) { w.pauseButton = b }},
+		{"Resume", func(b *qt.QPushButton) { w.resumeButton = b }},
+		{"Stop", func(b *qt.QPushButton) { w.stopButton = b }},
+	} {
+		button := qt.NewQPushButton(nil)
+		button.SetText(item.text)
+		item.set(button)
+		layout.AddWidget(button.QWidget)
+	}
+	w.runButton.OnClicked(func() {
+		if w.onRun != nil {
+			w.onRun()
+		}
+	})
+	w.pauseButton.OnClicked(func() {
+		if w.onPause != nil {
+			w.onPause()
+		}
+	})
+	w.resumeButton.OnClicked(func() {
+		if w.onResume != nil {
+			w.onResume()
+		}
+	})
+	w.stopButton.OnClicked(func() {
+		if w.onStop != nil {
+			w.onStop()
+		}
+	})
+	w.errorLabel = qt.NewQLabel(nil)
+	w.errorLabel.SetWordWrap(true)
+	w.errorLabel.SetStyleSheet("color: #b00020;")
+	layout.AddWidget(w.errorLabel.QWidget)
 	layout.AddStretch()
 	return panel
+}
+
+func (w *GCodeWindow) SetExecution(documentID app.DocumentID, program gcode.Program, parseErr error, run, pause, resume, stop func()) {
+	w.documentID = documentID
+	w.program = program
+	w.programErr = parseErr
+	w.presentation = frontend.NewDocumentExecutionPresentation(documentID, program)
+	w.onRun, w.onPause, w.onResume, w.onStop = run, pause, resume, stop
+	if parseErr != nil {
+		w.presentation.Error = parseErr.Error()
+	}
+	w.renderExecution()
+}
+
+func (w *GCodeWindow) SetStartPending(pending bool) {
+	w.startPending = pending
+	w.renderExecution()
+}
+
+func (w *GCodeWindow) SetOperationPending(pending bool) {
+	w.operationPending = pending
+	w.renderExecution()
+}
+
+func (w *GCodeWindow) StartResult(runID app.RunID, err error) {
+	w.startPending = false
+	if err != nil {
+		w.presentation.Error = err.Error()
+		w.presentation.Message = "Run was not admitted"
+	} else if runID != 0 && (w.presentation.RunID == 0 || runID >= w.presentation.RunID) {
+		w.presentation.RunID = runID
+		w.presentation.Error = ""
+	}
+	w.renderExecution()
+}
+
+func (w *GCodeWindow) OperationResult(err error) {
+	w.operationPending = false
+	if err != nil {
+		w.presentation.Error = err.Error()
+	}
+	w.renderExecution()
+}
+
+func (w *GCodeWindow) renderExecution() {
+	controls := frontend.DocumentExecutionControlState(w.documentID, w.programErr == nil && len(w.program.Lines) > 0, w.startPending, w.operationPending, w.state)
+	w.runButton.SetEnabled(controls.Run)
+	w.pauseButton.SetEnabled(controls.Pause)
+	w.resumeButton.SetEnabled(controls.Resume)
+	w.stopButton.SetEnabled(controls.Stop)
+	w.statusLabel.SetText("Status: " + w.presentation.StatusText(w.state))
+	w.progressLabel.SetText(fmt.Sprintf("Acknowledged commands: %d / %d", w.presentation.Complete, w.presentation.Total))
+	maximum := w.presentation.Total
+	if maximum < 1 {
+		maximum = 1
+	}
+	w.progressBar.SetMaximum(maximum)
+	w.progressBar.SetValue(w.presentation.Complete)
+	if w.presentation.NextLine > 0 {
+		w.lineLabel.SetText(fmt.Sprintf("Next command: source line %d", w.presentation.NextLine))
+		w.sourceView.HighlightPhysicalLine(w.presentation.NextLine, w.followCheck.IsChecked())
+	} else if w.presentation.Status == app.ProgramDraining {
+		w.lineLabel.SetText("All commands acknowledged — awaiting Idle")
+	} else {
+		w.lineLabel.SetText("Next command: none")
+	}
+	w.errorLabel.SetText(w.presentation.Error)
 }
 
 func (w *GCodeWindow) show()                            { w.window.Show() }
@@ -109,6 +250,13 @@ func (w *GCodeWindow) Focus() {
 	w.window.Raise()
 	w.window.ActivateWindow()
 }
-func (w *GCodeWindow) Close() bool          { return w.window.Close() }
-func (w *GCodeWindow) ApplyState(app.State) {}
-func (w *GCodeWindow) ApplyEvent(app.Event) {}
+func (w *GCodeWindow) Close() bool { return w.window.Close() }
+func (w *GCodeWindow) ApplyState(state app.State) {
+	w.state = state
+	w.presentation.ApplyState(state)
+	w.renderExecution()
+}
+func (w *GCodeWindow) ApplyEvent(event app.Event) {
+	w.presentation.ApplyEvent(event)
+	w.renderExecution()
+}

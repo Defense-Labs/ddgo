@@ -1221,7 +1221,27 @@ func (c *Controller) startProgram(ctx context.Context, documentID DocumentID, su
 }
 
 func (c *Controller) PauseProgram(ctx context.Context) error {
+	return c.pauseProgram(ctx, 0, 0, false)
+}
+
+// PauseProgramRun pauses exactly the specified execution. A zero DocumentID
+// is valid for the legacy workflow; RunID must be nonzero so a delayed UI
+// action cannot hold a replacement run.
+func (c *Controller) PauseProgramRun(ctx context.Context, documentID DocumentID, runID RunID) error {
+	if runID == 0 {
+		c.emitError(ErrProgramRunMismatch)
+		return ErrProgramRunMismatch
+	}
+	return c.pauseProgram(ctx, documentID, runID, true)
+}
+
+func (c *Controller) pauseProgram(ctx context.Context, documentID DocumentID, runID RunID, requireRunMatch bool) error {
 	c.mu.Lock()
+	if requireRunMatch && (c.run == nil || c.run.documentID != documentID || c.run.runID != runID) {
+		c.mu.Unlock()
+		c.emitError(ErrProgramRunMismatch)
+		return ErrProgramRunMismatch
+	}
 	run, transition, err := c.beginPauseTransitionLocked()
 	c.mu.Unlock()
 	if err != nil {
@@ -1255,8 +1275,27 @@ func (c *Controller) PauseProgram(ctx context.Context) error {
 }
 
 func (c *Controller) ResumeProgram(ctx context.Context) error {
+	return c.resumeProgram(ctx, 0, 0, false)
+}
+
+// ResumeProgramRun resumes exactly the specified paused execution. A zero
+// DocumentID is valid only for a legacy run; RunID is always required.
+func (c *Controller) ResumeProgramRun(ctx context.Context, documentID DocumentID, runID RunID) error {
+	if runID == 0 {
+		c.emitError(ErrProgramRunMismatch)
+		return ErrProgramRunMismatch
+	}
+	return c.resumeProgram(ctx, documentID, runID, true)
+}
+
+func (c *Controller) resumeProgram(ctx context.Context, documentID DocumentID, runID RunID, requireRunMatch bool) error {
 	c.mu.Lock()
 	run := c.run
+	if requireRunMatch && (run == nil || run.documentID != documentID || run.runID != runID) {
+		c.mu.Unlock()
+		c.emitError(ErrProgramRunMismatch)
+		return ErrProgramRunMismatch
+	}
 	if run != nil && run.pauseTransition != 0 {
 		c.mu.Unlock()
 		c.emitError(ErrPauseInProgress)

@@ -13,8 +13,31 @@ import (
 // The source remains in the QPlainTextEdit unchanged, allowing future use of
 // SetExtraSelections for execution highlighting.
 type GCodeSourceView struct {
-	editor *qt.QPlainTextEdit
-	gutter *qt.QWidget
+	editor          *qt.QPlainTextEdit
+	gutter          *qt.QWidget
+	highlightedLine int
+}
+
+// HighlightPhysicalLine selects one original physical source line without
+// modifying document text. The source is read-only; this is presentation only.
+func (v *GCodeSourceView) HighlightPhysicalLine(line int, follow bool) {
+	if line <= 0 {
+		return
+	}
+	if line == v.highlightedLine && !follow {
+		return
+	}
+	block := v.editor.Document().FindBlockByNumber(line - 1)
+	if !block.IsValid() {
+		return
+	}
+	cursor := qt.NewQTextCursor4(block)
+	cursor.Select(qt.QTextCursor__LineUnderCursor)
+	v.editor.SetTextCursor(cursor)
+	if follow && line != v.highlightedLine {
+		v.editor.EnsureCursorVisible()
+	}
+	v.highlightedLine = line
 }
 
 func newGCodeSourceView(source string) *GCodeSourceView {

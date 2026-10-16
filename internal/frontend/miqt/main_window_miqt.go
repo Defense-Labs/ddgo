@@ -389,9 +389,9 @@ func (w *MainWindow) bind() {
 	w.connectButton.OnClicked(func() { w.toggleConnection() })
 	w.browseButton.OnClicked(func() { w.browseAndLoadProgram() })
 	w.runButton.OnClicked(func() { w.startProgram() })
-	w.pauseButton.OnClicked(func() { go func() { _ = w.controller.PauseProgram(context.Background()) }() })
-	w.resumeButton.OnClicked(func() { go func() { _ = w.controller.ResumeProgram(context.Background()) }() })
-	w.stopButton.OnClicked(func() { go func() { _ = w.controller.StopProgram(context.Background()) }() })
+	w.pauseButton.OnClicked(func() { w.pauseLegacyProgram() })
+	w.resumeButton.OnClicked(func() { w.resumeLegacyProgram() })
+	w.stopButton.OnClicked(func() { w.stopLegacyProgram() })
 	w.jogXPButton.OnClicked(func() { w.jog("X", +1) })
 	w.jogXMButton.OnClicked(func() { w.jog("X", -1) })
 	w.jogYPButton.OnClicked(func() { w.jog("Y", +1) })
@@ -466,6 +466,29 @@ func (w *MainWindow) startProgram() {
 		return
 	}
 	go func() { _ = w.controller.StartProgram(context.Background()) }()
+}
+
+func (w *MainWindow) legacyRunID() (app.RunID, bool) {
+	state := w.controller.Snapshot()
+	return state.ProgramRunID, state.ProgramDocumentID == 0 && state.ProgramRunID != 0
+}
+
+func (w *MainWindow) pauseLegacyProgram() {
+	if runID, ok := w.legacyRunID(); ok {
+		go func() { _ = w.controller.PauseProgramRun(context.Background(), 0, runID) }()
+	}
+}
+
+func (w *MainWindow) resumeLegacyProgram() {
+	if runID, ok := w.legacyRunID(); ok {
+		go func() { _ = w.controller.ResumeProgramRun(context.Background(), 0, runID) }()
+	}
+}
+
+func (w *MainWindow) stopLegacyProgram() {
+	if runID, ok := w.legacyRunID(); ok {
+		go func() { _ = w.controller.StopProgramRun(context.Background(), 0, runID) }()
+	}
 }
 
 func (w *MainWindow) sendCommand() {

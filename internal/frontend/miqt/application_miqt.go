@@ -28,6 +28,11 @@ type Application struct {
 	pendingDocumentCloses  map[app.DocumentID]app.RunID
 	approvedDocumentCloses map[app.DocumentID]bool
 	documentCloseResults   chan documentCloseResult
+	pendingDocumentStarts  map[app.DocumentID]documentStartRequest
+	documentStartResults   chan documentStartResult
+	pendingDocumentActions map[app.DocumentID]app.RunID
+	documentActionResults  chan documentActionResult
+	nextDocumentStartID    uint64
 
 	shutdown            frontend.ShutdownCoordinator
 	shutdownStopResults chan shutdownStopResult
@@ -36,6 +41,19 @@ type Application struct {
 }
 
 type documentCloseResult struct {
+	documentID app.DocumentID
+	runID      app.RunID
+	err        error
+}
+
+type documentStartRequest struct{ id uint64 }
+type documentStartResult struct {
+	documentID app.DocumentID
+	requestID  uint64
+	runID      app.RunID
+	err        error
+}
+type documentActionResult struct {
 	documentID app.DocumentID
 	runID      app.RunID
 	err        error
@@ -65,6 +83,10 @@ func (a *Application) Run() error {
 	a.pendingDocumentCloses = make(map[app.DocumentID]app.RunID)
 	a.approvedDocumentCloses = make(map[app.DocumentID]bool)
 	a.documentCloseResults = make(chan documentCloseResult, 16)
+	a.pendingDocumentStarts = make(map[app.DocumentID]documentStartRequest)
+	a.documentStartResults = make(chan documentStartResult, 16)
+	a.pendingDocumentActions = make(map[app.DocumentID]app.RunID)
+	a.documentActionResults = make(chan documentActionResult, 16)
 	a.shutdownStopResults = make(chan shutdownStopResult, 2)
 
 	mainWindow := newMainWindow(a.controller, func() { a.openGCodeFile() }, func() { a.startLegacyProgram() })
@@ -101,8 +123,23 @@ func (a *Application) openGCodeFile() {
 		return
 	}
 	if opened {
-		entry.Window.Focus()
+		window, ok := entry.Window.(*GCodeWindow)
+		if !ok {
+			return
+		}
+		a.configureDocumentExecution(entry, window)
+		window.Focus()
 	}
+}
+
+func (a *Application) configureDocumentExecution(entry frontend.DocumentEntry, window *GCodeWindow) {
+	program, err := gcode.ProgramFromDocument(entry.Document)
+	window.SetExecution(entry.ID, program, err,
+		func() { a.startDocumentProgram(entry.ID) },
+		func() { a.documentProgramAction(entry.ID, "pause") },
+		func() { a.documentProgramAction(entry.ID, "resume") },
+		func() { a.documentProgramAction(entry.ID, "stop") },
+	)
 }
 
 func (a *Application) drainControllerEvents() {
@@ -111,10 +148,143 @@ func (a *Application) drainControllerEvents() {
 		case event := <-a.controller.Events():
 			a.dispatcher.Dispatch(event)
 		default:
+			a.drainDocumentStartResults()
+			a.drainDocumentActionResults()
 			a.drainDocumentCloseResults()
 			a.drainShutdownStopResults()
 			a.progressShutdown()
 			a.syncProgramStartGate()
+			return
+		}
+	}
+}
+
+func (a *Application) startDocumentProgram(id app.DocumentID) {
+	if _, pending := a.pendingDocumentStarts[id]; pending || a.documents.ClosePending(id) {
+		return
+	}
+	entry, ok := a.documents.Entry(id)
+	if !ok {
+		return
+	}
+	window, ok := entry.Window.(*GCodeWindow)
+	if !ok {
+		return
+	}
+	admission, ok := a.programStarts.Acquire()
+	if !ok {
+		return
+	}
+	a.nextDocumentStartID++
+	if a.nextDocumentStartID == 0 {
+		a.nextDocumentStartID++
+	}
+	request := documentStartRequest{id: a.nextDocumentStartID}
+	a.pendingDocumentStarts[id] = request
+	window.SetStartPending(true)
+	// Parse retained source, never the filesystem path. ProgramFromDocument
+	// preserves original physical source-line numbers for presentation.
+	program, parseErr := gcode.ProgramFromDocument(entry.Document)
+	go func() {
+		defer admission.Release()
+		if parseErr != nil {
+			a.documentStartResults <- documentStartResult{documentID: id, requestID: request.id, err: parseErr}
+			return
+		}
+		runID, err := a.controller.StartDocumentProgram(context.Background(), id, program)
+		a.documentStartResults <- documentStartResult{documentID: id, requestID: request.id, runID: runID, err: err}
+	}()
+}
+
+func (a *Application) drainDocumentStartResults() {
+	for {
+		select {
+		case result := <-a.documentStartResults:
+			request, pending := a.pendingDocumentStarts[result.documentID]
+			if !pending || request.id != result.requestID {
+				continue
+			}
+			delete(a.pendingDocumentStarts, result.documentID)
+			entry, open := a.documents.Entry(result.documentID)
+			if !open {
+				continue
+			}
+			window, ok := entry.Window.(*GCodeWindow)
+			if !ok {
+				continue
+			}
+			window.StartResult(result.runID, result.err)
+			if !a.documents.ClosePending(result.documentID) {
+				continue
+			}
+			a.documents.ClearClosePending(result.documentID)
+			state := a.controller.Snapshot()
+			if result.err != nil {
+				if !state.ProgramStatus.IsActive() {
+					_ = window.Close()
+				}
+				continue
+			}
+			// A successful admission is never auto-stopped. Reissue the close
+			// request on the UI thread so the normal Stop-and-Close confirmation
+			// governs this exact run.
+			if state.ProgramDocumentID == result.documentID && state.ProgramRunID == result.runID && state.ProgramStatus.IsActive() {
+				_ = window.Close()
+			}
+		default:
+			return
+		}
+	}
+}
+
+func (a *Application) documentProgramAction(id app.DocumentID, action string) {
+	if _, pending := a.pendingDocumentActions[id]; pending {
+		return
+	}
+	state := a.controller.Snapshot()
+	if state.ProgramDocumentID != id || state.ProgramRunID == 0 {
+		return
+	}
+	runID := state.ProgramRunID
+	entry, ok := a.documents.Entry(id)
+	if !ok {
+		return
+	}
+	window, ok := entry.Window.(*GCodeWindow)
+	if !ok {
+		return
+	}
+	a.pendingDocumentActions[id] = runID
+	window.SetOperationPending(true)
+	go func() {
+		var err error
+		switch action {
+		case "pause":
+			err = a.controller.PauseProgramRun(context.Background(), id, runID)
+		case "resume":
+			err = a.controller.ResumeProgramRun(context.Background(), id, runID)
+		case "stop":
+			err = a.controller.StopProgramRun(context.Background(), id, runID)
+		}
+		a.documentActionResults <- documentActionResult{documentID: id, runID: runID, err: err}
+	}()
+}
+
+func (a *Application) drainDocumentActionResults() {
+	for {
+		select {
+		case result := <-a.documentActionResults:
+			runID, pending := a.pendingDocumentActions[result.documentID]
+			if !pending || runID != result.runID {
+				continue
+			}
+			delete(a.pendingDocumentActions, result.documentID)
+			if entry, ok := a.documents.Entry(result.documentID); ok {
+				if window, ok := entry.Window.(*GCodeWindow); ok {
+					window.OperationResult(result.err)
+				}
+			}
+		default:
 			return
 		}
 	}
@@ -181,6 +351,12 @@ func (a *Application) requestDocumentClose(id app.DocumentID) bool {
 	if !ok {
 		return true
 	}
+	if _, pending := a.pendingDocumentStarts[id]; pending {
+		// The UI accepted Run before its controller call returned. Keep the
+		// document alive until that exact admission resolves.
+		a.documents.MarkClosePending(id)
+		return false
+	}
 	if a.documents.ClosePending(id) {
 		return false
 	}
@@ -244,6 +420,8 @@ func (a *Application) drainDocumentCloseResults() {
 
 func (a *Application) documentClosed(entry frontend.DocumentEntry) {
 	delete(a.pendingDocumentCloses, entry.ID)
+	delete(a.pendingDocumentStarts, entry.ID)
+	delete(a.pendingDocumentActions, entry.ID)
 	delete(a.approvedDocumentCloses, entry.ID)
 	// Do not close the main window here: this callback runs inside native
 	// document destruction. The next UI timer turn advances the coordinator.

@@ -33,6 +33,7 @@ func MainWindowControls(state app.State) MainWindowControlState {
 	recovering := state.EStopStatus == app.EStopRecovery
 	ordinaryAlarmRecovery := machineRecoveryRequired && strings.EqualFold(state.MachineState, "Alarm")
 	loaded := state.ProgramTotal > 0
+	legacyRun := state.ProgramDocumentID == 0 && state.ProgramRunID != 0
 
 	canManual := connected && safetyClear && machineReady && !programActive
 	canRun := connected && safetyClear && machineReady && loaded && !programActive
@@ -45,9 +46,9 @@ func MainWindowControls(state app.State) MainWindowControlState {
 		ProgramPathEnabled:   !programActive,
 		BrowseProgramEnabled: !programActive,
 		RunProgramEnabled:    canRun,
-		PauseProgramEnabled:  state.ProgramStatus == app.ProgramRunning || state.ProgramStatus == app.ProgramDraining,
-		ResumeProgramEnabled: state.ProgramStatus == app.ProgramPaused && machineReady,
-		StopProgramEnabled:   programActive && state.ProgramStatus != app.ProgramStopping,
+		PauseProgramEnabled:  legacyRun && (state.ProgramStatus == app.ProgramRunning || state.ProgramStatus == app.ProgramDraining),
+		ResumeProgramEnabled: legacyRun && state.ProgramStatus == app.ProgramPaused && machineReady,
+		StopProgramEnabled:   legacyRun && programActive && state.ProgramStatus != app.ProgramStopping,
 
 		ManualControlsEnabled: canManual,
 		UnlockEnabled: canManual ||

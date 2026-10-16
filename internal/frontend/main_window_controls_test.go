@@ -77,6 +77,7 @@ func TestMainWindowControls(t *testing.T) {
 				EStopStatus:      app.EStopClear,
 				ProgramStatus:    app.ProgramRunning,
 				ProgramTotal:     10,
+				ProgramRunID:     1,
 			},
 			want: MainWindowControlState{
 				PauseProgramEnabled: true,
@@ -90,6 +91,7 @@ func TestMainWindowControls(t *testing.T) {
 				EStopStatus:      app.EStopClear,
 				ProgramStatus:    app.ProgramPaused,
 				ProgramTotal:     10,
+				ProgramRunID:     1,
 			},
 			want: MainWindowControlState{
 				ResumeProgramEnabled: true,
@@ -104,11 +106,24 @@ func TestMainWindowControls(t *testing.T) {
 				ProgramStatus:    app.ProgramDraining,
 				ProgramTotal:     10,
 				ProgramComplete:  10,
+				ProgramRunID:     1,
 			},
 			want: MainWindowControlState{
 				PauseProgramEnabled: true,
 				StopProgramEnabled:  true,
 			},
+		},
+		{
+			name: "document-owned program",
+			state: app.State{
+				ConnectionStatus:  app.ConnectionConnected,
+				EStopStatus:       app.EStopClear,
+				ProgramStatus:     app.ProgramRunning,
+				ProgramTotal:      10,
+				ProgramDocumentID: 9,
+				ProgramRunID:      1,
+			},
+			want: MainWindowControlState{},
 		},
 		{
 			name: "stopping program",
