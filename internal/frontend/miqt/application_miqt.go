@@ -34,8 +34,9 @@ type Application struct {
 	documentActionResults  chan documentActionResult
 	nextDocumentStartID    uint64
 	legacyPrograms         frontend.LegacyProgramCoordinator
-	legacyLoadResults      chan legacyLoadResult
-	legacyRunResults       chan legacyRunResult
+	legacyRequests         frontend.LegacyProgramRequests
+	legacyLoadResults      chan frontend.LegacyProgramLoadResult
+	legacyRunResults       chan frontend.LegacyProgramRunResult
 
 	shutdown            frontend.ShutdownCoordinator
 	shutdownStopResults chan shutdownStopResult
@@ -61,15 +62,6 @@ type documentActionResult struct {
 	runID      app.RunID
 	err        error
 }
-type legacyLoadResult struct {
-	id  uint64
-	err error
-}
-type legacyRunResult struct {
-	id  uint64
-	err error
-}
-
 type shutdownStopResult struct {
 	attempt frontend.ShutdownAttemptID
 	target  frontend.ShutdownStopTarget
@@ -98,8 +90,21 @@ func (a *Application) Run() error {
 	a.documentStartResults = make(chan documentStartResult, 16)
 	a.pendingDocumentActions = make(map[app.DocumentID]app.RunID)
 	a.documentActionResults = make(chan documentActionResult, 16)
-	a.legacyLoadResults = make(chan legacyLoadResult, 1)
-	a.legacyRunResults = make(chan legacyRunResult, 1)
+	a.legacyLoadResults = make(chan frontend.LegacyProgramLoadResult, 1)
+	a.legacyRunResults = make(chan frontend.LegacyProgramRunResult, 1)
+	a.legacyRequests = frontend.LegacyProgramRequests{
+		Coordinator: &a.legacyPrograms,
+		StartGate:   &a.programStarts,
+		Load:        a.controller.LoadProgramFile,
+		Start:       a.controller.StartProgram,
+		OnChange:    a.refreshLegacyProgramCoordination,
+		OnLoadDone: func(result frontend.LegacyProgramLoadResult) {
+			a.legacyLoadResults <- result
+		},
+		OnRunDone: func(result frontend.LegacyProgramRunResult) {
+			a.legacyRunResults <- result
+		},
+	}
 	a.shutdownStopResults = make(chan shutdownStopResult, 2)
 
 	mainWindow := newMainWindow(a.controller, func() { a.openGCodeFile() }, func() { a.startLegacyProgram() }, func(path string) { a.loadLegacyProgram(path) })
@@ -308,54 +313,30 @@ func (a *Application) drainDocumentActionResults() {
 // controller goroutine is launched. The controller remains authoritative for
 // actual program admission and all machine-safety checks.
 func (a *Application) startLegacyProgram() {
-	id, ok := a.legacyPrograms.BeginRun()
-	if !ok {
-		return
-	}
-	admission, ok := a.programStarts.Acquire()
-	if !ok {
-		a.legacyPrograms.FinishRun(id)
-		return
-	}
-	a.refreshLegacyProgramCoordination()
-	go func() {
-		defer admission.Release()
-		err := a.controller.StartProgram(context.Background())
-		a.legacyRunResults <- legacyRunResult{id: id, err: err}
-	}()
+	a.legacyRequests.RequestRun()
 }
 
 func (a *Application) loadLegacyProgram(path string) {
 	if a.shutdown.Active() {
 		return
 	}
-	id, ok := a.legacyPrograms.BeginLoad()
-	if !ok {
-		return
-	}
-	a.refreshLegacyProgramCoordination()
-	go func() {
-		err := a.controller.LoadProgramFile(path)
-		a.legacyLoadResults <- legacyLoadResult{id: id, err: err}
-	}()
+	a.legacyRequests.RequestLoad(path)
 }
 
 func (a *Application) drainLegacyProgramResults() {
 	for {
 		select {
 		case result := <-a.legacyLoadResults:
-			if !a.legacyPrograms.FinishLoad(result.id) {
+			if !a.legacyRequests.FinishLoad(result) {
 				continue
 			}
-			a.refreshLegacyProgramCoordination()
-			if result.err != nil {
-				a.warnMain("Unable to Load Program", result.err.Error())
+			if result.Err != nil {
+				a.warnMain("Unable to Load Program", result.Err.Error())
 			}
 		case result := <-a.legacyRunResults:
-			if !a.legacyPrograms.FinishRun(result.id) {
+			if !a.legacyRequests.FinishRun(result) {
 				continue
 			}
-			a.refreshLegacyProgramCoordination()
 		default:
 			return
 		}
