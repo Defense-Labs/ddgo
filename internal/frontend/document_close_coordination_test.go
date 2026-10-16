@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/ianbruene/ddgo/internal/app"
+	"github.com/ianbruene/ddgo/internal/gcode"
 )
 
 func stoppedDocumentState(documentID app.DocumentID, runID app.RunID) app.State {
@@ -53,5 +54,31 @@ func TestDocumentCloseApprovalSuperseded(t *testing.T) {
 	}
 	if DocumentCloseApprovalSuperseded(documentID, runID, app.State{ProgramDocumentID: documentID + 1, ProgramRunID: runID + 1, ProgramStatus: app.ProgramRunning}) {
 		t.Fatal("other document superseded approval")
+	}
+}
+
+func TestDocumentCloseApprovalSupersessionReleasesRegistryForLaterClose(t *testing.T) {
+	registry, _ := newTestDocumentRegistry(t)
+	path := writeDocument(t, "approval.gcode", "G0 X1\n")
+	var windows []*fakeDocumentWindow
+	entry, opened, err := registry.OpenFile(path, gcode.LoadDocument, testDocumentWindowFactory(&windows))
+	if err != nil || !opened {
+		t.Fatalf("OpenFile() = (%v, %v)", opened, err)
+	}
+	if !registry.MarkClosePending(entry.ID) {
+		t.Fatal("could not mark initial close pending")
+	}
+	approvals := DocumentCloseApprovals{entry.ID: 10}
+	if !approvals.InvalidateSuperseded(registry, entry.ID, app.State{ProgramDocumentID: entry.ID, ProgramRunID: 11, ProgramStatus: app.ProgramRunning}) {
+		t.Fatal("replacement run did not invalidate approval")
+	}
+	if registry.ClosePending(entry.ID) {
+		t.Fatal("superseded approval stranded ClosePending")
+	}
+	if _, ok := approvals[entry.ID]; ok {
+		t.Fatal("superseded run retained close approval")
+	}
+	if !registry.MarkClosePending(entry.ID) {
+		t.Fatal("later legitimate close could not begin")
 	}
 }

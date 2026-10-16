@@ -29,6 +29,28 @@ func TestDocumentExecutionPresentationMapsPhysicalLinesAndRetainsHistory(t *test
 	}
 }
 
+func TestDocumentExecutionPresentationClearsNextLineForTerminalStates(t *testing.T) {
+	program := gcode.Program{Lines: []gcode.Line{{Number: 2, Text: "G0 X1"}, {Number: 5, Text: "G1 X2"}}}
+	for _, status := range []app.ProgramStatus{app.ProgramDraining, app.ProgramStopping, app.ProgramStopped, app.ProgramCompleted, app.ProgramFailed} {
+		t.Run(string(status), func(t *testing.T) {
+			p := NewDocumentExecutionPresentation(7, program)
+			p.ApplyState(app.State{ProgramDocumentID: 7, ProgramRunID: 11, ProgramStatus: status, ProgramTotal: 2, ProgramComplete: 1, ProgramError: "failure"})
+			if p.NextLine != 0 || p.Complete != 1 {
+				t.Fatalf("terminal presentation = %+v", p)
+			}
+		})
+	}
+	for _, status := range []app.ProgramStatus{app.ProgramRunning, app.ProgramPaused} {
+		t.Run("active-"+string(status), func(t *testing.T) {
+			p := NewDocumentExecutionPresentation(7, program)
+			p.ApplyState(app.State{ProgramDocumentID: 7, ProgramRunID: 11, ProgramStatus: status, ProgramTotal: 2, ProgramComplete: 1})
+			if p.NextLine != 5 {
+				t.Fatalf("active presentation next line = %d, want 5", p.NextLine)
+			}
+		})
+	}
+}
+
 func TestDocumentExecutionPresentationAttributesOnlyExactRunErrors(t *testing.T) {
 	p := NewDocumentExecutionPresentation(7, gcode.Program{Lines: []gcode.Line{{Number: 1, Text: "G0 X1"}}})
 	p.ApplyState(app.State{ProgramDocumentID: 7, ProgramRunID: 3, ProgramStatus: app.ProgramRunning, ProgramTotal: 1})

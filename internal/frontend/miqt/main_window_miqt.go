@@ -17,6 +17,7 @@ type MainWindow struct {
 	controller     *app.Controller
 	onOpen         func()
 	onStartProgram func()
+	onLoadProgram  func(string)
 	onClose        func()
 	onCloseRequest func() bool
 	closeNotified  bool
@@ -76,10 +77,12 @@ type MainWindow struct {
 	programStatus     *qt.QLabel
 	programProgress   *qt.QLabel
 	lastErrorLabel    *qt.QLabel
+	legacyLoadPending bool
+	legacyRunPending  bool
 }
 
-func newMainWindow(controller *app.Controller, onOpen func(), onStartProgram func()) *MainWindow {
-	w := &MainWindow{controller: controller, onOpen: onOpen, onStartProgram: onStartProgram}
+func newMainWindow(controller *app.Controller, onOpen func(), onStartProgram func(), onLoadProgram func(string)) *MainWindow {
+	w := &MainWindow{controller: controller, onOpen: onOpen, onStartProgram: onStartProgram, onLoadProgram: onLoadProgram}
 	w.build()
 	w.bind()
 	return w
@@ -456,8 +459,17 @@ func (w *MainWindow) browseAndLoadProgram() {
 	if path == "" {
 		return
 	}
-	w.programPath.SetText(path)
+	if w.onLoadProgram != nil {
+		w.onLoadProgram(path)
+		return
+	}
 	go func() { _ = w.controller.LoadProgramFile(path) }()
+}
+
+func (w *MainWindow) SetLegacyOperationPending(loadPending, runPending bool) {
+	w.legacyLoadPending = loadPending
+	w.legacyRunPending = runPending
+	w.ApplyState(w.controller.Snapshot())
 }
 
 func (w *MainWindow) startProgram() {
@@ -643,7 +655,7 @@ func (w *MainWindow) ApplyState(state app.State) {
 		w.lastErrorLabel.SetText("Last error: none")
 	}
 
-	controls := frontend.MainWindowControls(state)
+	controls := frontend.MainWindowControlsWithLegacyOperations(state, w.legacyLoadPending, w.legacyRunPending)
 
 	w.refreshButton.SetEnabled(controls.RefreshPortsEnabled)
 	w.connectButton.SetEnabled(controls.ConnectEnabled)

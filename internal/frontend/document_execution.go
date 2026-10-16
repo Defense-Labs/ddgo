@@ -82,7 +82,7 @@ func (p *DocumentExecutionPresentation) ApplyState(state app.State) {
 	p.Complete = state.ProgramComplete
 	p.Error = state.ProgramError
 	p.NextLine = 0
-	if p.Complete >= 0 && p.Complete < len(p.lines) {
+	if (p.Status == app.ProgramRunning || p.Status == app.ProgramPaused) && p.Complete >= 0 && p.Complete < len(p.lines) {
 		p.NextLine = p.lines[p.Complete].Number
 	}
 	switch p.Status {

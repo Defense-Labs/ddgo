@@ -8,6 +8,11 @@ import "github.com/ianbruene/ddgo/internal/app"
 // Qt.
 type DocumentStopDisposition uint8
 
+// DocumentCloseApprovals retains independently verified Stop-and-Close
+// approvals by their exact run. It is intentionally distinct from shutdown's
+// selected-document authorization.
+type DocumentCloseApprovals map[app.DocumentID]app.RunID
+
 const (
 	DocumentStopInvalid DocumentStopDisposition = iota
 	DocumentStopCloseIndependently
@@ -35,4 +40,19 @@ func ClassifyDocumentStopResult(err error, documentOpen bool, documentID app.Doc
 // native close or a new Stop request.
 func DocumentCloseApprovalSuperseded(documentID app.DocumentID, approvedRunID app.RunID, state app.State) bool {
 	return approvedRunID != 0 && state.ProgramStatus.IsActive() && state.ProgramDocumentID == documentID && state.ProgramRunID != approvedRunID
+}
+
+// InvalidateSuperseded releases both an obsolete approval and the registry's
+// close-pending flag. A later explicit close can then safely start its own
+// exact-run lifecycle instead of being stranded by the old request.
+func (a DocumentCloseApprovals) InvalidateSuperseded(registry *DocumentRegistry, documentID app.DocumentID, state app.State) bool {
+	runID, ok := a[documentID]
+	if !ok || !DocumentCloseApprovalSuperseded(documentID, runID, state) {
+		return false
+	}
+	delete(a, documentID)
+	if registry != nil {
+		registry.ClearClosePending(documentID)
+	}
+	return true
 }

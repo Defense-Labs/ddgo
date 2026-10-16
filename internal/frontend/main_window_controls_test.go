@@ -268,6 +268,15 @@ func TestMainWindowControls(t *testing.T) {
 	if !legacyRetained.RunProgramEnabled {
 		t.Fatal("retained legacy program was not runnable after document completion")
 	}
+	pendingLoad := MainWindowControlsWithLegacyOperations(app.State{
+		ConnectionStatus:    app.ConnectionConnected,
+		EStopStatus:         app.EStopClear,
+		LegacyProgramLoaded: true,
+		LegacyProgramTotal:  2,
+	}, true, false)
+	if pendingLoad.RunProgramEnabled || pendingLoad.BrowseProgramEnabled || pendingLoad.ProgramPathEnabled {
+		t.Fatalf("pending load left legacy controls enabled: %+v", pendingLoad)
+	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

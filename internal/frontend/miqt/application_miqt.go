@@ -26,13 +26,16 @@ type Application struct {
 	mainWindow *MainWindow
 
 	pendingDocumentCloses  map[app.DocumentID]app.RunID
-	approvedDocumentCloses map[app.DocumentID]app.RunID
+	approvedDocumentCloses frontend.DocumentCloseApprovals
 	documentCloseResults   chan documentCloseResult
 	pendingDocumentStarts  map[app.DocumentID]documentStartRequest
 	documentStartResults   chan documentStartResult
 	pendingDocumentActions map[app.DocumentID]app.RunID
 	documentActionResults  chan documentActionResult
 	nextDocumentStartID    uint64
+	legacyPrograms         frontend.LegacyProgramCoordinator
+	legacyLoadResults      chan legacyLoadResult
+	legacyRunResults       chan legacyRunResult
 
 	shutdown            frontend.ShutdownCoordinator
 	shutdownStopResults chan shutdownStopResult
@@ -58,6 +61,14 @@ type documentActionResult struct {
 	runID      app.RunID
 	err        error
 }
+type legacyLoadResult struct {
+	id  uint64
+	err error
+}
+type legacyRunResult struct {
+	id  uint64
+	err error
+}
 
 type shutdownStopResult struct {
 	attempt frontend.ShutdownAttemptID
@@ -81,15 +92,17 @@ func (a *Application) Run() error {
 	a.documents = frontend.NewDocumentRegistry(a.windows)
 	a.documents.SetOnClose(a.documentClosed)
 	a.pendingDocumentCloses = make(map[app.DocumentID]app.RunID)
-	a.approvedDocumentCloses = make(map[app.DocumentID]app.RunID)
+	a.approvedDocumentCloses = make(frontend.DocumentCloseApprovals)
 	a.documentCloseResults = make(chan documentCloseResult, 16)
 	a.pendingDocumentStarts = make(map[app.DocumentID]documentStartRequest)
 	a.documentStartResults = make(chan documentStartResult, 16)
 	a.pendingDocumentActions = make(map[app.DocumentID]app.RunID)
 	a.documentActionResults = make(chan documentActionResult, 16)
+	a.legacyLoadResults = make(chan legacyLoadResult, 1)
+	a.legacyRunResults = make(chan legacyRunResult, 1)
 	a.shutdownStopResults = make(chan shutdownStopResult, 2)
 
-	mainWindow := newMainWindow(a.controller, func() { a.openGCodeFile() }, func() { a.startLegacyProgram() })
+	mainWindow := newMainWindow(a.controller, func() { a.openGCodeFile() }, func() { a.startLegacyProgram() }, func(path string) { a.loadLegacyProgram(path) })
 	a.mainWindow = mainWindow
 	mainWindow.SetOnCloseRequest(a.requestMainClose)
 	a.windows.Add(mainWindow)
@@ -148,6 +161,7 @@ func (a *Application) drainControllerEvents() {
 		case event := <-a.controller.Events():
 			a.dispatcher.Dispatch(event)
 		default:
+			a.drainLegacyProgramResults()
 			a.drainDocumentStartResults()
 			a.drainDocumentActionResults()
 			a.drainDocumentCloseResults()
@@ -294,14 +308,64 @@ func (a *Application) drainDocumentActionResults() {
 // controller goroutine is launched. The controller remains authoritative for
 // actual program admission and all machine-safety checks.
 func (a *Application) startLegacyProgram() {
-	admission, ok := a.programStarts.Acquire()
+	id, ok := a.legacyPrograms.BeginRun()
 	if !ok {
 		return
 	}
+	admission, ok := a.programStarts.Acquire()
+	if !ok {
+		a.legacyPrograms.FinishRun(id)
+		return
+	}
+	a.refreshLegacyProgramCoordination()
 	go func() {
 		defer admission.Release()
-		_ = a.controller.StartProgram(context.Background())
+		err := a.controller.StartProgram(context.Background())
+		a.legacyRunResults <- legacyRunResult{id: id, err: err}
 	}()
+}
+
+func (a *Application) loadLegacyProgram(path string) {
+	if a.shutdown.Active() {
+		return
+	}
+	id, ok := a.legacyPrograms.BeginLoad()
+	if !ok {
+		return
+	}
+	a.refreshLegacyProgramCoordination()
+	go func() {
+		err := a.controller.LoadProgramFile(path)
+		a.legacyLoadResults <- legacyLoadResult{id: id, err: err}
+	}()
+}
+
+func (a *Application) drainLegacyProgramResults() {
+	for {
+		select {
+		case result := <-a.legacyLoadResults:
+			if !a.legacyPrograms.FinishLoad(result.id) {
+				continue
+			}
+			a.refreshLegacyProgramCoordination()
+			if result.err != nil {
+				a.warnMain("Unable to Load Program", result.err.Error())
+			}
+		case result := <-a.legacyRunResults:
+			if !a.legacyPrograms.FinishRun(result.id) {
+				continue
+			}
+			a.refreshLegacyProgramCoordination()
+		default:
+			return
+		}
+	}
+}
+
+func (a *Application) refreshLegacyProgramCoordination() {
+	if a.mainWindow != nil {
+		a.mainWindow.SetLegacyOperationPending(a.legacyPrograms.LoadPending(), a.legacyPrograms.RunPending())
+	}
 }
 
 func (a *Application) syncProgramStartGate() {
@@ -337,13 +401,11 @@ func (a *Application) requestDocumentClose(id app.DocumentID) bool {
 		}
 		return true
 	}
-	if approvedRunID, approved := a.approvedDocumentCloses[id]; approved {
+	if _, approved := a.approvedDocumentCloses[id]; approved {
 		state := a.controller.Snapshot()
-		if frontend.DocumentCloseApprovalSuperseded(id, approvedRunID, state) {
+		if a.approvedDocumentCloses.InvalidateSuperseded(a.documents, id, state) {
 			// A new run for this document supersedes an earlier Stop-and-Close
 			// approval and requires a fresh explicit close request.
-			delete(a.approvedDocumentCloses, id)
-			a.documents.ClearClosePending(id)
 			return false
 		}
 		return true
@@ -437,6 +499,10 @@ func (a *Application) requestMainClose() bool {
 		return true
 	}
 	if a.shutdown.Active() {
+		return false
+	}
+	if a.legacyPrograms.LoadPending() {
+		a.warnMain("Program Load In Progress", "Wait for the selected legacy program to finish loading before closing DDGo.")
 		return false
 	}
 	state := a.controller.Snapshot()

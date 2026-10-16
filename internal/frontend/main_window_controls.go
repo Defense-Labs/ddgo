@@ -25,6 +25,13 @@ type MainWindowControlState struct {
 }
 
 func MainWindowControls(state app.State) MainWindowControlState {
+	return MainWindowControlsWithLegacyOperations(state, false, false)
+}
+
+// MainWindowControlsWithLegacyOperations adds the frontend-only coordination
+// state for the legacy Load/Run workflow. Controller state remains the
+// authority for all machine and execution admission checks.
+func MainWindowControlsWithLegacyOperations(state app.State, legacyLoadPending, legacyRunPending bool) MainWindowControlState {
 	programActive := state.ProgramStatus.IsActive()
 	connected := state.IsConnected()
 	safetyClear := state.EStopStatus == app.EStopClear
@@ -36,15 +43,16 @@ func MainWindowControls(state app.State) MainWindowControlState {
 	legacyRun := state.ProgramDocumentID == 0 && state.ProgramRunID != 0
 
 	canManual := connected && safetyClear && machineReady && !programActive
-	canRun := connected && safetyClear && machineReady && loaded && !programActive
+	legacyOperationPending := legacyLoadPending || legacyRunPending
+	canRun := connected && safetyClear && machineReady && loaded && !programActive && !legacyOperationPending
 
 	return MainWindowControlState{
 		RefreshPortsEnabled:  !programActive,
 		ConnectEnabled:       !programActive && !state.IsConnecting(),
 		PortSelectionEnabled: !programActive,
 
-		ProgramPathEnabled:   !programActive,
-		BrowseProgramEnabled: !programActive,
+		ProgramPathEnabled:   !programActive && !legacyOperationPending,
+		BrowseProgramEnabled: !programActive && !legacyOperationPending,
 		RunProgramEnabled:    canRun,
 		PauseProgramEnabled:  legacyRun && (state.ProgramStatus == app.ProgramRunning || state.ProgramStatus == app.ProgramDraining),
 		ResumeProgramEnabled: legacyRun && state.ProgramStatus == app.ProgramPaused && machineReady,
