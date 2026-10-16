@@ -33,10 +33,6 @@ type Application struct {
 	pendingDocumentActions map[app.DocumentID]app.RunID
 	documentActionResults  chan documentActionResult
 	nextDocumentStartID    uint64
-	legacyPrograms         frontend.LegacyProgramCoordinator
-	legacyRequests         frontend.LegacyProgramRequests
-	legacyLoadResults      chan frontend.LegacyProgramLoadResult
-	legacyRunResults       chan frontend.LegacyProgramRunResult
 
 	shutdown            frontend.ShutdownCoordinator
 	shutdownStopResults chan shutdownStopResult
@@ -90,24 +86,9 @@ func (a *Application) Run() error {
 	a.documentStartResults = make(chan documentStartResult, 16)
 	a.pendingDocumentActions = make(map[app.DocumentID]app.RunID)
 	a.documentActionResults = make(chan documentActionResult, 16)
-	a.legacyLoadResults = make(chan frontend.LegacyProgramLoadResult, 1)
-	a.legacyRunResults = make(chan frontend.LegacyProgramRunResult, 1)
-	a.legacyRequests = frontend.LegacyProgramRequests{
-		Coordinator: &a.legacyPrograms,
-		StartGate:   &a.programStarts,
-		Load:        a.controller.LoadProgramFile,
-		Start:       a.controller.StartProgram,
-		OnChange:    a.refreshLegacyProgramCoordination,
-		OnLoadDone: func(result frontend.LegacyProgramLoadResult) {
-			a.legacyLoadResults <- result
-		},
-		OnRunDone: func(result frontend.LegacyProgramRunResult) {
-			a.legacyRunResults <- result
-		},
-	}
 	a.shutdownStopResults = make(chan shutdownStopResult, 2)
 
-	mainWindow := newMainWindow(a.controller, func() { a.openGCodeFile() }, func() { a.startLegacyProgram() }, func(path string) { a.loadLegacyProgram(path) })
+	mainWindow := newMainWindow(a.controller, func() { a.openGCodeFile() }, a.showExecutionDocument, a.canShowExecutionDocument)
 	a.mainWindow = mainWindow
 	mainWindow.SetOnCloseRequest(a.requestMainClose)
 	a.windows.Add(mainWindow)
@@ -148,6 +129,7 @@ func (a *Application) openGCodeFile() {
 		a.configureDocumentExecution(entry, window)
 		window.Focus()
 	}
+	a.refreshExecutionSummary()
 }
 
 func (a *Application) configureDocumentExecution(entry frontend.DocumentEntry, window *GCodeWindow) {
@@ -166,7 +148,6 @@ func (a *Application) drainControllerEvents() {
 		case event := <-a.controller.Events():
 			a.dispatcher.Dispatch(event)
 		default:
-			a.drainLegacyProgramResults()
 			a.drainDocumentStartResults()
 			a.drainDocumentActionResults()
 			a.drainDocumentCloseResults()
@@ -309,46 +290,6 @@ func (a *Application) drainDocumentActionResults() {
 	}
 }
 
-// startLegacyProgram acquires frontend admission on the UI thread before the
-// controller goroutine is launched. The controller remains authoritative for
-// actual program admission and all machine-safety checks.
-func (a *Application) startLegacyProgram() {
-	a.legacyRequests.RequestRun()
-}
-
-func (a *Application) loadLegacyProgram(path string) {
-	if a.shutdown.Active() {
-		return
-	}
-	a.legacyRequests.RequestLoad(path)
-}
-
-func (a *Application) drainLegacyProgramResults() {
-	for {
-		select {
-		case result := <-a.legacyLoadResults:
-			if !a.legacyRequests.FinishLoad(result) {
-				continue
-			}
-			if result.Err != nil {
-				a.warnMain("Unable to Load Program", result.Err.Error())
-			}
-		case result := <-a.legacyRunResults:
-			if !a.legacyRequests.FinishRun(result) {
-				continue
-			}
-		default:
-			return
-		}
-	}
-}
-
-func (a *Application) refreshLegacyProgramCoordination() {
-	if a.mainWindow != nil {
-		a.mainWindow.SetLegacyOperationPending(a.legacyPrograms.LoadPending(), a.legacyPrograms.RunPending())
-	}
-}
-
 func (a *Application) syncProgramStartGate() {
 	if a.mainCloseIssued || a.shutdown.Phase() == frontend.ShutdownFinished {
 		a.programStarts.Finalize()
@@ -472,6 +413,35 @@ func (a *Application) documentClosed(entry frontend.DocumentEntry) {
 	if a.shutdown.Active() {
 		a.shutdown.DocumentClosed(a.shutdown.Attempt(), entry.ID)
 	}
+	a.refreshExecutionSummary()
+}
+
+func (a *Application) refreshExecutionSummary() {
+	if a.mainWindow != nil {
+		a.mainWindow.RefreshExecutionSummary()
+	}
+}
+
+func (a *Application) canShowExecutionDocument(documentID app.DocumentID, runID app.RunID) bool {
+	if a.documents == nil {
+		return false
+	}
+	state := a.controller.Snapshot()
+	_, open := a.documents.Entry(documentID)
+	return frontend.CanFocusExecutionSummary(state, documentID, runID, open)
+}
+
+func (a *Application) showExecutionDocument(documentID app.DocumentID, runID app.RunID) {
+	if !a.canShowExecutionDocument(documentID, runID) {
+		a.refreshExecutionSummary()
+		return
+	}
+	entry, open := a.documents.Entry(documentID)
+	if !open {
+		a.refreshExecutionSummary()
+		return
+	}
+	entry.Window.Focus()
 }
 
 func (a *Application) requestMainClose() bool {
@@ -480,10 +450,6 @@ func (a *Application) requestMainClose() bool {
 		return true
 	}
 	if a.shutdown.Active() {
-		return false
-	}
-	if a.legacyPrograms.LoadPending() {
-		a.warnMain("Program Load In Progress", "Wait for the selected legacy program to finish loading before closing DDGo.")
 		return false
 	}
 	state := a.controller.Snapshot()

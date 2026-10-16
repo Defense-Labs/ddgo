@@ -14,13 +14,13 @@ import (
 )
 
 type MainWindow struct {
-	controller     *app.Controller
-	onOpen         func()
-	onStartProgram func()
-	onLoadProgram  func(string)
-	onClose        func()
-	onCloseRequest func() bool
-	closeNotified  bool
+	controller      *app.Controller
+	onOpen          func()
+	onShowDocument  func(app.DocumentID, app.RunID)
+	canShowDocument func(app.DocumentID, app.RunID) bool
+	onClose         func()
+	onCloseRequest  func() bool
+	closeNotified   bool
 
 	window *qt.QMainWindow
 
@@ -29,60 +29,57 @@ type MainWindow struct {
 	sendButton     *qt.QPushButton
 	commandHistory frontend.CommandHistory
 
-	portCombo         *qt.QComboBox
-	refreshButton     *qt.QPushButton
-	connectButton     *qt.QPushButton
-	programPath       *qt.QLineEdit
-	browseButton      *qt.QPushButton
-	runButton         *qt.QPushButton
-	pauseButton       *qt.QPushButton
-	resumeButton      *qt.QPushButton
-	stopButton        *qt.QPushButton
-	stepCombo         *qt.QComboBox
-	feedCombo         *qt.QComboBox
-	xTravel           *qt.QLineEdit
-	yTravel           *qt.QLineEdit
-	zTravel           *qt.QLineEdit
-	jogXPButton       *qt.QPushButton
-	jogXMButton       *qt.QPushButton
-	jogYPButton       *qt.QPushButton
-	jogYMButton       *qt.QPushButton
-	jogZPButton       *qt.QPushButton
-	jogZMButton       *qt.QPushButton
-	jogToXPButton     *qt.QPushButton
-	jogToXMButton     *qt.QPushButton
-	jogToYPButton     *qt.QPushButton
-	jogToYMButton     *qt.QPushButton
-	jogToZPButton     *qt.QPushButton
-	jogToZMButton     *qt.QPushButton
-	stopMotionButton  *qt.QPushButton
-	unlockButton      *qt.QPushButton
-	homeButton        *qt.QPushButton
-	resetButton       *qt.QPushButton
-	holdButton        *qt.QPushButton
-	resumeActBtn      *qt.QPushButton
-	statusButton      *qt.QPushButton
-	connStatus        *qt.QLabel
-	safetyStatus      *qt.QLabel
-	machineStatus     *qt.QLabel
-	machinePos        *qt.QLabel
-	workPos           *qt.QLabel
-	feedSpindle       *qt.QLabel
-	spindleRPM        *qt.QSpinBox
-	spindleCWButton   *qt.QPushButton
-	spindleCCWButton  *qt.QPushButton
-	spindleSetButton  *qt.QPushButton
-	spindleStopButton *qt.QPushButton
-	spindleReported   *qt.QLabel
-	programStatus     *qt.QLabel
-	programProgress   *qt.QLabel
-	lastErrorLabel    *qt.QLabel
-	legacyLoadPending bool
-	legacyRunPending  bool
+	portCombo          *qt.QComboBox
+	refreshButton      *qt.QPushButton
+	connectButton      *qt.QPushButton
+	executionGroup     *qt.QGroupBox
+	executionName      *qt.QLabel
+	executionStatus    *qt.QLabel
+	executionProgress  *qt.QLabel
+	executionDetail    *qt.QLabel
+	showDocumentButton *qt.QPushButton
+	stepCombo          *qt.QComboBox
+	feedCombo          *qt.QComboBox
+	xTravel            *qt.QLineEdit
+	yTravel            *qt.QLineEdit
+	zTravel            *qt.QLineEdit
+	jogXPButton        *qt.QPushButton
+	jogXMButton        *qt.QPushButton
+	jogYPButton        *qt.QPushButton
+	jogYMButton        *qt.QPushButton
+	jogZPButton        *qt.QPushButton
+	jogZMButton        *qt.QPushButton
+	jogToXPButton      *qt.QPushButton
+	jogToXMButton      *qt.QPushButton
+	jogToYPButton      *qt.QPushButton
+	jogToYMButton      *qt.QPushButton
+	jogToZPButton      *qt.QPushButton
+	jogToZMButton      *qt.QPushButton
+	stopMotionButton   *qt.QPushButton
+	unlockButton       *qt.QPushButton
+	homeButton         *qt.QPushButton
+	resetButton        *qt.QPushButton
+	holdButton         *qt.QPushButton
+	resumeActBtn       *qt.QPushButton
+	statusButton       *qt.QPushButton
+	connStatus         *qt.QLabel
+	safetyStatus       *qt.QLabel
+	machineStatus      *qt.QLabel
+	machinePos         *qt.QLabel
+	workPos            *qt.QLabel
+	feedSpindle        *qt.QLabel
+	spindleRPM         *qt.QSpinBox
+	spindleCWButton    *qt.QPushButton
+	spindleCCWButton   *qt.QPushButton
+	spindleSetButton   *qt.QPushButton
+	spindleStopButton  *qt.QPushButton
+	spindleReported    *qt.QLabel
+	lastErrorLabel     *qt.QLabel
+	executionSummary   frontend.ExecutionSummary
 }
 
-func newMainWindow(controller *app.Controller, onOpen func(), onStartProgram func(), onLoadProgram func(string)) *MainWindow {
-	w := &MainWindow{controller: controller, onOpen: onOpen, onStartProgram: onStartProgram, onLoadProgram: onLoadProgram}
+func newMainWindow(controller *app.Controller, onOpen func(), onShowDocument func(app.DocumentID, app.RunID), canShowDocument func(app.DocumentID, app.RunID) bool) *MainWindow {
+	w := &MainWindow{controller: controller, onOpen: onOpen, onShowDocument: onShowDocument, canShowDocument: canShowDocument}
 	w.build()
 	w.bind()
 	return w
@@ -266,13 +263,13 @@ func (w *MainWindow) build() {
 	endJogLayout.AddWidget(w.stopMotionButton.QWidget)
 	endJogLayout.AddStretch()
 
-	rowConnectionProgram := qt.NewQWidget(nil)
-	rowConnectionProgramLayout := qt.NewQHBoxLayout(nil)
-	rowConnectionProgram.SetLayout(rowConnectionProgramLayout.QLayout)
-	rightLayout.AddWidget(rowConnectionProgram)
+	rowConnectionExecution := qt.NewQWidget(nil)
+	rowConnectionExecutionLayout := qt.NewQHBoxLayout(nil)
+	rowConnectionExecution.SetLayout(rowConnectionExecutionLayout.QLayout)
+	rightLayout.AddWidget(rowConnectionExecution)
 
 	connectionGroup := groupBox("Connection")
-	rowConnectionProgramLayout.AddWidget2(connectionGroup.QWidget, 1)
+	rowConnectionExecutionLayout.AddWidget2(connectionGroup.QWidget, 1)
 	w.portCombo = qt.NewQComboBox(nil)
 	connectionGroup.Layout().AddWidget(label("Port").QWidget)
 	connectionGroup.Layout().AddWidget(w.portCombo.QWidget)
@@ -281,26 +278,21 @@ func (w *MainWindow) build() {
 	w.connectButton = button("Connect")
 	connectionGroup.Layout().AddWidget(w.connectButton.QWidget)
 
-	programGroup := groupBox("Program")
-	rowConnectionProgramLayout.AddWidget2(programGroup.QWidget, 1)
-	programGroup.Layout().AddWidget(label("G-code file").QWidget)
-	pathRow := qt.NewQWidget(nil)
-	pathRow.SetLayout(qt.NewQHBoxLayout(nil).QLayout)
-	programGroup.Layout().AddWidget(pathRow)
-	w.programPath = qt.NewQLineEdit(nil)
-	w.programPath.SetPlaceholderText("No program selected")
-	w.programPath.SetReadOnly(true)
-	pathRow.Layout().AddWidget(w.programPath.QWidget)
-	w.browseButton = button("Open…")
-	pathRow.Layout().AddWidget(w.browseButton.QWidget)
-	w.runButton = button("Run")
-	programGroup.Layout().AddWidget(w.runButton.QWidget)
-	w.pauseButton = button("Pause")
-	programGroup.Layout().AddWidget(w.pauseButton.QWidget)
-	w.resumeButton = button("Resume")
-	programGroup.Layout().AddWidget(w.resumeButton.QWidget)
-	w.stopButton = button("Stop")
-	programGroup.Layout().AddWidget(w.stopButton.QWidget)
+	w.executionGroup = groupBox("Current Execution")
+	rowConnectionExecutionLayout.AddWidget2(w.executionGroup.QWidget, 1)
+	w.executionName = qt.NewQLabel(nil)
+	w.executionName.SetWordWrap(true)
+	w.executionGroup.Layout().AddWidget(w.executionName.QWidget)
+	w.executionStatus = qt.NewQLabel(nil)
+	w.executionStatus.SetWordWrap(true)
+	w.executionGroup.Layout().AddWidget(w.executionStatus.QWidget)
+	w.executionProgress = qt.NewQLabel(nil)
+	w.executionGroup.Layout().AddWidget(w.executionProgress.QWidget)
+	w.executionDetail = qt.NewQLabel(nil)
+	w.executionDetail.SetWordWrap(true)
+	w.executionGroup.Layout().AddWidget(w.executionDetail.QWidget)
+	w.showDocumentButton = button("Show Document")
+	w.executionGroup.Layout().AddWidget(w.showDocumentButton.QWidget)
 
 	rowActionsStatus := qt.NewQWidget(nil)
 	rowActionsStatusLayout := qt.NewQHBoxLayout(nil)
@@ -327,10 +319,8 @@ func (w *MainWindow) build() {
 	w.machinePos = qt.NewQLabel(nil)
 	w.workPos = qt.NewQLabel(nil)
 	w.feedSpindle = qt.NewQLabel(nil)
-	w.programStatus = qt.NewQLabel(nil)
-	w.programProgress = qt.NewQLabel(nil)
 	w.lastErrorLabel = qt.NewQLabel(nil)
-	for _, lbl := range []*qt.QLabel{w.connStatus, w.safetyStatus, w.machineStatus, w.machinePos, w.workPos, w.feedSpindle, w.programStatus, w.programProgress, w.lastErrorLabel} {
+	for _, lbl := range []*qt.QLabel{w.connStatus, w.safetyStatus, w.machineStatus, w.machinePos, w.workPos, w.feedSpindle, w.lastErrorLabel} {
 		statusGroup.Layout().AddWidget(lbl.QWidget)
 	}
 
@@ -390,11 +380,7 @@ func (w *MainWindow) bind() {
 		go func() { _ = w.controller.RefreshPorts(context.Background()) }()
 	})
 	w.connectButton.OnClicked(func() { w.toggleConnection() })
-	w.browseButton.OnClicked(func() { w.browseAndLoadProgram() })
-	w.runButton.OnClicked(func() { w.startProgram() })
-	w.pauseButton.OnClicked(func() { w.pauseLegacyProgram() })
-	w.resumeButton.OnClicked(func() { w.resumeLegacyProgram() })
-	w.stopButton.OnClicked(func() { w.stopLegacyProgram() })
+	w.showDocumentButton.OnClicked(func() { w.showExecutionDocument() })
 	w.jogXPButton.OnClicked(func() { w.jog("X", +1) })
 	w.jogXMButton.OnClicked(func() { w.jog("X", -1) })
 	w.jogYPButton.OnClicked(func() { w.jog("Y", +1) })
@@ -454,53 +440,21 @@ func (w *MainWindow) toggleConnection() {
 	go func() { _ = w.controller.ConnectPort(context.Background(), port) }()
 }
 
-func (w *MainWindow) browseAndLoadProgram() {
-	path := chooseProgramFile(w.window.QWidget)
-	if path == "" {
-		return
+func (w *MainWindow) showExecutionDocument() {
+	target := w.executionSummary
+	if w.onShowDocument != nil && w.canShowDocument != nil &&
+		w.canShowDocument(target.DocumentID, target.RunID) {
+		w.onShowDocument(target.DocumentID, target.RunID)
 	}
-	if w.onLoadProgram != nil {
-		w.onLoadProgram(path)
-		return
-	}
-	go func() { _ = w.controller.LoadProgramFile(path) }()
+	// Document lifetime can change without a controller event; refresh from a
+	// current snapshot after every focus attempt.
+	w.refreshExecutionSummary(w.controller.Snapshot())
 }
 
-func (w *MainWindow) SetLegacyOperationPending(loadPending, runPending bool) {
-	w.legacyLoadPending = loadPending
-	w.legacyRunPending = runPending
-	w.ApplyState(w.controller.Snapshot())
-}
-
-func (w *MainWindow) startProgram() {
-	if w.onStartProgram != nil {
-		w.onStartProgram()
-		return
-	}
-	go func() { _ = w.controller.StartProgram(context.Background()) }()
-}
-
-func (w *MainWindow) legacyRunID() (app.RunID, bool) {
-	state := w.controller.Snapshot()
-	return state.ProgramRunID, state.ProgramDocumentID == 0 && state.ProgramRunID != 0
-}
-
-func (w *MainWindow) pauseLegacyProgram() {
-	if runID, ok := w.legacyRunID(); ok {
-		go func() { _ = w.controller.PauseProgramRun(context.Background(), 0, runID) }()
-	}
-}
-
-func (w *MainWindow) resumeLegacyProgram() {
-	if runID, ok := w.legacyRunID(); ok {
-		go func() { _ = w.controller.ResumeProgramRun(context.Background(), 0, runID) }()
-	}
-}
-
-func (w *MainWindow) stopLegacyProgram() {
-	if runID, ok := w.legacyRunID(); ok {
-		go func() { _ = w.controller.StopProgramRun(context.Background(), 0, runID) }()
-	}
+// RefreshExecutionSummary updates only the controller-derived read-only
+// execution panel. Application calls it after document lifecycle changes.
+func (w *MainWindow) RefreshExecutionSummary() {
+	w.refreshExecutionSummary(w.controller.Snapshot())
 }
 
 func (w *MainWindow) sendCommand() {
@@ -639,14 +593,7 @@ func (w *MainWindow) ApplyState(state app.State) {
 		w.feedSpindle.SetText("Feed: unknown  Spindle: unknown")
 		w.spindleReported.SetText("Reported RPM: unknown")
 	}
-	if state.LegacyProgramLoaded && state.LegacyProgramPath != "" && w.programPath.Text() != state.LegacyProgramPath {
-		// ProgramPath follows the current or most recent execution and may be
-		// document-owned. The main-window selector always reflects the retained
-		// legacy program instead.
-		w.programPath.SetText(state.LegacyProgramPath)
-	}
-	w.programStatus.SetText("Program: " + frontend.FormatProgramStatus(state))
-	w.programProgress.SetText(fmt.Sprintf("Progress: %d / %d", state.ProgramComplete, state.ProgramTotal))
+	w.refreshExecutionSummary(state)
 	if state.MachineReadiness != app.MachineReadinessNormal && state.MachineReadinessReason != "" {
 		w.lastErrorLabel.SetText("Machine not ready: " + state.MachineReadinessReason)
 	} else if state.LastError != "" {
@@ -655,17 +602,11 @@ func (w *MainWindow) ApplyState(state app.State) {
 		w.lastErrorLabel.SetText("Last error: none")
 	}
 
-	controls := frontend.MainWindowControlsWithLegacyOperations(state, w.legacyLoadPending, w.legacyRunPending)
+	controls := frontend.MainWindowControls(state)
 
 	w.refreshButton.SetEnabled(controls.RefreshPortsEnabled)
 	w.connectButton.SetEnabled(controls.ConnectEnabled)
 	w.portCombo.SetEnabled(controls.PortSelectionEnabled)
-	w.programPath.SetEnabled(controls.ProgramPathEnabled)
-	w.browseButton.SetEnabled(controls.BrowseProgramEnabled)
-	w.runButton.SetEnabled(controls.RunProgramEnabled)
-	w.pauseButton.SetEnabled(controls.PauseProgramEnabled)
-	w.resumeButton.SetEnabled(controls.ResumeProgramEnabled)
-	w.stopButton.SetEnabled(controls.StopProgramEnabled)
 
 	w.sendButton.SetEnabled(controls.ManualControlsEnabled)
 	w.commandEntry.SetEnabled(controls.ManualControlsEnabled)
@@ -687,6 +628,17 @@ func (w *MainWindow) ApplyState(state app.State) {
 	for _, btn := range []*qt.QPushButton{w.spindleCWButton, w.spindleCCWButton, w.spindleSetButton, w.spindleStopButton} {
 		btn.SetEnabled(controls.ManualControlsEnabled)
 	}
+}
+
+func (w *MainWindow) refreshExecutionSummary(state app.State) {
+	w.executionSummary = frontend.ExecutionSummaryForState(state)
+	w.executionGroup.SetTitle(w.executionSummary.Heading)
+	w.executionName.SetText("Program: " + w.executionSummary.Name)
+	w.executionStatus.SetText("Status: " + w.executionSummary.Status)
+	w.executionProgress.SetText(w.executionSummary.Progress)
+	w.executionDetail.SetText(w.executionSummary.Detail)
+	canShow := w.canShowDocument != nil && w.canShowDocument(w.executionSummary.DocumentID, w.executionSummary.RunID)
+	w.showDocumentButton.SetEnabled(canShow)
 }
 
 func (w *MainWindow) appendConsole(prefix string, text string) {
