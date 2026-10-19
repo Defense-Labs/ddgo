@@ -46,8 +46,9 @@ while expanding an include.
 ## Safety and resource lifetime
 
 Archive entries are checked before parsing. DDGo rejects duplicate paths,
-absolute/traversal/drive/UNC/backslash paths, NUL names, symbolic links, and
-special files. It permits harmless directory entries. Referenced G-code,
+absolute/traversal/drive/UNC paths, **any single backslash**, NUL names,
+symbolic links, and special files. It permits harmless directory entries.
+Referenced G-code,
 images, guides, models, and submanifests must exist with exact case.
 
 Default limits are centralized in `ddpackage.DefaultLimits()`:
@@ -62,6 +63,14 @@ ZIP metadata. The loader snapshots all validated resource bytes into bounded
 memory and closes the ZIP immediately. `ReadResource` returns a copy, so a
 subsequent on-disk replacement cannot alter a loaded package or a caller's
 previous resource data.
+
+`MaxExpandedSteps` applies to the combined final output of every job in one
+package. Every occurrence of a repeated submanifest counts again. The manifest
+limit applies to root `manifest.yml` and to every resource decoded through
+`manifest_file`, regardless of that resource's extension. Ordinary resources
+retain the separate per-resource allowance; an otherwise valid large G-code or
+model file is not treated as a manifest. Total decompressed-size and exact
+compression-ratio checks continue to apply to all resources.
 
 ## Compatibility scope and future integration
 

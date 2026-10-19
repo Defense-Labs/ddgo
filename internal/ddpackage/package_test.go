@@ -244,7 +244,10 @@ func TestLoadRejectsUnsafeAndDuplicateArchiveEntries(t *testing.T) {
 		{"parent traversal", []zipEntry{{name: manifestName, data: valid}, {name: "../escape", data: "x"}}, "unsafe archive path"},
 		{"absolute path", []zipEntry{{name: manifestName, data: valid}, {name: "/escape", data: "x"}}, "unsafe archive path"},
 		{"drive path", []zipEntry{{name: manifestName, data: valid}, {name: "C:escape", data: "x"}}, "unsafe archive path"},
-		{"backslash path", []zipEntry{{name: manifestName, data: valid}, {name: `Code\\escape`, data: "x"}}, "unsafe archive path"},
+		{"one backslash", []zipEntry{{name: manifestName, data: valid}, {name: "Code\\file.nc", data: "x"}}, "unsafe archive path"},
+		{"two backslashes", []zipEntry{{name: manifestName, data: valid}, {name: "Code\\\\file.nc", data: "x"}}, "unsafe archive path"},
+		{"Windows absolute path", []zipEntry{{name: manifestName, data: valid}, {name: "C:\\file.nc", data: "x"}}, "unsafe archive path"},
+		{"UNC path", []zipEntry{{name: manifestName, data: valid}, {name: "\\\\server\\share\\file.nc", data: "x"}}, "unsafe archive path"},
 		{"duplicate", []zipEntry{{name: manifestName, data: valid}, {name: "Code/a", data: "x"}, {name: "Code/a", data: "y"}}, "duplicate archive path"},
 		{"symlink", []zipEntry{{name: manifestName, data: valid}, {name: "link", data: "target", mode: os.ModeSymlink | 0o777}}, "symbolic-link"},
 	}
@@ -255,6 +258,9 @@ func TestLoadRejectsUnsafeAndDuplicateArchiveEntries(t *testing.T) {
 				t.Fatalf("Load() = pkg=%v err=%v", pkg, err)
 			}
 		})
+	}
+	if pkg, err := Load(writePackage(t, zipEntry{name: manifestName, data: valid}, zipEntry{name: "Code/file.nc", data: "G0"})); err != nil || pkg == nil {
+		t.Fatalf("forward-slash path Load() = pkg=%v err=%v", pkg, err)
 	}
 }
 
@@ -307,5 +313,172 @@ func TestLoadEnforcesEntryAndExpansionLimits(t *testing.T) {
 	limits.MaxInclusionDepth = 1
 	if pkg, err := LoadWithLimits(depthPath, limits); err == nil || pkg != nil || !strings.Contains(err.Error(), "inclusion depth") {
 		t.Fatalf("depth limit Load() = pkg=%v err=%v", pkg, err)
+	}
+}
+
+func TestLoadExpandedStepLimitAppliesToEntirePackage(t *testing.T) {
+	loadWithStepLimit := func(t *testing.T, manifest string, entries []zipEntry, maximum int) (*Package, error) {
+		t.Helper()
+		limits := DefaultLimits()
+		limits.MaxExpandedSteps = maximum
+		return LoadWithLimits(writePackage(t, append([]zipEntry{{name: manifestName, data: manifest}}, entries...)...), limits)
+	}
+	job := func(name string, count int) string {
+		var text strings.Builder
+		text.WriteString("- job_name: " + name + "\n  job_steps:\n")
+		for i := 0; i < count; i++ {
+			text.WriteString("    - step_name: step\n")
+		}
+		return text.String()
+	}
+	assertResult := func(t *testing.T, pkg *Package, err error, succeed bool) {
+		t.Helper()
+		if succeed && (err != nil || pkg == nil) {
+			t.Fatalf("LoadWithLimits() = pkg=%v err=%v, want success", pkg, err)
+		}
+		if !succeed && (err == nil || pkg != nil || !strings.Contains(err.Error(), "expanded steps")) {
+			t.Fatalf("LoadWithLimits() = pkg=%v err=%v, want shared step-limit error and nil package", pkg, err)
+		}
+	}
+
+	pkg, err := loadWithStepLimit(t, job("one", 3), nil, 3)
+	assertResult(t, pkg, err, true)
+	pkg, err = loadWithStepLimit(t, job("one", 4), nil, 3)
+	assertResult(t, pkg, err, false)
+
+	pkg, err = loadWithStepLimit(t, job("one", 2)+job("two", 2), nil, 4)
+	assertResult(t, pkg, err, true)
+	if pkg.Jobs[1].Steps[0].ID != "job-2-step-1" {
+		t.Fatalf("second-job step ID changed: %+v", pkg.Jobs[1].Steps[0])
+	}
+	pkg, err = loadWithStepLimit(t, job("one", 2)+job("two", 2), nil, 3)
+	assertResult(t, pkg, err, false)
+
+	repeated := `- job_name: one
+  job_steps:
+    - manifest_file: shared.yml
+- job_name: two
+  job_steps:
+    - manifest_file: shared.yml
+`
+	pkg, err = loadWithStepLimit(t, repeated, []zipEntry{{name: "shared.yml", data: "- step_name: imported\n"}}, 2)
+	assertResult(t, pkg, err, true)
+	pkg, err = loadWithStepLimit(t, repeated, []zipEntry{{name: "shared.yml", data: "- step_name: imported\n"}}, 1)
+	assertResult(t, pkg, err, false)
+
+	nested := `- job_name: nested
+  job_steps:
+    - manifest_file: outer.yml
+    - manifest_file: outer.yml
+`
+	entries := []zipEntry{{name: "outer.yml", data: "- manifest_file: inner.yml\n"}, {name: "inner.yml", data: "- step_name: nested-step\n"}}
+	pkg, err = loadWithStepLimit(t, nested, entries, 2)
+	assertResult(t, pkg, err, true)
+	pkg, err = loadWithStepLimit(t, nested, entries, 1)
+	assertResult(t, pkg, err, false)
+}
+
+func TestLoadManifestSizeLimitsApplyToReferencedContent(t *testing.T) {
+	loadWithLimits := func(t *testing.T, manifest string, entries []zipEntry, manifestLimit, resourceLimit int64) (*Package, error) {
+		t.Helper()
+		limits := DefaultLimits()
+		limits.MaxManifestBytes = manifestLimit
+		limits.MaxResourceBytes = resourceLimit
+		limits.MaxTotalUncompressedBytes = 4096
+		return LoadWithLimits(writePackage(t, append([]zipEntry{{name: manifestName, data: manifest}}, entries...)...), limits)
+	}
+	assertFailure := func(t *testing.T, pkg *Package, err error, path string) {
+		t.Helper()
+		if err == nil || pkg != nil || !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "manifest") {
+			t.Fatalf("LoadWithLimits() = pkg=%v err=%v, want manifest-limit error for %q", pkg, err, path)
+		}
+	}
+
+	rootOversized := "- job_name: x\n  job_steps: []\n#" + strings.Repeat("x", 80)
+	pkg, err := loadWithLimits(t, rootOversized, nil, 64, 512)
+	assertFailure(t, pkg, err, manifestName)
+
+	directRoot := "- job_name: x\n  job_steps:\n    - manifest_file: Code/steps.txt\n"
+	pkg, err = loadWithLimits(t, directRoot, []zipEntry{{name: "Code/steps.txt", data: "- step_name: x #" + strings.Repeat("x", 100)}}, int64(len(directRoot)+1), 512)
+	assertFailure(t, pkg, err, "Code/steps.txt")
+
+	nestedRoot := "- job_name: x\n  job_steps:\n    - manifest_file: first\n"
+	first := "- manifest_file: second\n"
+	pkg, err = loadWithLimits(t, nestedRoot, []zipEntry{{name: "first", data: first}, {name: "second", data: "- step_name: x #" + strings.Repeat("x", 100)}}, int64(len(nestedRoot)+1), 512)
+	assertFailure(t, pkg, err, "second")
+
+	jobLevelRoot := "- job_name: x\n  manifest_file: job-steps\n"
+	pkg, err = loadWithLimits(t, jobLevelRoot, []zipEntry{{name: "job-steps", data: "- step_name: x #" + strings.Repeat("x", 100)}}, int64(len(jobLevelRoot)+1), 512)
+	assertFailure(t, pkg, err, "job-steps")
+
+	exactRoot := "- job_name: x\n  job_steps:\n    - manifest_file: exact\n"
+	exactLimit := int64(128)
+	exactSubmanifest := "- step_name: exact #" + strings.Repeat("x", int(exactLimit)-len("- step_name: exact #"))
+	pkg, err = loadWithLimits(t, exactRoot, []zipEntry{{name: "exact", data: exactSubmanifest}}, exactLimit, 512)
+	if err != nil || pkg == nil || len(pkg.Jobs[0].Steps) != 1 {
+		t.Fatalf("exact manifest limit = pkg=%v err=%v", pkg, err)
+	}
+
+	ordinaryRoot := "- job_name: x\n  job_steps:\n    - step_gcode: Code/large\n"
+	pkg, err = loadWithLimits(t, ordinaryRoot, []zipEntry{{name: "Code/large", data: strings.Repeat("G", 150)}}, 100, 200)
+	if err != nil || pkg == nil {
+		t.Fatalf("ordinary resource above manifest limit = pkg=%v err=%v", pkg, err)
+	}
+}
+
+func TestLoadTotalAndCompressionRatioLimits(t *testing.T) {
+	manifest := "- job_name: x\n  job_steps: []\n"
+	first, second := strings.Repeat("a", 80), strings.Repeat("b", 80)
+	exactTotal := int64(len(manifest) + len(first) + len(second))
+	limits := DefaultLimits()
+	limits.MaxManifestBytes = 100
+	limits.MaxResourceBytes = 100
+	limits.MaxTotalUncompressedBytes = exactTotal
+	path := writePackage(t, zipEntry{name: manifestName, data: manifest}, zipEntry{name: "one", data: first}, zipEntry{name: "two", data: second})
+	pkg, err := LoadWithLimits(path, limits)
+	if err != nil || pkg == nil {
+		t.Fatalf("exact total limit = pkg=%v err=%v", pkg, err)
+	}
+	limits.MaxTotalUncompressedBytes--
+	pkg, err = LoadWithLimits(path, limits)
+	if err == nil || pkg != nil || !strings.Contains(err.Error(), "total limit") {
+		t.Fatalf("total limit = pkg=%v err=%v", pkg, err)
+	}
+
+	ratioPath := writePackage(t, zipEntry{name: manifestName, data: manifest}, zipEntry{name: "arbitrary-resource", data: strings.Repeat("z", 16<<10)})
+	zr, err := zip.OpenReader(ratioPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resource *zip.File
+	for _, file := range zr.File {
+		if file.Name == "arbitrary-resource" {
+			resource = file
+			break
+		}
+	}
+	if resource == nil || resource.CompressedSize64 == 0 {
+		t.Fatal("missing compressed fixture resource")
+	}
+	requiredRatio := (resource.UncompressedSize64 + resource.CompressedSize64 - 1) / resource.CompressedSize64
+	if err := zr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if requiredRatio < 2 {
+		t.Fatalf("fixture was not sufficiently compressible: %d", requiredRatio)
+	}
+	limits = DefaultLimits()
+	limits.MaxManifestBytes = 1024
+	limits.MaxResourceBytes = 32 << 10
+	limits.MaxTotalUncompressedBytes = 64 << 10
+	limits.MaxCompressionRatio = requiredRatio
+	pkg, err = LoadWithLimits(ratioPath, limits)
+	if err != nil || pkg == nil {
+		t.Fatalf("ratio boundary acceptance = pkg=%v err=%v", pkg, err)
+	}
+	limits.MaxCompressionRatio = requiredRatio - 1
+	pkg, err = LoadWithLimits(ratioPath, limits)
+	if err == nil || pkg != nil || !strings.Contains(err.Error(), "compression ratio") {
+		t.Fatalf("ratio rejection = pkg=%v err=%v", pkg, err)
 	}
 }

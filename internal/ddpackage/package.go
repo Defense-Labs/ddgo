@@ -187,15 +187,18 @@ func LoadWithLimits(sourcePath string, limits Limits) (*Package, error) {
 		if isDirectory {
 			continue
 		}
-		if file.UncompressedSize64 > uint64(limits.MaxResourceBytes) {
-			return nil, fmt.Errorf("resource %q declared size exceeds per-resource limit", file.Name)
-		}
-		if file.CompressedSize64 > 0 && file.UncompressedSize64/file.CompressedSize64 > limits.MaxCompressionRatio {
-			return nil, fmt.Errorf("resource %q declared compression ratio exceeds limit", file.Name)
-		}
 		limit := limits.MaxResourceBytes
 		if file.Name == manifestName {
 			limit = limits.MaxManifestBytes
+		}
+		if file.UncompressedSize64 > uint64(limit) {
+			if file.Name == manifestName {
+				return nil, fmt.Errorf("manifest %q declared size exceeds manifest limit", file.Name)
+			}
+			return nil, fmt.Errorf("resource %q declared size exceeds per-resource limit", file.Name)
+		}
+		if exceedsCompressionRatio(file.UncompressedSize64, file.CompressedSize64, limits.MaxCompressionRatio) {
+			return nil, fmt.Errorf("resource %q declared compression ratio exceeds limit", file.Name)
 		}
 		data, err := readZipFile(file, limit)
 		if err != nil {
@@ -203,6 +206,9 @@ func LoadWithLimits(sourcePath string, limits Limits) (*Package, error) {
 		}
 		if int64(len(data)) > limit {
 			return nil, fmt.Errorf("resource %q exceeds size limit", file.Name)
+		}
+		if exceedsCompressionRatio(uint64(len(data)), file.CompressedSize64, limits.MaxCompressionRatio) {
+			return nil, fmt.Errorf("resource %q decompressed compression ratio exceeds limit", file.Name)
 		}
 		total += int64(len(data))
 		if total > limits.MaxTotalUncompressedBytes {
@@ -254,11 +260,21 @@ func readZipFile(file *zip.File, limit int64) ([]byte, error) {
 	return data, nil
 }
 
+// exceedsCompressionRatio reports whether uncompressed is greater than the
+// exact allowed multiple of compressed without overflowing multiplication.
+func exceedsCompressionRatio(uncompressed, compressed, maximum uint64) bool {
+	if compressed == 0 {
+		return uncompressed != 0
+	}
+	quotient, remainder := uncompressed/maximum, uncompressed%maximum
+	return quotient > compressed || (quotient == compressed && remainder != 0)
+}
+
 var drivePath = regexp.MustCompile(`^[A-Za-z]:`)
 
 func validateArchiveEntry(file *zip.File) (bool, error) {
 	name := file.Name
-	if strings.ContainsRune(name, 0) || strings.Contains(name, `\\`) || path.IsAbs(name) || strings.HasPrefix(name, "//") || drivePath.MatchString(name) {
+	if strings.ContainsRune(name, 0) || strings.ContainsRune(name, '\\') || path.IsAbs(name) || strings.HasPrefix(name, "//") || drivePath.MatchString(name) {
 		return false, fmt.Errorf("unsafe archive path %q", name)
 	}
 	isDirectory := file.FileInfo().IsDir() || strings.HasSuffix(name, "/")
@@ -289,8 +305,9 @@ func parseManifest(data []byte, manifestPath string, resources map[string][]byte
 	}
 	warnings := []Diagnostic{}
 	jobs := make([]Job, 0, len(root.Content))
+	expandedCount := 0
 	for index, jobNode := range root.Content {
-		job, ws, err := parseJob(jobNode, manifestPath, resources, limits, index)
+		job, ws, err := parseJob(jobNode, manifestPath, resources, limits, index, &expandedCount)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -319,7 +336,7 @@ func decodeYAML(data []byte, source string) (*yaml.Node, error) {
 	return document.Content[0], nil
 }
 
-func parseJob(node *yaml.Node, manifestPath string, resources map[string][]byte, limits Limits, jobIndex int) (Job, []Diagnostic, error) {
+func parseJob(node *yaml.Node, manifestPath string, resources map[string][]byte, limits Limits, jobIndex int, expandedCount *int) (Job, []Diagnostic, error) {
 	fields, err := mapping(node, "job", manifestPath)
 	if err != nil {
 		return Job{}, nil, err
@@ -327,7 +344,6 @@ func parseJob(node *yaml.Node, manifestPath string, resources map[string][]byte,
 	job := Job{ManifestPath: manifestPath, Metadata: nodeMetadata(fields)}
 	warnings := []Diagnostic{}
 	var steps []Step
-	expandedCount := 0
 	for _, field := range fields {
 		switch field.key {
 		case "job_name":
@@ -350,14 +366,14 @@ func parseJob(node *yaml.Node, manifestPath string, resources map[string][]byte,
 			job.WCSCheckFailedMessage, err = legacyText(field.value, manifestPath, field.key)
 		case "job_steps":
 			var added []Step
-			added, err = expandStepList(field.value, manifestPath, resources, limits, nil, 0, &warnings, &expandedCount)
+			added, err = expandStepList(field.value, manifestPath, resources, limits, nil, 0, &warnings, expandedCount)
 			steps = append(steps, added...)
 		case "manifest_file":
 			var include string
 			include, err = resourcePath(field.value, manifestPath, field.key, resources)
 			if err == nil {
 				var added []Step
-				added, err = expandSubmanifest(include, resources, limits, nil, 0, &warnings, &expandedCount)
+				added, err = expandSubmanifest(include, resources, limits, nil, 0, &warnings, expandedCount)
 				steps = append(steps, added...)
 			}
 		default:
@@ -389,6 +405,9 @@ func expandSubmanifest(name string, resources map[string][]byte, limits Limits, 
 	data, ok := resources[name]
 	if !ok {
 		return nil, fmt.Errorf("submanifest %q is missing", name)
+	}
+	if int64(len(data)) > limits.MaxManifestBytes {
+		return nil, fmt.Errorf("submanifest %q exceeds manifest size limit of %d bytes", name, limits.MaxManifestBytes)
 	}
 	root, err := decodeYAML(data, name)
 	if err != nil {
@@ -422,7 +441,7 @@ func expandStepList(node *yaml.Node, manifestPath string, resources map[string][
 			if err != nil {
 				return nil, err
 			}
-			*expandedCount++
+			*expandedCount = *expandedCount + 1
 			if *expandedCount > limits.MaxExpandedSteps {
 				return nil, fmt.Errorf("expanded steps in %q exceed limit of %d", manifestPath, limits.MaxExpandedSteps)
 			}
