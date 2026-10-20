@@ -23,16 +23,16 @@ type Application struct {
 	dispatcher *frontend.ViewDispatcher
 	windows    *frontend.WindowManager
 	documents  *frontend.DocumentRegistry
+	sessions   *frontend.ExecutionSessions
 	mainWindow *MainWindow
 
 	pendingDocumentCloses  map[app.DocumentID]app.RunID
 	approvedDocumentCloses frontend.DocumentCloseApprovals
 	documentCloseResults   chan documentCloseResult
-	pendingDocumentStarts  map[app.DocumentID]documentStartRequest
+	pendingDocumentStarts  map[frontend.ExecutionSessionID]documentStartRequest
 	documentStartResults   chan documentStartResult
-	pendingDocumentActions map[app.DocumentID]app.RunID
+	pendingDocumentActions map[frontend.ExecutionSessionID]app.RunID
 	documentActionResults  chan documentActionResult
-	nextDocumentStartID    uint64
 
 	shutdown            frontend.ShutdownCoordinator
 	shutdownStopResults chan shutdownStopResult
@@ -49,12 +49,14 @@ type documentCloseResult struct {
 type documentStartRequest struct{ id uint64 }
 type documentStartResult struct {
 	documentID app.DocumentID
+	sessionID  frontend.ExecutionSessionID
 	requestID  uint64
 	runID      app.RunID
 	err        error
 }
 type documentActionResult struct {
 	documentID app.DocumentID
+	sessionID  frontend.ExecutionSessionID
 	runID      app.RunID
 	err        error
 }
@@ -79,12 +81,13 @@ func (a *Application) Run() error {
 	a.windows = frontend.NewWindowManager(a.dispatcher)
 	a.documents = frontend.NewDocumentRegistry(a.windows)
 	a.documents.SetOnClose(a.documentClosed)
+	a.sessions = frontend.NewExecutionSessions(state, revision)
 	a.pendingDocumentCloses = make(map[app.DocumentID]app.RunID)
 	a.approvedDocumentCloses = make(frontend.DocumentCloseApprovals)
 	a.documentCloseResults = make(chan documentCloseResult, 16)
-	a.pendingDocumentStarts = make(map[app.DocumentID]documentStartRequest)
+	a.pendingDocumentStarts = make(map[frontend.ExecutionSessionID]documentStartRequest)
 	a.documentStartResults = make(chan documentStartResult, 16)
-	a.pendingDocumentActions = make(map[app.DocumentID]app.RunID)
+	a.pendingDocumentActions = make(map[frontend.ExecutionSessionID]app.RunID)
 	a.documentActionResults = make(chan documentActionResult, 16)
 	a.shutdownStopResults = make(chan shutdownStopResult, 2)
 
@@ -134,11 +137,23 @@ func (a *Application) openGCodeFile() {
 
 func (a *Application) configureDocumentExecution(entry frontend.DocumentEntry, window *GCodeWindow) {
 	program, err := gcode.ProgramFromDocument(entry.Document)
-	window.SetExecution(entry.ID, program, err,
-		func() { a.startDocumentProgram(entry.ID) },
-		func() { a.documentProgramAction(entry.ID, "pause") },
-		func() { a.documentProgramAction(entry.ID, "resume") },
-		func() { a.documentProgramAction(entry.ID, "stop") },
+	sessionID := frontend.StandaloneExecutionSessionID(entry.ID)
+	session, sessionErr := a.sessions.Add(sessionID, entry.Document.Source, program, err)
+	if sessionErr != nil {
+		// A duplicate can only arise from an interrupted UI configuration path.
+		// Reuse the existing authoritative session rather than creating a second
+		// execution history for the same document identity.
+		var exists bool
+		session, exists = a.sessions.Session(sessionID)
+		if !exists {
+			return
+		}
+	}
+	window.SetExecutionSession(session,
+		func() { a.startDocumentProgram(sessionID) },
+		func() { a.documentProgramAction(sessionID, "pause") },
+		func() { a.documentProgramAction(sessionID, "resume") },
+		func() { a.documentProgramAction(sessionID, "stop") },
 	)
 }
 
@@ -147,6 +162,7 @@ func (a *Application) drainControllerEvents() {
 		select {
 		case event := <-a.controller.Events():
 			a.dispatcher.Dispatch(event)
+			a.sessions.ApplyEvent(event)
 		default:
 			a.drainDocumentStartResults()
 			a.drainDocumentActionResults()
@@ -159,15 +175,15 @@ func (a *Application) drainControllerEvents() {
 	}
 }
 
-func (a *Application) startDocumentProgram(id app.DocumentID) {
-	if _, pending := a.pendingDocumentStarts[id]; pending || a.documents.ClosePending(id) {
+func (a *Application) startDocumentProgram(sessionID frontend.ExecutionSessionID) {
+	id := sessionID.DocumentID
+	if _, pending := a.pendingDocumentStarts[sessionID]; pending || a.documents.ClosePending(id) {
 		return
 	}
-	entry, ok := a.documents.Entry(id)
-	if !ok {
+	if _, ok := a.documents.Entry(id); !ok {
 		return
 	}
-	window, ok := entry.Window.(*GCodeWindow)
+	session, ok := a.sessions.Session(sessionID)
 	if !ok {
 		return
 	}
@@ -175,24 +191,23 @@ func (a *Application) startDocumentProgram(id app.DocumentID) {
 	if !ok {
 		return
 	}
-	a.nextDocumentStartID++
-	if a.nextDocumentStartID == 0 {
-		a.nextDocumentStartID++
+	requestID, ok := session.BeginStart()
+	if !ok {
+		admission.Release()
+		return
 	}
-	request := documentStartRequest{id: a.nextDocumentStartID}
-	a.pendingDocumentStarts[id] = request
-	window.SetStartPending(true)
-	// Parse retained source, never the filesystem path. ProgramFromDocument
-	// preserves original physical source-line numbers for presentation.
-	program, parseErr := gcode.ProgramFromDocument(entry.Document)
+	request := documentStartRequest{id: requestID}
+	a.pendingDocumentStarts[sessionID] = request
+	snapshot := session.Snapshot()
+	program, parseErr := snapshot.Program, snapshot.ParseError
 	go func() {
 		defer admission.Release()
 		if parseErr != nil {
-			a.documentStartResults <- documentStartResult{documentID: id, requestID: request.id, err: parseErr}
+			a.documentStartResults <- documentStartResult{documentID: id, sessionID: sessionID, requestID: request.id, err: parseErr}
 			return
 		}
 		runID, err := a.controller.StartDocumentProgram(context.Background(), id, program)
-		a.documentStartResults <- documentStartResult{documentID: id, requestID: request.id, runID: runID, err: err}
+		a.documentStartResults <- documentStartResult{documentID: id, sessionID: sessionID, requestID: request.id, runID: runID, err: err}
 	}()
 }
 
@@ -200,11 +215,11 @@ func (a *Application) drainDocumentStartResults() {
 	for {
 		select {
 		case result := <-a.documentStartResults:
-			request, pending := a.pendingDocumentStarts[result.documentID]
+			request, pending := a.pendingDocumentStarts[result.sessionID]
 			if !pending || request.id != result.requestID {
 				continue
 			}
-			delete(a.pendingDocumentStarts, result.documentID)
+			delete(a.pendingDocumentStarts, result.sessionID)
 			entry, open := a.documents.Entry(result.documentID)
 			if !open {
 				continue
@@ -213,7 +228,9 @@ func (a *Application) drainDocumentStartResults() {
 			if !ok {
 				continue
 			}
-			window.StartResult(result.runID, result.err)
+			if !a.sessions.AssociateRun(result.sessionID, result.requestID, result.runID, result.err) {
+				continue
+			}
 			if !a.documents.ClosePending(result.documentID) {
 				continue
 			}
@@ -237,8 +254,9 @@ func (a *Application) drainDocumentStartResults() {
 	}
 }
 
-func (a *Application) documentProgramAction(id app.DocumentID, action string) {
-	if _, pending := a.pendingDocumentActions[id]; pending {
+func (a *Application) documentProgramAction(sessionID frontend.ExecutionSessionID, action string) {
+	id := sessionID.DocumentID
+	if _, pending := a.pendingDocumentActions[sessionID]; pending {
 		return
 	}
 	state := a.controller.Snapshot()
@@ -246,16 +264,14 @@ func (a *Application) documentProgramAction(id app.DocumentID, action string) {
 		return
 	}
 	runID := state.ProgramRunID
-	entry, ok := a.documents.Entry(id)
-	if !ok {
+	if _, ok := a.documents.Entry(id); !ok {
 		return
 	}
-	window, ok := entry.Window.(*GCodeWindow)
-	if !ok {
+	session, ok := a.sessions.Session(sessionID)
+	if !ok || !session.BeginAction(runID) {
 		return
 	}
-	a.pendingDocumentActions[id] = runID
-	window.SetOperationPending(true)
+	a.pendingDocumentActions[sessionID] = runID
 	go func() {
 		var err error
 		switch action {
@@ -266,7 +282,7 @@ func (a *Application) documentProgramAction(id app.DocumentID, action string) {
 		case "stop":
 			err = a.controller.StopProgramRun(context.Background(), id, runID)
 		}
-		a.documentActionResults <- documentActionResult{documentID: id, runID: runID, err: err}
+		a.documentActionResults <- documentActionResult{documentID: id, sessionID: sessionID, runID: runID, err: err}
 	}()
 }
 
@@ -274,14 +290,14 @@ func (a *Application) drainDocumentActionResults() {
 	for {
 		select {
 		case result := <-a.documentActionResults:
-			runID, pending := a.pendingDocumentActions[result.documentID]
+			runID, pending := a.pendingDocumentActions[result.sessionID]
 			if !pending || runID != result.runID {
 				continue
 			}
-			delete(a.pendingDocumentActions, result.documentID)
-			if entry, ok := a.documents.Entry(result.documentID); ok {
-				if window, ok := entry.Window.(*GCodeWindow); ok {
-					window.OperationResult(result.err)
+			delete(a.pendingDocumentActions, result.sessionID)
+			if _, ok := a.documents.Entry(result.documentID); ok {
+				if session, exists := a.sessions.Session(result.sessionID); exists {
+					session.FinishAction(result.runID, result.err)
 				}
 			}
 		default:
@@ -300,6 +316,18 @@ func (a *Application) syncProgramStartGate() {
 		return
 	}
 	a.programStarts.Reopen()
+}
+
+// hasPendingSessionStart keeps document close safety tied to document
+// ownership rather than to a particular view. It already supports the future
+// case where one package document owns several step sessions.
+func (a *Application) hasPendingSessionStart(documentID app.DocumentID) bool {
+	for sessionID := range a.pendingDocumentStarts {
+		if sessionID.DocumentID == documentID {
+			return true
+		}
+	}
+	return false
 }
 
 // requestDocumentClose governs independent document closure. An application
@@ -336,7 +364,7 @@ func (a *Application) requestDocumentClose(id app.DocumentID) bool {
 	if !ok {
 		return true
 	}
-	if _, pending := a.pendingDocumentStarts[id]; pending {
+	if a.hasPendingSessionStart(id) {
 		// The UI accepted Run before its controller call returned. Keep the
 		// document alive until that exact admission resolves.
 		a.documents.MarkClosePending(id)
@@ -405,9 +433,12 @@ func (a *Application) drainDocumentCloseResults() {
 
 func (a *Application) documentClosed(entry frontend.DocumentEntry) {
 	delete(a.pendingDocumentCloses, entry.ID)
-	delete(a.pendingDocumentStarts, entry.ID)
-	delete(a.pendingDocumentActions, entry.ID)
+	delete(a.pendingDocumentStarts, frontend.StandaloneExecutionSessionID(entry.ID))
+	delete(a.pendingDocumentActions, frontend.StandaloneExecutionSessionID(entry.ID))
 	delete(a.approvedDocumentCloses, entry.ID)
+	if a.sessions != nil {
+		a.sessions.Remove(frontend.StandaloneExecutionSessionID(entry.ID))
+	}
 	// Do not close the main window here: this callback runs inside native
 	// document destruction. The next UI timer turn advances the coordinator.
 	if a.shutdown.Active() {

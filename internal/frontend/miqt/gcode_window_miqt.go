@@ -30,17 +30,13 @@ type GCodeWindow struct {
 	progressBar         *qt.QProgressBar
 	followCheck         *qt.QCheckBox
 
-	documentID       app.DocumentID
-	program          gcode.Program
-	programErr       error
-	presentation     frontend.DocumentExecutionPresentation
-	state            app.State
-	startPending     bool
-	operationPending bool
-	onRun            func()
-	onPause          func()
-	onResume         func()
-	onStop           func()
+	session         *frontend.ExecutionSession
+	sessionSnapshot frontend.ExecutionSessionSnapshot
+	detachSession   func()
+	onRun           func()
+	onPause         func()
+	onResume        func()
+	onStop          func()
 
 	onClose        func()
 	onOpen         func()
@@ -85,6 +81,13 @@ func newGCodeWindow(document gcode.Document, onOpen func()) *GCodeWindow {
 		}
 		super(event)
 		if event.IsAccepted() && !w.closeNotified {
+			// WA_DeleteOnClose can delete the QObject during this close event. The
+			// session callback must be released before the next UI event can reach
+			// a destroyed native window. A rejected native close remains attached.
+			if w.detachSession != nil {
+				w.detachSession()
+				w.detachSession = nil
+			}
 			w.closeNotified = true
 			if w.onClose != nil {
 				w.onClose()
@@ -175,67 +178,50 @@ func (w *GCodeWindow) newExecutionPanel() *qt.QGroupBox {
 	return panel
 }
 
-func (w *GCodeWindow) SetExecution(documentID app.DocumentID, program gcode.Program, parseErr error, run, pause, resume, stop func()) {
-	w.documentID = documentID
-	w.program = program
-	w.programErr = parseErr
-	w.presentation = frontend.NewDocumentExecutionPresentation(documentID, program)
+// SetExecutionSession attaches this window as a presentation-only consumer.
+// The Application owns controller goroutines; the session owns all execution
+// state and pending-operation coordination shared by every attached view.
+func (w *GCodeWindow) SetExecutionSession(session *frontend.ExecutionSession, run, pause, resume, stop func()) {
+	if w.detachSession != nil {
+		w.detachSession()
+	}
+	w.session = session
 	w.onRun, w.onPause, w.onResume, w.onStop = run, pause, resume, stop
-	if parseErr != nil {
-		w.presentation.Error = parseErr.Error()
+	if session == nil {
+		return
 	}
-	w.renderExecution()
-}
-
-func (w *GCodeWindow) SetStartPending(pending bool) {
-	w.startPending = pending
-	w.renderExecution()
-}
-
-func (w *GCodeWindow) SetOperationPending(pending bool) {
-	w.operationPending = pending
-	w.renderExecution()
-}
-
-func (w *GCodeWindow) StartResult(runID app.RunID, err error) {
-	w.startPending = false
-	w.presentation.ReconcileAdmission(runID, err)
-	w.renderExecution()
-}
-
-func (w *GCodeWindow) OperationResult(err error) {
-	w.operationPending = false
-	if err != nil {
-		w.presentation.Error = err.Error()
-	}
-	w.renderExecution()
+	w.detachSession = session.Attach(func(snapshot frontend.ExecutionSessionSnapshot) {
+		w.sessionSnapshot = snapshot
+		w.renderExecution()
+	})
 }
 
 func (w *GCodeWindow) renderExecution() {
-	controls := frontend.DocumentExecutionControlState(w.documentID, w.programErr == nil && len(w.program.Lines) > 0, w.startPending, w.operationPending, w.state)
+	controls := w.sessionSnapshot.Controls
 	w.runButton.SetEnabled(controls.Run)
 	w.pauseButton.SetEnabled(controls.Pause)
 	w.resumeButton.SetEnabled(controls.Resume)
 	w.stopButton.SetEnabled(controls.Stop)
-	w.statusLabel.SetText("Status: " + w.presentation.StatusText(w.state))
-	w.progressLabel.SetText(fmt.Sprintf("Acknowledged commands: %d / %d", w.presentation.Complete, w.presentation.Total))
-	maximum := w.presentation.Total
+	presentation := w.sessionSnapshot.Presentation
+	w.statusLabel.SetText("Status: " + presentation.StatusText(w.sessionSnapshot.State))
+	w.progressLabel.SetText(fmt.Sprintf("Acknowledged commands: %d / %d", presentation.Complete, presentation.Total))
+	maximum := presentation.Total
 	if maximum < 1 {
 		maximum = 1
 	}
 	w.progressBar.SetMaximum(maximum)
-	w.progressBar.SetValue(w.presentation.Complete)
-	if w.presentation.NextLine > 0 {
-		w.lineLabel.SetText(fmt.Sprintf("Next command: source line %d", w.presentation.NextLine))
-	} else if w.presentation.Status == app.ProgramDraining {
+	w.progressBar.SetValue(presentation.Complete)
+	if presentation.NextLine > 0 {
+		w.lineLabel.SetText(fmt.Sprintf("Next command: source line %d", presentation.NextLine))
+	} else if presentation.Status == app.ProgramDraining {
 		w.lineLabel.SetText("All commands acknowledged — awaiting Idle")
 	} else {
 		w.lineLabel.SetText("Next command: none")
 	}
 	// This is intentionally called for zero too: completed, draining, stopped,
 	// and failed runs must not leave a stale pending-command marker behind.
-	w.sourceView.SetExecutionHighlight(w.presentation.NextLine, w.followCheck.IsChecked())
-	w.errorLabel.SetText(w.presentation.Error)
+	w.sourceView.SetExecutionHighlight(presentation.NextLine, w.followCheck.IsChecked())
+	w.errorLabel.SetText(presentation.Error)
 }
 
 func (w *GCodeWindow) show()                            { w.window.Show() }
@@ -247,12 +233,9 @@ func (w *GCodeWindow) Focus() {
 	w.window.ActivateWindow()
 }
 func (w *GCodeWindow) Close() bool { return w.window.Close() }
-func (w *GCodeWindow) ApplyState(state app.State) {
-	w.state = state
-	w.presentation.ApplyState(state)
-	w.renderExecution()
-}
-func (w *GCodeWindow) ApplyEvent(event app.Event) {
-	w.presentation.ApplyEvent(event)
-	w.renderExecution()
-}
+
+// Controller events are routed once through ExecutionSessions. These no-op
+// EventView methods retain WindowManager registration without giving each
+// native window a second competing execution history.
+func (w *GCodeWindow) ApplyState(frontendState app.State) {}
+func (w *GCodeWindow) ApplyEvent(frontendEvent app.Event) {}
