@@ -67,6 +67,7 @@ type ExecutionSession struct {
 	state        app.State
 
 	startPending     bool
+	awaitingRunState app.RunID
 	operationPending bool
 	lastOperationErr error
 	nextRequest      uint64
@@ -84,9 +85,9 @@ func NewExecutionSession(id ExecutionSessionID, source string, program gcode.Pro
 	s := &ExecutionSession{
 		id:           id,
 		source:       source,
-		program:      program,
+		program:      cloneExecutionProgram(program),
 		parseErr:     parseErr,
-		presentation: NewDocumentExecutionPresentation(id.DocumentID, program),
+		presentation: NewDocumentExecutionPresentation(id.DocumentID, cloneExecutionProgram(program)),
 		state:        state,
 	}
 	if parseErr != nil {
@@ -101,16 +102,26 @@ func (s *ExecutionSession) Snapshot() ExecutionSessionSnapshot {
 	return ExecutionSessionSnapshot{
 		ID:               s.id,
 		Source:           s.source,
-		Program:          s.program,
+		Program:          cloneExecutionProgram(s.program),
 		ParseError:       s.parseErr,
-		Presentation:     s.presentation,
+		Presentation:     cloneExecutionPresentation(s.presentation),
 		State:            s.state,
 		StartPending:     s.startPending,
 		OperationPending: s.operationPending,
 		LastOperationErr: s.lastOperationErr,
-		Controls: DocumentExecutionControlState(s.id.DocumentID,
-			s.parseErr == nil && len(s.program.Lines) > 0, s.startPending, s.operationPending, s.state),
+		Controls: SessionExecutionControlState(s.id, s.presentation.RunID,
+			s.parseErr == nil && len(s.program.Lines) > 0, s.startPending, s.awaitingRunState != 0, s.operationPending, s.state),
 	}
+}
+
+func cloneExecutionProgram(program gcode.Program) gcode.Program {
+	program.Lines = append([]gcode.Line(nil), program.Lines...)
+	return program
+}
+
+func cloneExecutionPresentation(presentation DocumentExecutionPresentation) DocumentExecutionPresentation {
+	presentation.lines = append([]gcode.Line(nil), presentation.lines...)
+	return presentation
 }
 
 // Attach synchronously sends the current snapshot and returns an idempotent
@@ -138,9 +149,11 @@ func (s *ExecutionSession) Attach(observer func(ExecutionSessionSnapshot)) func(
 }
 
 func (s *ExecutionSession) notify() {
-	snapshot := s.Snapshot()
 	for _, observer := range s.observers {
-		observer(snapshot)
+		// Program contains a slice. Give every observer its own snapshot so one
+		// presentation consumer cannot mutate another consumer's view of the
+		// retained executable program.
+		observer(s.Snapshot())
 	}
 }
 
@@ -152,7 +165,7 @@ func (s *ExecutionSession) detachAll() {
 // ProgramStartGate before launching the controller goroutine.
 func (s *ExecutionSession) BeginStart() (uint64, bool) {
 	controls := s.Snapshot().Controls
-	if !controls.Run || s.startPending || s.operationPending {
+	if !controls.Run || s.startPending || s.awaitingRunState != 0 || s.operationPending {
 		return 0, false
 	}
 	s.nextRequest++
@@ -175,6 +188,13 @@ func (s *ExecutionSession) FinishStart(request uint64, runID app.RunID, err erro
 	s.presentation.ReconcileAdmission(runID, err)
 	if err != nil {
 		s.lastOperationErr = err
+	} else if runID != 0 {
+		// StartProgram has accepted a run, but the session must not expose a
+		// second Run until the revisioned controller stream identifies it.
+		s.awaitingRunState = runID
+		if s.state.ProgramDocumentID == s.id.DocumentID && s.state.ProgramRunID == runID {
+			s.awaitingRunState = 0
+		}
 	}
 	s.notify()
 	return true
@@ -208,11 +228,21 @@ func (s *ExecutionSession) FinishAction(runID app.RunID, err error) bool {
 
 func (s *ExecutionSession) ApplyState(state app.State) {
 	s.state = state
-	// The manager routes state only after exact RunID ownership is known.
-	if state.ProgramDocumentID == s.id.DocumentID && state.ProgramRunID == s.presentation.RunID {
-		s.presentation.ApplyState(state)
-	}
+	s.applyRunState(state)
 	s.notify()
+}
+
+// applyRunState updates retained run presentation without changing s.state.
+// Buffered admission state uses this path so an older run snapshot cannot
+// roll back newer global readiness, connection, or emergency-stop state.
+func (s *ExecutionSession) applyRunState(state app.State) {
+	if state.ProgramDocumentID != s.id.DocumentID || state.ProgramRunID == 0 || state.ProgramRunID != s.presentation.RunID {
+		return
+	}
+	s.presentation.ApplyState(state)
+	if s.awaitingRunState == state.ProgramRunID {
+		s.awaitingRunState = 0
+	}
 }
 
 func (s *ExecutionSession) applyGlobalState(state app.State) {
@@ -225,6 +255,23 @@ func (s *ExecutionSession) ApplyEvent(event app.Event) {
 		s.presentation.ApplyEvent(event)
 		s.notify()
 	}
+}
+
+// SessionExecutionControlState applies the established document policy and
+// then narrows active controls to the exact session RunID. DocumentID alone
+// cannot identify a package step because several step sessions share the
+// package's owning document identity.
+func SessionExecutionControlState(id ExecutionSessionID, sessionRunID app.RunID, executable, startPending, awaitingRunState, operationPending bool, state app.State) DocumentExecutionControls {
+	controls := DocumentExecutionControlState(id.DocumentID, executable, startPending, operationPending, state)
+	if awaitingRunState {
+		controls.Run = false
+	}
+	if state.ProgramDocumentID != id.DocumentID || state.ProgramRunID == 0 || state.ProgramRunID != sessionRunID {
+		controls.Pause = false
+		controls.Resume = false
+		controls.Stop = false
+	}
+	return controls
 }
 
 // ExecutionSessions routes the one accepted controller event stream to
@@ -270,6 +317,28 @@ func (m *ExecutionSessions) Session(id ExecutionSessionID) (*ExecutionSession, b
 	return s, ok
 }
 
+// BeginStart is the owner-level admission check used by application command
+// callbacks. Standalone sessions retain their existing behavior. For a future
+// package, sibling steps sharing the owner DocumentID cannot speculatively
+// start while another step's admission has not reached controller state.
+func (m *ExecutionSessions) BeginStart(id ExecutionSessionID) (uint64, bool) {
+	s, ok := m.sessions[id]
+	if !ok {
+		return 0, false
+	}
+	if !id.Standalone() {
+		for otherID, other := range m.sessions {
+			if otherID == id || otherID.DocumentID != id.DocumentID || otherID.Standalone() {
+				continue
+			}
+			if other.startPending || other.awaitingRunState != 0 {
+				return 0, false
+			}
+		}
+	}
+	return s.BeginStart()
+}
+
 func (m *ExecutionSessions) Remove(id ExecutionSessionID) {
 	s, ok := m.sessions[id]
 	if !ok {
@@ -300,7 +369,10 @@ func (m *ExecutionSessions) AssociateRun(id ExecutionSessionID, request uint64, 
 	m.runOwners[runID] = id
 	if state, pending := m.pendingStates[runID]; pending {
 		delete(m.pendingStates, runID)
-		s.ApplyState(state)
+		// This state may be older than m.currentState. It belongs to this exact
+		// run's history but must not replace current machine-control policy.
+		s.applyRunState(state)
+		s.notify()
 	}
 	for _, event := range m.pendingEvents[runID] {
 		s.ApplyEvent(event)
@@ -319,7 +391,8 @@ func (m *ExecutionSessions) ApplyEvent(event app.Event) {
 		runID := event.State.ProgramRunID
 		if owner, ok := m.runOwners[runID]; ok {
 			if s, exists := m.sessions[owner]; exists {
-				s.ApplyState(event.State)
+				s.applyRunState(event.State)
+				s.notify()
 			}
 		} else if m.awaitingAdmission(event.State.ProgramDocumentID) && runID != 0 {
 			m.rememberState(runID, event.State)

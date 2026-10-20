@@ -191,7 +191,7 @@ func (a *Application) startDocumentProgram(sessionID frontend.ExecutionSessionID
 	if !ok {
 		return
 	}
-	requestID, ok := session.BeginStart()
+	requestID, ok := a.sessions.BeginStart(sessionID)
 	if !ok {
 		admission.Release()
 		return
