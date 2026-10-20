@@ -66,13 +66,14 @@ type ExecutionSession struct {
 	presentation DocumentExecutionPresentation
 	state        app.State
 
-	startPending     bool
-	awaitingRunState app.RunID
-	operationPending bool
-	lastOperationErr error
-	nextRequest      uint64
-	startRequest     uint64
-	actionRunID      app.RunID
+	startPending      bool
+	awaitingRunState  app.RunID
+	ownerStartBlocked bool
+	operationPending  bool
+	lastOperationErr  error
+	nextRequest       uint64
+	startRequest      uint64
+	actionRunID       app.RunID
 
 	nextObserver uint64
 	observers    map[uint64]func(ExecutionSessionSnapshot)
@@ -110,7 +111,7 @@ func (s *ExecutionSession) Snapshot() ExecutionSessionSnapshot {
 		OperationPending: s.operationPending,
 		LastOperationErr: s.lastOperationErr,
 		Controls: SessionExecutionControlState(s.id, s.presentation.RunID,
-			s.parseErr == nil && len(s.program.Lines) > 0, s.startPending, s.awaitingRunState != 0, s.operationPending, s.state),
+			s.parseErr == nil && len(s.program.Lines) > 0, s.startPending, s.awaitingRunState != 0, s.ownerStartBlocked, s.operationPending, s.state),
 	}
 }
 
@@ -261,9 +262,9 @@ func (s *ExecutionSession) ApplyEvent(event app.Event) {
 // then narrows active controls to the exact session RunID. DocumentID alone
 // cannot identify a package step because several step sessions share the
 // package's owning document identity.
-func SessionExecutionControlState(id ExecutionSessionID, sessionRunID app.RunID, executable, startPending, awaitingRunState, operationPending bool, state app.State) DocumentExecutionControls {
+func SessionExecutionControlState(id ExecutionSessionID, sessionRunID app.RunID, executable, startPending, awaitingRunState, ownerStartBlocked, operationPending bool, state app.State) DocumentExecutionControls {
 	controls := DocumentExecutionControlState(id.DocumentID, executable, startPending, operationPending, state)
-	if awaitingRunState {
+	if awaitingRunState || ownerStartBlocked {
 		controls.Run = false
 	}
 	if state.ProgramDocumentID != id.DocumentID || state.ProgramRunID == 0 || state.ProgramRunID != sessionRunID {
@@ -309,6 +310,7 @@ func (m *ExecutionSessions) Add(id ExecutionSessionID, source string, program gc
 		return nil, err
 	}
 	m.sessions[id] = s
+	m.refreshPackageAdmission(id.DocumentID, false)
 	return s, nil
 }
 
@@ -326,17 +328,16 @@ func (m *ExecutionSessions) BeginStart(id ExecutionSessionID) (uint64, bool) {
 	if !ok {
 		return 0, false
 	}
-	if !id.Standalone() {
-		for otherID, other := range m.sessions {
-			if otherID == id || otherID.DocumentID != id.DocumentID || otherID.Standalone() {
-				continue
-			}
-			if other.startPending || other.awaitingRunState != 0 {
-				return 0, false
-			}
-		}
+	if m.packageAdmissionBlocked(id) {
+		return 0, false
 	}
-	return s.BeginStart()
+	request, accepted := s.BeginStart()
+	if accepted {
+		// The session's own transition notifies its views. Refreshing the owner
+		// immediately updates every sibling before any controller state arrives.
+		m.refreshPackageAdmission(id.DocumentID, false)
+	}
+	return request, accepted
 }
 
 func (m *ExecutionSessions) Remove(id ExecutionSessionID) {
@@ -349,6 +350,7 @@ func (m *ExecutionSessions) Remove(id ExecutionSessionID) {
 	}
 	s.detachAll()
 	delete(m.sessions, id)
+	m.refreshPackageAdmission(id.DocumentID, false)
 }
 
 func (m *ExecutionSessions) AssociateRun(id ExecutionSessionID, request uint64, runID app.RunID, err error) bool {
@@ -361,6 +363,7 @@ func (m *ExecutionSessions) AssociateRun(id ExecutionSessionID, request uint64, 
 		return false
 	}
 	if err != nil || runID == 0 {
+		m.refreshPackageAdmission(id.DocumentID, true)
 		return true
 	}
 	if oldRunID != 0 && oldRunID != runID {
@@ -378,6 +381,7 @@ func (m *ExecutionSessions) AssociateRun(id ExecutionSessionID, request uint64, 
 		s.ApplyEvent(event)
 	}
 	delete(m.pendingEvents, runID)
+	m.refreshPackageAdmission(id.DocumentID, true)
 	return true
 }
 
@@ -393,6 +397,7 @@ func (m *ExecutionSessions) ApplyEvent(event app.Event) {
 			if s, exists := m.sessions[owner]; exists {
 				s.applyRunState(event.State)
 				s.notify()
+				m.refreshPackageAdmission(owner.DocumentID, false)
 			}
 		} else if m.awaitingAdmission(event.State.ProgramDocumentID) && runID != 0 {
 			m.rememberState(runID, event.State)
@@ -409,6 +414,43 @@ func (m *ExecutionSessions) ApplyEvent(event app.Event) {
 	}
 	if m.awaitingAdmission(event.ErrorDocumentID) {
 		m.rememberEvent(event.ErrorRunID, event)
+	}
+}
+
+// packageAdmissionBlocked is the sole package-owner admission rule. Only
+// non-standalone sessions with the same owning package DocumentID are
+// siblings; standalone documents and other packages remain independent.
+func (m *ExecutionSessions) packageAdmissionBlocked(id ExecutionSessionID) bool {
+	if id.Standalone() {
+		return false
+	}
+	for otherID, other := range m.sessions {
+		if otherID == id || otherID.DocumentID != id.DocumentID || otherID.Standalone() {
+			continue
+		}
+		if other.startPending || other.awaitingRunState != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// refreshPackageAdmission projects the manager's admission rule into each
+// package-step snapshot. It notifies only sessions whose rendered Run
+// availability can change; normal controller-state notifications remain
+// separate and revision ordered.
+func (m *ExecutionSessions) refreshPackageAdmission(documentID app.DocumentID, force bool) {
+	for id, session := range m.sessions {
+		if id.DocumentID != documentID || id.Standalone() {
+			continue
+		}
+		blocked := m.packageAdmissionBlocked(id)
+		if session.ownerStartBlocked != blocked {
+			session.ownerStartBlocked = blocked
+			session.notify()
+		} else if force {
+			session.notify()
+		}
 	}
 }
 

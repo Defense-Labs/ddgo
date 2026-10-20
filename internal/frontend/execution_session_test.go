@@ -372,3 +372,124 @@ func TestExecutionSessionsHoldRunAdmissionUntilAuthoritativeState(t *testing.T) 
 		t.Fatal("rejected admission did not permit retry")
 	}
 }
+
+func TestExecutionSessionsImmediatelyPropagatePackageAdmissionEligibility(t *testing.T) {
+	manager := NewExecutionSessions(sessionState(0, 0, "", 0), 1)
+	stepAID := PackageStepExecutionSessionID(7, 1, "step-a")
+	stepBID := PackageStepExecutionSessionID(7, 1, "step-b")
+	stepA, _ := manager.Add(stepAID, "G0 X1", testSessionProgram(), nil)
+	stepB, _ := manager.Add(stepBID, "G0 X1", testSessionProgram(), nil)
+	var aUpdates, bUpdates []ExecutionSessionSnapshot
+	stepA.Attach(func(snapshot ExecutionSessionSnapshot) { aUpdates = append(aUpdates, snapshot) })
+	detachB := stepB.Attach(func(snapshot ExecutionSessionSnapshot) { bUpdates = append(bUpdates, snapshot) })
+	if !stepA.Snapshot().Controls.Run || !stepB.Snapshot().Controls.Run {
+		t.Fatalf("initial package controls = A:%+v B:%+v", stepA.Snapshot().Controls, stepB.Snapshot().Controls)
+	}
+
+	request, ok := manager.BeginStart(stepAID)
+	if !ok {
+		t.Fatal("A admission was rejected")
+	}
+	if stepA.Snapshot().Controls.Run || stepB.Snapshot().Controls.Run {
+		t.Fatalf("pending admission did not disable siblings: A:%+v B:%+v", stepA.Snapshot().Controls, stepB.Snapshot().Controls)
+	}
+	if len(aUpdates) < 2 || len(bUpdates) < 2 || bUpdates[len(bUpdates)-1].Controls.Run {
+		t.Fatalf("pending admission did not notify both views: A=%d B=%d lastB=%+v", len(aUpdates), len(bUpdates), bUpdates[len(bUpdates)-1].Controls)
+	}
+	if _, ok := manager.BeginStart(stepBID); ok {
+		t.Fatal("manager accepted sibling while A admission was pending")
+	}
+
+	updatesBeforeSuccess := len(bUpdates)
+	if !manager.AssociateRun(stepAID, request, 51, nil) {
+		t.Fatal("A admission result was rejected")
+	}
+	if stepA.Snapshot().Controls.Run || stepB.Snapshot().Controls.Run {
+		t.Fatalf("successful admission reopened Run before controller state: A:%+v B:%+v", stepA.Snapshot().Controls, stepB.Snapshot().Controls)
+	}
+	if len(bUpdates) <= updatesBeforeSuccess || bUpdates[len(bUpdates)-1].Controls.Run {
+		t.Fatalf("success transition did not notify sibling: updates=%d controls=%+v", len(bUpdates), bUpdates[len(bUpdates)-1].Controls)
+	}
+	if _, ok := manager.BeginStart(stepBID); ok {
+		t.Fatal("manager accepted sibling while A awaited controller state")
+	}
+
+	manager.ApplyEvent(app.Event{StateRevision: 2, State: sessionState(7, 51, app.ProgramRunning, 0)})
+	if stepA.Snapshot().Controls.Run || stepB.Snapshot().Controls.Run {
+		t.Fatalf("running state reopened Run: A:%+v B:%+v", stepA.Snapshot().Controls, stepB.Snapshot().Controls)
+	}
+	manager.ApplyEvent(app.Event{StateRevision: 3, State: sessionState(7, 51, app.ProgramCompleted, 2)})
+	if !stepA.Snapshot().Controls.Run || !stepB.Snapshot().Controls.Run {
+		t.Fatalf("terminal state did not restore package eligibility: A:%+v B:%+v", stepA.Snapshot().Controls, stepB.Snapshot().Controls)
+	}
+	if got := stepA.Snapshot().Presentation; got.RunID != 51 || got.Status != app.ProgramCompleted {
+		t.Fatalf("terminal history was not retained: %+v", got)
+	}
+
+	detachB()
+	updatesBeforeDetach := len(bUpdates)
+	request, ok = manager.BeginStart(stepAID)
+	if !ok {
+		t.Fatal("later A admission was rejected")
+	}
+	if !manager.AssociateRun(stepAID, request, 0, errors.New("controller busy")) {
+		t.Fatal("rejected A admission was not consumed")
+	}
+	if len(bUpdates) != updatesBeforeDetach {
+		t.Fatal("detached sibling received a notification")
+	}
+	var reattached ExecutionSessionSnapshot
+	stepB.Attach(func(snapshot ExecutionSessionSnapshot) { reattached = snapshot })
+	if !reattached.Controls.Run {
+		t.Fatalf("reattached sibling did not recover eligibility: %+v", reattached.Controls)
+	}
+}
+
+func TestExecutionSessionsScopeAdmissionLocksToPackageOwner(t *testing.T) {
+	manager := NewExecutionSessions(sessionState(0, 0, "", 0), 1)
+	packageA := PackageStepExecutionSessionID(7, 1, "step-a")
+	packageASibling := PackageStepExecutionSessionID(7, 1, "step-b")
+	packageB := PackageStepExecutionSessionID(8, 1, "step-a")
+	standaloneA := StandaloneExecutionSessionID(9)
+	standaloneB := StandaloneExecutionSessionID(10)
+	_, _ = manager.Add(packageA, "G0 X1", testSessionProgram(), nil)
+	sibling, _ := manager.Add(packageASibling, "G0 X1", testSessionProgram(), nil)
+	otherPackage, _ := manager.Add(packageB, "G0 X1", testSessionProgram(), nil)
+	standaloneOne, _ := manager.Add(standaloneA, "G0 X1", testSessionProgram(), nil)
+	standaloneTwo, _ := manager.Add(standaloneB, "G0 X1", testSessionProgram(), nil)
+
+	if _, ok := manager.BeginStart(packageA); !ok {
+		t.Fatal("package A admission was rejected")
+	}
+	if sibling.Snapshot().Controls.Run {
+		t.Fatal("same-package sibling remained enabled")
+	}
+	if !otherPackage.Snapshot().Controls.Run || !standaloneOne.Snapshot().Controls.Run || !standaloneTwo.Snapshot().Controls.Run {
+		t.Fatalf("unrelated owners inherited package lock: package=%+v standaloneA=%+v standaloneB=%+v", otherPackage.Snapshot().Controls, standaloneOne.Snapshot().Controls, standaloneTwo.Snapshot().Controls)
+	}
+}
+
+func TestExecutionSessionsKeepSiblingControlsLockedWhenStatePrecedesAdmission(t *testing.T) {
+	manager := NewExecutionSessions(sessionState(0, 0, "", 0), 1)
+	stepAID := PackageStepExecutionSessionID(7, 1, "step-a")
+	stepBID := PackageStepExecutionSessionID(7, 1, "step-b")
+	_, _ = manager.Add(stepAID, "G0 X1", testSessionProgram(), nil)
+	stepB, _ := manager.Add(stepBID, "G0 X1", testSessionProgram(), nil)
+	request, ok := manager.BeginStart(stepAID)
+	if !ok || stepB.Snapshot().Controls.Run {
+		t.Fatal("pending admission did not lock sibling")
+	}
+	// The state is accepted before the asynchronous Start result identifies A.
+	manager.ApplyEvent(app.Event{StateRevision: 3, State: sessionState(7, 73, app.ProgramRunning, 0)})
+	if stepB.Snapshot().Controls.Run {
+		t.Fatal("pre-admission running state released sibling")
+	}
+	if !manager.AssociateRun(stepAID, request, 73, nil) || stepB.Snapshot().Controls.Run {
+		t.Fatal("reconciliation released sibling while the run is active")
+	}
+	// A stale revision cannot change either the manager's state or lock.
+	manager.ApplyEvent(app.Event{StateRevision: 2, State: sessionState(0, 0, "", 0)})
+	if stepB.Snapshot().Controls.Run {
+		t.Fatal("stale state released sibling")
+	}
+}
