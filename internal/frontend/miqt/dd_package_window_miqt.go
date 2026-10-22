@@ -13,7 +13,6 @@ import (
 
 	"github.com/ianbruene/ddgo/internal/app"
 	"github.com/ianbruene/ddgo/internal/ddpackage"
-	"github.com/ianbruene/ddgo/internal/frontend"
 	qt "github.com/mappu/miqt/qt6"
 )
 
@@ -239,4 +238,4 @@ func (w *DDPackageWindow) SetOnCloseRequest(fn func() bool) { w.onCloseRequest =
 func (w *DDPackageWindow) Focus()                           { w.window.ShowNormal(); w.window.Raise(); w.window.ActivateWindow() }
 func (w *DDPackageWindow) Close() bool                      { return w.window.Close() }
 func (w *DDPackageWindow) ApplyState(app.State)             {}
-func (w *DDPackageWindow) ApplyEvent(frontend.Event)        {}
+func (w *DDPackageWindow) ApplyEvent(app.Event)             {}
