@@ -3,12 +3,10 @@ module github.com/ianbruene/ddgo
 go 1.23
 
 require (
-	github.com/mappu/miqt v0.14.0
+	github.com/mappu/miqt v0.15.0
 	go.bug.st/serial v1.6.4
+	golang.org/x/sys v0.19.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-require (
-	github.com/creack/goselect v0.1.2 // indirect
-	golang.org/x/sys v0.19.0 // indirect
-)
+require github.com/creack/goselect v0.1.2 // indirect
