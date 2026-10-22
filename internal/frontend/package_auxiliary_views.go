@@ -64,16 +64,32 @@ func (v *PackageAuxiliaryViews) Remove(owner app.DocumentID, id ExecutionSession
 	return true
 }
 
-// RemoveOwner atomically releases all membership before callers close native
-// windows, so their close callbacks cannot retain or mutate package state.
-func (v *PackageAuxiliaryViews) RemoveOwner(owner app.DocumentID) []DocumentWindow {
-	views := v.byOwner[owner]
-	delete(v.byOwner, owner)
-	windows := make([]DocumentWindow, 0, len(views))
-	for _, entry := range views {
-		windows = append(windows, entry.window)
+// CloseOwner asks every currently registered auxiliary view to close without
+// discarding membership first. Accepted native closes invoke their individual
+// WindowManager callback, which calls Remove with the original token. A false
+// result or a missing callback leaves the surviving view owned and prevents
+// the package's native close from being accepted.
+func (v *PackageAuxiliaryViews) CloseOwner(owner app.DocumentID) bool {
+	type pendingClose struct {
+		id     ExecutionSessionID
+		token  uint64
+		window DocumentWindow
 	}
-	return windows
+	views := v.byOwner[owner]
+	pending := make([]pendingClose, 0, len(views))
+	for id, entry := range views {
+		pending = append(pending, pendingClose{id: id, token: entry.token, window: entry.window})
+	}
+	for _, close := range pending {
+		current, ok := v.byOwner[owner][close.id]
+		if !ok || current.token != close.token {
+			continue
+		}
+		if !close.window.Close() {
+			return false
+		}
+	}
+	return len(v.byOwner[owner]) == 0
 }
 
 func (v *PackageAuxiliaryViews) Len(owner app.DocumentID) int { return len(v.byOwner[owner]) }

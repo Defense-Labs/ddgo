@@ -13,6 +13,7 @@ import (
 
 	"github.com/ianbruene/ddgo/internal/app"
 	"github.com/ianbruene/ddgo/internal/ddpackage"
+	"github.com/ianbruene/ddgo/internal/frontend"
 	qt "github.com/mappu/miqt/qt6"
 )
 
@@ -130,7 +131,7 @@ func newDDPackageWindow(id app.DocumentID, pkg *ddpackage.Package, openStep func
 	if len(pkg.Warnings) > 0 {
 		messages := make([]string, 0, len(pkg.Warnings))
 		for _, warning := range pkg.Warnings {
-			messages = append(messages, fmt.Sprintf("%s: %s", warning.Path, warning.Message))
+			messages = append(messages, frontend.FormatPackageDiagnostic(warning))
 		}
 		w.warnings.SetText("Package compatibility notes: " + strings.Join(messages, "\n"))
 	}

@@ -15,6 +15,9 @@ import (
 type GCodeWindow struct {
 	document            gcode.Document
 	window              *qt.QMainWindow
+	central             *qt.QWidget
+	centralLayout       *qt.QVBoxLayout
+	packageHeader       *qt.QWidget
 	splitter            *qt.QSplitter
 	sourceView          *GCodeSourceView
 	toolpathPlaceholder *qt.QWidget
@@ -62,10 +65,10 @@ func (w *GCodeWindow) SetPackageAuxiliary(packageName, stepName string, back fun
 	w.resumeButton.SetEnabled(false)
 	w.stopButton.SetEnabled(false)
 	w.statusLabel.SetText("Package-step execution is not available yet.")
-	header := qt.NewQWidget(nil)
+	w.packageHeader = qt.NewQWidget(nil)
 	headerLayout := qt.NewQHBoxLayout(nil)
 	headerLayout.SetContentsMargins(8, 4, 8, 4)
-	header.SetLayout(headerLayout.QLayout)
+	w.packageHeader.SetLayout(headerLayout.QLayout)
 	button := qt.NewQPushButton(nil)
 	button.SetText("← Back to Package — " + packageName)
 	button.OnClicked(func() {
@@ -75,13 +78,9 @@ func (w *GCodeWindow) SetPackageAuxiliary(packageName, stepName string, back fun
 	})
 	headerLayout.AddWidget(button.QWidget)
 	headerLayout.AddStretch()
-	container := qt.NewQWidget(nil)
-	layout := qt.NewQVBoxLayout(nil)
-	layout.SetContentsMargins(0, 0, 0, 0)
-	container.SetLayout(layout.QLayout)
-	layout.AddWidget(header)
-	layout.AddWidget(w.splitter.QWidget)
-	w.window.SetCentralWidget(container)
+	// The main-window central widget is installed once in newGCodeWindow.
+	// Inserting this header never reparents or replaces the splitter.
+	w.centralLayout.InsertWidget(0, w.packageHeader)
 }
 
 func newGCodeWindow(document gcode.Document, onOpen func()) *GCodeWindow {
@@ -105,7 +104,13 @@ func newGCodeWindow(document gcode.Document, onOpen func()) *GCodeWindow {
 	w.splitter.SetStretchFactor(1, 5)
 	w.splitter.SetStretchFactor(2, 2)
 	w.splitter.SetSizes([]int{384, 640, 256})
-	w.window.SetCentralWidget(w.splitter.QWidget)
+	w.central = qt.NewQWidget(nil)
+	w.centralLayout = qt.NewQVBoxLayout(nil)
+	w.centralLayout.SetContentsMargins(0, 0, 0, 0)
+	w.central.SetLayout(w.centralLayout.QLayout)
+	w.centralLayout.AddWidget(w.splitter.QWidget)
+	// This is the sole SetCentralWidget call for the lifetime of this window.
+	w.window.SetCentralWidget(w.central)
 
 	fileMenu := w.window.MenuBar().AddMenuWithTitle("File")
 	openAction := fileMenu.AddActionWithText("Open…")

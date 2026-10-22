@@ -433,7 +433,7 @@ func (a *Application) requestDocumentClose(id app.DocumentID) bool {
 			a.warnMain("Shutdown Cancelled", "Controller execution or machine recovery became active before the document could close.")
 			return false
 		}
-		return true
+		return a.closePackageAuxiliaries(id)
 	}
 	if _, approved := a.approvedDocumentCloses[id]; approved {
 		state := a.controller.Snapshot()
@@ -442,7 +442,7 @@ func (a *Application) requestDocumentClose(id app.DocumentID) bool {
 			// approval and requires a fresh explicit close request.
 			return false
 		}
-		return true
+		return a.closePackageAuxiliaries(id)
 	}
 	entry, ok := a.documents.Entry(id)
 	if !ok {
@@ -459,7 +459,7 @@ func (a *Application) requestDocumentClose(id app.DocumentID) bool {
 	}
 	state := a.controller.Snapshot()
 	if !state.ProgramStatus.IsActive() || state.ProgramDocumentID != id {
-		return true
+		return a.closePackageAuxiliaries(id)
 	}
 	if !confirmStopAndClose(documentParent(entry)) || !a.documents.MarkClosePending(id) {
 		return false
@@ -470,6 +470,24 @@ func (a *Application) requestDocumentClose(id app.DocumentID) bool {
 		err := a.controller.StopProgramRun(context.Background(), id, runID)
 		a.documentCloseResults <- documentCloseResult{documentID: id, runID: runID, err: err}
 	}()
+	return false
+}
+
+// closePackageAuxiliaries is stage B of package close coordination. Stage A
+// above has already established controller/shutdown authorization. Membership
+// is released only from accepted auxiliary native-close callbacks, so a failed
+// close leaves the package document and every surviving view owned and usable.
+func (a *Application) closePackageAuxiliaries(id app.DocumentID) bool {
+	entry, ok := a.documents.Entry(id)
+	if !ok || entry.Kind != frontend.DocumentKindDDPackage {
+		return true
+	}
+	if a.packageViews.CloseOwner(id) {
+		return true
+	}
+	if !a.shutdown.Active() {
+		qt.QMessageBox_Warning(documentParent(entry), "Package Remains Open", "A supplementary G-code window refused to close. The package remains open.")
+	}
 	return false
 }
 
@@ -524,19 +542,19 @@ func (a *Application) documentClosed(entry frontend.DocumentEntry) {
 		a.sessions.Remove(frontend.StandaloneExecutionSessionID(entry.ID))
 	}
 	if entry.Kind == frontend.DocumentKindDDPackage {
-		// The package is the sole logical owner. Its accepted native close tears
-		// down supplementary top-level views, which remain unregistered from the
-		// document registry throughout their lifetime.
-		views := a.packageViews.RemoveOwner(entry.ID)
+		// Auxiliary native closes were verified before this document's own close
+		// event was accepted. Do not release sessions if that invariant is ever
+		// violated; a live view must never lose its owner/session prematurely.
+		if a.packageViews.Len(entry.ID) != 0 {
+			a.refreshExecutionFocusAvailability()
+			return
+		}
 		for id := range a.packageSessions[entry.ID] {
 			if a.sessions != nil {
 				a.sessions.Remove(id)
 			}
 		}
 		delete(a.packageSessions, entry.ID)
-		for _, window := range views {
-			_ = window.Close()
-		}
 	}
 	// Do not close the main window here: this callback runs inside native
 	// document destruction. The next UI timer turn advances the coordinator.

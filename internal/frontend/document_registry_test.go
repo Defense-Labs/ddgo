@@ -14,7 +14,8 @@ import (
 
 type fakeDocumentWindow struct {
 	fakeApplicationWindow
-	focused int
+	focused     int
+	rejectClose bool
 }
 
 func TestDocumentRegistryOpensOnePackageWithStableIdentity(t *testing.T) {
@@ -67,6 +68,9 @@ func TestDocumentRegistryFailedPackageLoadLeavesNoEntry(t *testing.T) {
 
 func (w *fakeDocumentWindow) Focus() { w.focused++ }
 func (w *fakeDocumentWindow) Close() bool {
+	if w.rejectClose {
+		return false
+	}
 	w.close()
 	return true
 }
