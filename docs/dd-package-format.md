@@ -88,10 +88,17 @@ chapter 19. The public source uses a custom YAML parser and historically treats
 the first parsed document as the root manifest; DDGo instead requires one
 standard-YAML document with an explicit sequence root.
 
-Future UI integration should add a package-document variant above the existing
-frontend registry, sharing canonical source-path identity, `DocumentID`
-allocation, top-level-window ownership, dispatcher registration, focus, and
-safe close coordination. The existing registry should not be generalized until
-that package window has concrete lifecycle requirements. A future wizard may
-render these models and request controller work, but must bind every action to
-document/run identity and retain the current controller safety interlocks.
+DDGo now presents a loaded package as one first-class, read-only package
+document. It browses manifest-order jobs and steps, preserves text/Markdown,
+shows bounded in-memory images when Qt can decode them, lists resource
+references and loader diagnostics, and can open a supplementary source-only
+G-code view for any `step_gcode`. These views use the retained archive snapshot
+without extracting resources, are keyed by package document/job/step identity,
+and provide Back to Package navigation. Closing an auxiliary view does not
+close the package; accepted package closure closes its auxiliary views.
+
+This is viewing only. DDGo does not yet execute package G-code, advance a
+guided workflow, evaluate conditions, display models externally, or act on
+pause/reset/timeout/jump/popup metadata. A future wizard may request controller
+work only after binding every action to package document, step, and RunID while
+retaining current controller safety interlocks.

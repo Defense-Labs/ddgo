@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/ianbruene/ddgo/internal/app"
+	"github.com/ianbruene/ddgo/internal/ddpackage"
 	"github.com/ianbruene/ddgo/internal/gcode"
 )
 
@@ -19,11 +20,22 @@ type DocumentWindow interface {
 	Close() bool
 }
 
+// DocumentKind identifies the retained, first-class document payload. Native
+// auxiliary views intentionally do not have a DocumentKind or DocumentID.
+type DocumentKind uint8
+
+const (
+	DocumentKindGCode DocumentKind = iota + 1
+	DocumentKindDDPackage
+)
+
 // DocumentEntry is one currently open file-backed document. Its ID is an
 // application identity, not a filename or a controller RunID.
 type DocumentEntry struct {
 	ID            app.DocumentID
+	Kind          DocumentKind
 	Document      gcode.Document
+	Package       *ddpackage.Package
 	CanonicalPath string
 	Window        DocumentWindow
 	closePending  bool
@@ -79,6 +91,40 @@ func CanonicalDocumentPath(path string) (string, error) {
 // and registers that window with WindowManager as one atomic UI-thread step.
 // The returned boolean reports whether a new document was opened.
 func (r *DocumentRegistry) OpenFile(path string, load func(string) (gcode.Document, error), newWindow func(app.DocumentID, gcode.Document) DocumentWindow) (DocumentEntry, bool, error) {
+	return r.open(path, func(canonical string, id app.DocumentID) (DocumentEntry, error) {
+		document, err := load(canonical)
+		if err != nil {
+			return DocumentEntry{}, err
+		}
+		window := newWindow(id, document)
+		if window == nil {
+			return DocumentEntry{}, fmt.Errorf("create document window")
+		}
+		return DocumentEntry{ID: id, Kind: DocumentKindGCode, Document: document, CanonicalPath: canonical, Window: window}, nil
+	})
+}
+
+// OpenPackage is the package analogue of OpenFile. It preserves the fully
+// loaded package snapshot supplied by the loader and creates one logical
+// document regardless of the number of later auxiliary G-code views.
+func (r *DocumentRegistry) OpenPackage(path string, load func(string) (*ddpackage.Package, error), newWindow func(app.DocumentID, *ddpackage.Package) DocumentWindow) (DocumentEntry, bool, error) {
+	return r.open(path, func(canonical string, id app.DocumentID) (DocumentEntry, error) {
+		pkg, err := load(canonical)
+		if err != nil {
+			return DocumentEntry{}, err
+		}
+		if pkg == nil {
+			return DocumentEntry{}, fmt.Errorf("load .dd package returned nil")
+		}
+		window := newWindow(id, pkg)
+		if window == nil {
+			return DocumentEntry{}, fmt.Errorf("create package window")
+		}
+		return DocumentEntry{ID: id, Kind: DocumentKindDDPackage, Package: pkg, CanonicalPath: canonical, Window: window}, nil
+	})
+}
+
+func (r *DocumentRegistry) open(path string, create func(canonical string, id app.DocumentID) (DocumentEntry, error)) (DocumentEntry, bool, error) {
 	if r == nil || r.windows == nil {
 		return DocumentEntry{}, false, fmt.Errorf("document registry is not initialized")
 	}
@@ -91,34 +137,31 @@ func (r *DocumentRegistry) OpenFile(path string, load func(string) (gcode.Docume
 			entry.Window.Focus()
 			return *entry, false, nil
 		}
-		// Keep maps self-healing if an interrupted earlier teardown left a stale
-		// lookup. A live entry is always present in both maps.
 		delete(r.byPath, canonical)
-	}
-	document, err := load(canonical)
-	if err != nil {
-		return DocumentEntry{}, false, err
 	}
 	if r.nextID == ^app.DocumentID(0) {
 		return DocumentEntry{}, false, fmt.Errorf("document IDs exhausted")
 	}
-	r.nextID++
-	if r.nextID == 0 {
-		r.nextID++
+	candidate := r.nextID + 1
+	if candidate == 0 {
+		candidate++
 	}
-	window := newWindow(r.nextID, document)
-	if window == nil {
-		return DocumentEntry{}, false, fmt.Errorf("create document window")
+	entry, err := create(canonical, candidate)
+	if err != nil {
+		return DocumentEntry{}, false, err
 	}
-	entry := &DocumentEntry{ID: r.nextID, Document: document, CanonicalPath: canonical, Window: window}
+	if entry.ID != candidate || entry.Window == nil {
+		return DocumentEntry{}, false, fmt.Errorf("invalid document registration")
+	}
+	r.nextID = candidate
 	if r.byID == nil {
 		r.byID = make(map[app.DocumentID]*DocumentEntry)
 		r.byPath = make(map[string]app.DocumentID)
 	}
-	r.byID[entry.ID] = entry
+	r.byID[entry.ID] = &entry
 	r.byPath[canonical] = entry.ID
-	r.windows.AddWithClose(window, func() { r.remove(entry.ID) })
-	return *entry, true, nil
+	r.windows.AddWithClose(entry.Window, func() { r.remove(entry.ID) })
+	return entry, true, nil
 }
 
 // Entry returns the current entry by stable application identity.

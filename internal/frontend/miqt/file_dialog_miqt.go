@@ -11,12 +11,12 @@ import (
 
 const (
 	allFilesFilter     = "All Files (*)"
-	programFileFilters = allFilesFilter + ";;G-code Files (*.gcode *.gc *.nc *.tap *.ngc)"
+	programFileFilters = "G-code Files (*.gcode *.gc *.nc *.tap *.ngc);;DD Package Files (*.dd);;" + allFilesFilter
 )
 
 func chooseProgramFile(parent *qt.QWidget) string {
 	dialog := qt.NewQFileDialog(parent)
-	dialog.SetWindowTitle("Open G-code File")
+	dialog.SetWindowTitle("Open File")
 	dialog.SetFileMode(qt.QFileDialog__ExistingFile)
 	dialog.SetNameFilter(programFileFilters)
 	dialog.SelectNameFilter(allFilesFilter)

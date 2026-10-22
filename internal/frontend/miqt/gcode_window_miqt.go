@@ -29,6 +29,8 @@ type GCodeWindow struct {
 	errorLabel          *qt.QLabel
 	progressBar         *qt.QProgressBar
 	followCheck         *qt.QCheckBox
+	isAuxiliary         bool
+	executionDisabled   bool
 
 	session         *frontend.ExecutionSession
 	sessionSnapshot frontend.ExecutionSessionSnapshot
@@ -42,6 +44,44 @@ type GCodeWindow struct {
 	onOpen         func()
 	onCloseRequest func() bool
 	closeNotified  bool
+}
+
+// SetPackageAuxiliary marks this window as a supplementary package-step view.
+// It has no controller callbacks in DD-B2; the visible header is both the
+// navigation affordance and an ownership cue in the native task switcher.
+func (w *GCodeWindow) SetPackageAuxiliary(packageName, stepName string, back func()) {
+	if w.isAuxiliary {
+		return
+	}
+	w.isAuxiliary = true
+	w.executionDisabled = true
+	w.window.SetWindowTitle(stepName + " — " + packageName + " — DDGo")
+	w.onRun, w.onPause, w.onResume, w.onStop = nil, nil, nil, nil
+	w.runButton.SetEnabled(false)
+	w.pauseButton.SetEnabled(false)
+	w.resumeButton.SetEnabled(false)
+	w.stopButton.SetEnabled(false)
+	w.statusLabel.SetText("Package-step execution is not available yet.")
+	header := qt.NewQWidget(nil)
+	headerLayout := qt.NewQHBoxLayout(nil)
+	headerLayout.SetContentsMargins(8, 4, 8, 4)
+	header.SetLayout(headerLayout.QLayout)
+	button := qt.NewQPushButton(nil)
+	button.SetText("← Back to Package — " + packageName)
+	button.OnClicked(func() {
+		if back != nil {
+			back()
+		}
+	})
+	headerLayout.AddWidget(button.QWidget)
+	headerLayout.AddStretch()
+	container := qt.NewQWidget(nil)
+	layout := qt.NewQVBoxLayout(nil)
+	layout.SetContentsMargins(0, 0, 0, 0)
+	container.SetLayout(layout.QLayout)
+	layout.AddWidget(header)
+	layout.AddWidget(w.splitter.QWidget)
+	w.window.SetCentralWidget(container)
 }
 
 func newGCodeWindow(document gcode.Document, onOpen func()) *GCodeWindow {
@@ -198,6 +238,9 @@ func (w *GCodeWindow) SetExecutionSession(session *frontend.ExecutionSession, ru
 
 func (w *GCodeWindow) renderExecution() {
 	controls := w.sessionSnapshot.Controls
+	if w.executionDisabled {
+		controls.Run, controls.Pause, controls.Resume, controls.Stop = false, false, false, false
+	}
 	w.runButton.SetEnabled(controls.Run)
 	w.pauseButton.SetEnabled(controls.Pause)
 	w.resumeButton.SetEnabled(controls.Resume)

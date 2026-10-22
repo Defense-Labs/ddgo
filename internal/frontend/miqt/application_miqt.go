@@ -7,8 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/ianbruene/ddgo/internal/app"
+	"github.com/ianbruene/ddgo/internal/ddpackage"
 	"github.com/ianbruene/ddgo/internal/frontend"
 	"github.com/ianbruene/ddgo/internal/gcode"
 	qt "github.com/mappu/miqt/qt6"
@@ -33,6 +36,8 @@ type Application struct {
 	documentStartResults   chan documentStartResult
 	pendingDocumentActions map[frontend.ExecutionSessionID]app.RunID
 	documentActionResults  chan documentActionResult
+	packageViews           frontend.PackageAuxiliaryViews
+	packageSessions        map[app.DocumentID]map[frontend.ExecutionSessionID]struct{}
 
 	shutdown            frontend.ShutdownCoordinator
 	shutdownStopResults chan shutdownStopResult
@@ -89,6 +94,7 @@ func (a *Application) Run() error {
 	a.documentStartResults = make(chan documentStartResult, 16)
 	a.pendingDocumentActions = make(map[frontend.ExecutionSessionID]app.RunID)
 	a.documentActionResults = make(chan documentActionResult, 16)
+	a.packageSessions = make(map[app.DocumentID]map[frontend.ExecutionSessionID]struct{})
 	a.shutdownStopResults = make(chan shutdownStopResult, 2)
 
 	mainWindow := newMainWindow(a.controller, func() { a.openGCodeFile() }, a.showExecutionDocument, a.canShowExecutionDocument)
@@ -115,6 +121,10 @@ func (a *Application) openGCodeFile() {
 	if path == "" {
 		return
 	}
+	if strings.EqualFold(filepath.Ext(path), ".dd") {
+		a.openPackageFile(path)
+		return
+	}
 	entry, opened, err := a.documents.OpenFile(path, gcode.LoadDocument, func(id app.DocumentID, document gcode.Document) frontend.DocumentWindow {
 		window := newGCodeWindow(document, func() { a.openGCodeFile() })
 		window.SetOnCloseRequest(func() bool { return a.requestDocumentClose(id) })
@@ -133,6 +143,80 @@ func (a *Application) openGCodeFile() {
 		window.Focus()
 	}
 	a.refreshExecutionFocusAvailability()
+}
+
+func (a *Application) openPackageFile(path string) {
+	entry, opened, err := a.documents.OpenPackage(path, ddpackage.Load, func(id app.DocumentID, pkg *ddpackage.Package) frontend.DocumentWindow {
+		window := newDDPackageWindow(id, pkg, func(jobIndex int, step ddpackage.Step) { a.openPackageStep(id, jobIndex, step) })
+		window.SetOnCloseRequest(func() bool { return a.requestDocumentClose(id) })
+		return window
+	})
+	if err != nil {
+		qt.QMessageBox_Critical(nil, "Unable to Open DD Package", fmt.Sprintf("Could not open %s:\n%v", path, err))
+		return
+	}
+	if opened {
+		entry.Window.Focus()
+	}
+	a.refreshExecutionFocusAvailability()
+}
+
+func (a *Application) openPackageStep(documentID app.DocumentID, jobIndex int, step ddpackage.Step) {
+	entry, ok := a.documents.Entry(documentID)
+	if !ok || entry.Kind != frontend.DocumentKindDDPackage || entry.Package == nil || jobIndex < 0 || jobIndex >= len(entry.Package.Jobs) {
+		return
+	}
+	id := frontend.PackageStepExecutionSessionID(documentID, jobIndex+1, step.ID)
+	if view, exists := a.packageViews.Window(documentID, id); exists {
+		view.Focus()
+		return
+	}
+	source, err := entry.Package.ReadStepGCode(step)
+	if err != nil {
+		qt.QMessageBox_Warning(documentParent(entry), "Unable to Open Step G-code", err.Error())
+		return
+	}
+	document := gcode.Document{Path: entry.CanonicalPath + "!" + step.GCodePath, Name: filepath.Base(step.GCodePath), Source: string(source)}
+	window := newGCodeWindow(document, func() { a.openGCodeFile() })
+	packageName := entry.Package.DisplayName
+	window.SetPackageAuxiliary(packageName, step.Name, func() { a.focusPackage(documentID) })
+	token, existing, added, err := a.packageViews.Add(documentID, id, window)
+	if err != nil {
+		return
+	}
+	if !added {
+		existing.Focus()
+		return
+	}
+	program, parseErr := gcode.ProgramFromDocument(document)
+	session, sessionErr := a.sessions.Add(id, document.Source, program, parseErr)
+	if sessionErr != nil {
+		session, _ = a.sessions.Session(id)
+	}
+	if session != nil {
+		// DD-B2 attaches the shared session for presentation/lifetime only. No
+		// command callback is supplied, and GCodeWindow's auxiliary capability
+		// forces all program controls disabled until DD-B3 wires package runs.
+		window.SetExecutionSession(session, nil, nil, nil, nil)
+		if a.packageSessions[documentID] == nil {
+			a.packageSessions[documentID] = make(map[frontend.ExecutionSessionID]struct{})
+		}
+		a.packageSessions[documentID][id] = struct{}{}
+	}
+	// Sessions are deliberately created only when an operator opens this step's
+	// source view, never eagerly for every package step. DD-B2 attaches them for
+	// shared presentation/lifetime preparation only; it does not admit a run.
+	a.windows.AddWithClose(window, func() {
+		a.packageViews.Remove(documentID, id, token)
+	})
+	window.show()
+}
+
+func (a *Application) focusPackage(id app.DocumentID) {
+	entry, ok := a.documents.Entry(id)
+	if ok && entry.Kind == frontend.DocumentKindDDPackage {
+		entry.Window.Focus()
+	}
 }
 
 func (a *Application) configureDocumentExecution(entry frontend.DocumentEntry, window *GCodeWindow) {
@@ -438,6 +522,21 @@ func (a *Application) documentClosed(entry frontend.DocumentEntry) {
 	delete(a.approvedDocumentCloses, entry.ID)
 	if a.sessions != nil {
 		a.sessions.Remove(frontend.StandaloneExecutionSessionID(entry.ID))
+	}
+	if entry.Kind == frontend.DocumentKindDDPackage {
+		// The package is the sole logical owner. Its accepted native close tears
+		// down supplementary top-level views, which remain unregistered from the
+		// document registry throughout their lifetime.
+		views := a.packageViews.RemoveOwner(entry.ID)
+		for id := range a.packageSessions[entry.ID] {
+			if a.sessions != nil {
+				a.sessions.Remove(id)
+			}
+		}
+		delete(a.packageSessions, entry.ID)
+		for _, window := range views {
+			_ = window.Close()
+		}
 	}
 	// Do not close the main window here: this callback runs inside native
 	// document destruction. The next UI timer turn advances the coordinator.

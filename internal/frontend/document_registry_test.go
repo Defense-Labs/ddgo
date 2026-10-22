@@ -1,18 +1,68 @@
 package frontend
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 
 	"github.com/ianbruene/ddgo/internal/app"
+	"github.com/ianbruene/ddgo/internal/ddpackage"
 	"github.com/ianbruene/ddgo/internal/gcode"
 )
 
 type fakeDocumentWindow struct {
 	fakeApplicationWindow
 	focused int
+}
+
+func TestDocumentRegistryOpensOnePackageWithStableIdentity(t *testing.T) {
+	registry, manager := newTestDocumentRegistry(t)
+	path := writeDocument(t, "fixture.dd", "not read by fake loader")
+	loads := 0
+	var windows []*fakeDocumentWindow
+	load := func(path string) (*ddpackage.Package, error) {
+		loads++
+		return &ddpackage.Package{SourcePath: path, DisplayName: "Fixture"}, nil
+	}
+	newWindow := func(app.DocumentID, *ddpackage.Package) DocumentWindow {
+		window := &fakeDocumentWindow{}
+		windows = append(windows, window)
+		return window
+	}
+	first, opened, err := registry.OpenPackage(path, load, newWindow)
+	if err != nil || !opened || first.ID == 0 || first.Kind != DocumentKindDDPackage || first.Package == nil {
+		t.Fatalf("OpenPackage() = (%+v, %v, %v)", first, opened, err)
+	}
+	second, opened, err := registry.OpenPackage(path, load, newWindow)
+	if err != nil || opened || second.ID != first.ID || loads != 1 || windows[0].focused != 1 {
+		t.Fatalf("duplicate package = (%+v, %v, %v), loads=%d focus=%d", second, opened, err, loads, windows[0].focused)
+	}
+	if registry.Len() != 1 || manager.len() != 1 {
+		t.Fatalf("package ownership registry=%d windows=%d", registry.Len(), manager.len())
+	}
+	staleClose := windows[0].onClose
+	windows[0].Close()
+	third, opened, err := registry.OpenPackage(path, load, newWindow)
+	if err != nil || !opened || third.ID == first.ID || third.Kind != DocumentKindDDPackage {
+		t.Fatalf("reopen package = (%+v, %v, %v)", third, opened, err)
+	}
+	staleClose()
+	if entry, ok := registry.Entry(third.ID); !ok || entry.ID != third.ID {
+		t.Fatalf("stale package close affected replacement: %+v %v", entry, ok)
+	}
+}
+
+func TestDocumentRegistryFailedPackageLoadLeavesNoEntry(t *testing.T) {
+	registry, manager := newTestDocumentRegistry(t)
+	path := writeDocument(t, "broken.dd", "not a package")
+	_, opened, err := registry.OpenPackage(path, func(string) (*ddpackage.Package, error) {
+		return nil, errors.New("malformed archive")
+	}, func(app.DocumentID, *ddpackage.Package) DocumentWindow { return &fakeDocumentWindow{} })
+	if err == nil || opened || registry.Len() != 0 || manager.len() != 0 {
+		t.Fatalf("failed package load opened=%v err=%v registry=%d windows=%d", opened, err, registry.Len(), manager.len())
+	}
 }
 
 func (w *fakeDocumentWindow) Focus() { w.focused++ }
