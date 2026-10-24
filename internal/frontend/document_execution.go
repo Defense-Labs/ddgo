@@ -38,27 +38,39 @@ func PackageStepExecutionFeedback(hasGCode bool, resourceErr error, snapshot *Ex
 	if snapshot.ParseError != nil {
 		return PackageStepFeedback{Message: "Step G-code is invalid.", Error: snapshot.ParseError.Error()}
 	}
-	if snapshot.StartErr != nil {
-		return PackageStepFeedback{Message: "Start rejected.", Error: snapshot.StartErr.Error()}
-	}
 	if snapshot.Controls.Run {
+		if snapshot.StartErr != nil {
+			return PackageStepFeedback{
+				RunEnabled: true,
+				Message:    "Previous Start rejected. This step can now be retried.",
+				Error:      snapshot.StartErr.Error(),
+			}
+		}
 		return PackageStepFeedback{RunEnabled: true, Message: "Ready to run this step."}
 	}
+	// StartErr describes a completed historical admission attempt. It can be
+	// useful feedback, but it is never the authority for current eligibility:
+	// the session control policy below remains authoritative.
+	feedback := PackageStepFeedback{}
 	state := snapshot.State
 	switch {
 	case !state.IsConnected():
-		return PackageStepFeedback{Message: "Machine is not connected."}
+		feedback.Message = "Machine is not connected."
 	case state.EStopStatus != app.EStopClear:
-		return PackageStepFeedback{Message: "Machine emergency stop is active."}
+		feedback.Message = "Machine emergency stop is active."
 	case state.MachineReadiness != app.MachineReadinessNormal:
-		return PackageStepFeedback{Message: "Machine recovery is required before running."}
+		feedback.Message = "Machine recovery is required before running."
 	case snapshot.StartPending || snapshot.AwaitingRunState || snapshot.OwnerStartBlocked:
-		return PackageStepFeedback{Message: "A program Start admission is pending."}
+		feedback.Message = "A program Start admission is pending."
 	case state.ProgramStatus.IsActive():
-		return PackageStepFeedback{Message: "Another program is active."}
+		feedback.Message = "Another program is active."
 	default:
-		return PackageStepFeedback{Message: "This step is not currently eligible to run."}
+		feedback.Message = "This step is not currently eligible to run."
 	}
+	if snapshot.StartErr != nil {
+		feedback.Error = snapshot.StartErr.Error()
+	}
+	return feedback
 }
 
 // SourceHighlightAction separates logical execution highlighting from native

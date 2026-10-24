@@ -3,6 +3,7 @@ package frontend
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/ianbruene/ddgo/internal/app"
@@ -134,6 +135,9 @@ func TestExecutionSessionsReconcilesStateBeforeAdmissionByExactRun(t *testing.T)
 	}
 	if first.Snapshot().Presentation.RunID != 0 {
 		t.Fatal("failed admission claimed a run")
+	}
+	if got := first.Snapshot(); got.Presentation.Error != "controller busy" || got.StartErr == nil || got.StartErr.Error() != "controller busy" {
+		t.Fatalf("first rejected package Start was not retained for its view: %+v", got)
 	}
 }
 
@@ -541,6 +545,7 @@ func TestExecutionSessionsRetainRejectedPackageAttemptAndPriorRun(t *testing.T) 
 		t.Fatal("first admission failed")
 	}
 	manager.ApplyEvent(app.Event{StateRevision: 2, State: sessionState(7, 31, app.ProgramCompleted, 2)})
+	before := step.Snapshot().Presentation
 	request, ok = manager.BeginStart(stepID)
 	if !ok {
 		t.Fatal("repeat admission was rejected before controller result")
@@ -555,12 +560,18 @@ func TestExecutionSessionsRetainRejectedPackageAttemptAndPriorRun(t *testing.T) 
 	if got.Controls.Pause || got.Controls.Resume || got.Controls.Stop {
 		t.Fatalf("rejected attempt exposed actions: %+v", got.Controls)
 	}
-	if retained := step.Snapshot().Presentation; retained.RunID != 31 || retained.Status != app.ProgramCompleted {
+	if retained := step.Snapshot().Presentation; !reflect.DeepEqual(retained, before) {
 		t.Fatalf("rejected repeat destroyed successful history: %+v", retained)
+	}
+	if feedback := PackageStepExecutionFeedback(true, nil, ptrSnapshot(step.Snapshot())); !feedback.RunEnabled || feedback.Error != "controller is not ready" {
+		t.Fatalf("rejected retry did not remain retryable: %+v", feedback)
 	}
 	newRequest, ok := manager.BeginStart(stepID)
 	if !ok {
 		t.Fatal("new attempt was not admitted after rejection")
+	}
+	if got := step.Snapshot().StartErr; got != nil {
+		t.Fatalf("new Start did not clear historical rejection: %v", got)
 	}
 	if manager.AssociateRun(stepID, request, 0, errors.New("stale rejection")) {
 		t.Fatal("stale result was accepted for the newer attempt")
@@ -570,6 +581,82 @@ func TestExecutionSessionsRetainRejectedPackageAttemptAndPriorRun(t *testing.T) 
 	}
 	if !manager.AssociateRun(stepID, newRequest, 32, nil) {
 		t.Fatal("new successful admission was rejected")
+	}
+}
+
+func ptrSnapshot(snapshot ExecutionSessionSnapshot) *ExecutionSessionSnapshot { return &snapshot }
+
+func TestExecutionSessionsRejectedRetryPreservesFailedRunPresentation(t *testing.T) {
+	manager := NewExecutionSessions(sessionState(0, 0, "", 0), 1)
+	stepID := PackageStepExecutionSessionID(7, 1, "machining")
+	step, _ := manager.Add(stepID, "G0 X1", testSessionProgram(), nil)
+
+	request, ok := manager.BeginStart(stepID)
+	if !ok || !manager.AssociateRun(stepID, request, 31, nil) {
+		t.Fatal("first admission failed")
+	}
+	failed := sessionState(7, 31, app.ProgramFailed, 2)
+	failed.ProgramError = "controller reported failure"
+	manager.ApplyEvent(app.Event{StateRevision: 2, State: failed})
+	manager.ApplyEvent(app.Event{Kind: app.EventError, StateRevision: 2, ErrorDocumentID: 7, ErrorRunID: 31, Err: errors.New("run scoped failure")})
+	before := step.Snapshot().Presentation
+	if before.RunID != 31 || before.Status != app.ProgramFailed || before.Total != 2 || before.Complete != 2 || before.NextLine != 0 || before.Message != "Failed" || before.Error != "run scoped failure" {
+		t.Fatalf("incomplete failed-run fixture: %+v", before)
+	}
+
+	request, ok = manager.BeginStart(stepID)
+	if !ok || !manager.AssociateRun(stepID, request, 0, errors.New("controller is not ready")) {
+		t.Fatal("rejected retry was not recorded")
+	}
+	after := step.Snapshot()
+	if !reflect.DeepEqual(after.Presentation, before) {
+		t.Fatalf("rejected retry changed failed-run presentation: before=%+v after=%+v", before, after.Presentation)
+	}
+	if after.StartErr == nil || after.StartErr.Error() != "controller is not ready" {
+		t.Fatalf("rejected attempt was not independently retained: %+v", after)
+	}
+	if after.Controls.Pause || after.Controls.Resume || after.Controls.Stop {
+		t.Fatalf("rejected retry exposed active controls: %+v", after.Controls)
+	}
+	feedback := PackageStepExecutionFeedback(true, nil, ptrSnapshot(after))
+	if !feedback.RunEnabled || feedback.Error != "controller is not ready" {
+		t.Fatalf("current eligibility did not permit retry: %+v", feedback)
+	}
+
+	later, ok := manager.BeginStart(stepID)
+	if !ok || !manager.AssociateRun(stepID, later, 32, nil) {
+		t.Fatal("later successful admission failed")
+	}
+	if got := step.Snapshot().Presentation; got.RunID != 32 || got.Status != app.ProgramRunning || got.Error != "" {
+		t.Fatalf("successful admission did not establish new presentation: %+v", got)
+	}
+}
+
+func TestExecutionSessionsRejectedStartRestoresEligibilityWithMachineReadiness(t *testing.T) {
+	manager := NewExecutionSessions(sessionState(0, 0, "", 0), 1)
+	id := PackageStepExecutionSessionID(7, 1, "machining")
+	step, _ := manager.Add(id, "G0 X1", testSessionProgram(), nil)
+	request, ok := manager.BeginStart(id)
+	if !ok {
+		t.Fatal("could not reserve initial Start")
+	}
+	disconnected := sessionState(0, 0, "", 0)
+	disconnected.ConnectionStatus = app.ConnectionDisconnected
+	manager.ApplyEvent(app.Event{StateRevision: 2, State: disconnected})
+	if !manager.AssociateRun(id, request, 0, errors.New("controller is not ready")) {
+		t.Fatal("rejected Start was not associated")
+	}
+	blocked := step.Snapshot()
+	if feedback := PackageStepExecutionFeedback(true, nil, ptrSnapshot(blocked)); feedback.RunEnabled || feedback.Message != "Machine is not connected." || feedback.Error != "controller is not ready" {
+		t.Fatalf("rejected Start hid current blocker: %+v", feedback)
+	}
+	manager.ApplyEvent(app.Event{StateRevision: 3, State: sessionState(0, 0, "", 0)})
+	restored := step.Snapshot()
+	if feedback := PackageStepExecutionFeedback(true, nil, ptrSnapshot(restored)); !feedback.RunEnabled || feedback.Error != "controller is not ready" {
+		t.Fatalf("restored readiness did not reenable retry: %+v", feedback)
+	}
+	if _, ok := manager.BeginStart(id); !ok {
+		t.Fatal("restored eligibility did not permit a new Start")
 	}
 }
 
@@ -597,5 +684,31 @@ func TestExecutionSessionsPackageObserverIsOwnerScoped(t *testing.T) {
 	manager.ApplyEvent(app.Event{StateRevision: 3, State: sessionState(7, 51, app.ProgramCompleted, 2)})
 	if updates != 1 {
 		t.Fatalf("detached package observer received %d updates", updates)
+	}
+}
+
+// BenchmarkExecutionSessionsRefreshPackageAdmission exercises the projection
+// directly at several retained-session counts. refreshPackageAdmission makes
+// exactly two map passes regardless of how many owners are unresolved; it
+// must not regress to invoking packageAdmissionBlocked once per session.
+func BenchmarkExecutionSessionsRefreshPackageAdmission(b *testing.B) {
+	for _, count := range []int{1, 10, 100, 1000} {
+		b.Run(fmt.Sprintf("steps=%d", count), func(b *testing.B) {
+			manager := NewExecutionSessions(sessionState(0, 0, "", 0), 1)
+			for i := 0; i < count; i++ {
+				id := PackageStepExecutionSessionID(7, 1, fmt.Sprintf("step-%d", i))
+				if _, err := manager.Add(id, "G0 X1", testSessionProgram(), nil); err != nil {
+					b.Fatal(err)
+				}
+			}
+			// One unresolved owner is the busiest normal projection: every
+			// sibling must be updated but the owner must not block itself.
+			owner := PackageStepExecutionSessionID(7, 1, "step-0")
+			manager.sessions[owner].startPending = true
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				manager.refreshPackageAdmission(7, false)
+			}
+		})
 	}
 }

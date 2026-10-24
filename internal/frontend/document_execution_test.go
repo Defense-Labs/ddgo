@@ -150,6 +150,11 @@ func TestPackageStepExecutionFeedback(t *testing.T) {
 	pending := ready
 	pending.Controls.Run = false
 	pending.StartPending = true
+	rejectedDisconnected := disconnected
+	rejectedDisconnected.StartErr = errors.New("controller was not ready")
+	active := ready
+	active.Controls.Run = false
+	active.State.ProgramStatus = app.ProgramRunning
 
 	tests := []struct {
 		name        string
@@ -163,11 +168,13 @@ func TestPackageStepExecutionFeedback(t *testing.T) {
 		{"no gcode", false, nil, nil, false, "This step has no G-code to run.", ""},
 		{"resource", true, errors.New("missing Code/a.nc"), nil, false, "Step G-code is unavailable.", "missing Code/a.nc"},
 		{"invalid", true, nil, &invalid, false, "Step G-code is invalid.", "line 2: unsupported command"},
-		{"rejected", true, nil, &rejected, false, "Start rejected.", "controller is not ready"},
+		{"rejected but eligible", true, nil, &rejected, true, "Previous Start rejected. This step can now be retried.", "controller is not ready"},
 		{"disconnected", true, nil, &disconnected, false, "Machine is not connected.", ""},
 		{"estop", true, nil, &estop, false, "Machine emergency stop is active.", ""},
 		{"recovery", true, nil, &recovery, false, "Machine recovery is required before running.", ""},
 		{"pending", true, nil, &pending, false, "A program Start admission is pending.", ""},
+		{"rejected while blocked", true, nil, &rejectedDisconnected, false, "Machine is not connected.", "controller was not ready"},
+		{"another active operation", true, nil, &active, false, "Another program is active.", ""},
 		{"ready", true, nil, &ready, true, "Ready to run this step.", ""},
 	}
 	for _, tt := range tests {
@@ -175,6 +182,28 @@ func TestPackageStepExecutionFeedback(t *testing.T) {
 			got := PackageStepExecutionFeedback(tt.hasGCode, tt.resourceErr, tt.snapshot)
 			if got.RunEnabled != tt.wantRun || got.Message != tt.wantText || got.Error != tt.wantError {
 				t.Fatalf("feedback = %+v, want run=%v message=%q error=%q", got, tt.wantRun, tt.wantText, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestPackageStepFeedbackUsesTheSameCurrentRunPolicyAsAuxiliary(t *testing.T) {
+	states := []struct {
+		name  string
+		state app.State
+	}{
+		{"ready", app.State{ConnectionStatus: app.ConnectionConnected, EStopStatus: app.EStopClear, MachineReadiness: app.MachineReadinessNormal}},
+		{"disconnected", app.State{ConnectionStatus: app.ConnectionDisconnected, EStopStatus: app.EStopClear, MachineReadiness: app.MachineReadinessNormal}},
+		{"recovery", app.State{ConnectionStatus: app.ConnectionConnected, EStopStatus: app.EStopClear, MachineReadiness: app.MachineReadinessRecoveryRequired}},
+		{"active", app.State{ConnectionStatus: app.ConnectionConnected, EStopStatus: app.EStopClear, MachineReadiness: app.MachineReadinessNormal, ProgramDocumentID: 99, ProgramRunID: 4, ProgramStatus: app.ProgramRunning}},
+	}
+	for _, tt := range states {
+		t.Run(tt.name, func(t *testing.T) {
+			controls := SessionExecutionControlState(PackageStepExecutionSessionID(7, 1, "step"), 0, true, false, false, false, false, tt.state)
+			snapshot := ExecutionSessionSnapshot{State: tt.state, Controls: controls, StartErr: errors.New("earlier rejection")}
+			feedback := PackageStepExecutionFeedback(true, nil, &snapshot)
+			if feedback.RunEnabled != controls.Run {
+				t.Fatalf("package Run=%v, shared auxiliary policy Run=%v: %+v", feedback.RunEnabled, controls.Run, feedback)
 			}
 		})
 	}

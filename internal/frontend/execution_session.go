@@ -237,7 +237,16 @@ func (s *ExecutionSession) FinishStart(request uint64, runID app.RunID, err erro
 	}
 	s.startPending = false
 	s.startRequest = 0
-	s.presentation.ReconcileAdmission(runID, err)
+	// A package Start rejection belongs to the package attempt record, not to
+	// an earlier admitted run. Standalone windows historically present their
+	// rejected admission through DocumentExecutionPresentation, so retain that
+	// behavior there. A first package rejection has no admitted presentation
+	// to preserve, so keep the legacy presentation feedback for an auxiliary
+	// view as well; subsequent package rejections are represented by StartErr
+	// and the package attempt record.
+	if err == nil || s.id.Standalone() || s.presentation.RunID == 0 {
+		s.presentation.ReconcileAdmission(runID, err)
+	}
 	if err != nil {
 		s.startErr = err
 		s.lastOperationErr = err
@@ -673,11 +682,26 @@ func (m *ExecutionSessions) packageAdmissionBlocked(id ExecutionSessionID) bool 
 // availability can change; normal controller-state notifications remain
 // separate and revision ordered.
 func (m *ExecutionSessions) refreshPackageAdmission(documentID app.DocumentID, force bool) {
+	// Compute unresolved ownership once. The command-time helper below uses
+	// the same predicate, but calling it once per retained session here used
+	// to make this projection quadratic.
+	ownerCount := 0
 	for id, session := range m.sessions {
 		if id.DocumentID != documentID || id.Standalone() {
 			continue
 		}
-		blocked := m.packageAdmissionBlocked(id)
+		if session.startPending || session.awaitingRunState != 0 {
+			ownerCount++
+		}
+	}
+	for id, session := range m.sessions {
+		if id.DocumentID != documentID || id.Standalone() {
+			continue
+		}
+		// A session is blocked only by another unresolved owner. With multiple
+		// anomalous owners this remains conservative for every sibling.
+		ownsAdmission := session.startPending || session.awaitingRunState != 0
+		blocked := ownerCount > 0 && (!ownsAdmission || ownerCount > 1)
 		if session.ownerStartBlocked != blocked {
 			session.ownerStartBlocked = blocked
 			session.notify()
