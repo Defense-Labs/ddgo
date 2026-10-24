@@ -457,10 +457,11 @@ func (a *Application) drainDocumentStartResults() {
 			if !a.sessions.AssociateRun(result.sessionID, result.requestID, result.runID, result.err) {
 				continue
 			}
-			if !a.documents.ClosePending(result.documentID) {
+			disposition := frontend.ResolveDeferredAdmissionClose(a.documents.ClosePending(result.documentID), result.runID, result.err, false)
+			if disposition == frontend.DeferredAdmissionCloseNone {
 				continue
 			}
-			if result.err != nil {
+			if disposition == frontend.DeferredAdmissionCloseRetryNormal {
 				a.documents.ClearClosePending(result.documentID)
 				// Reissue normal close policy even when another document owns an
 				// active run. A failed package admission has no RunID to stop and
@@ -491,7 +492,12 @@ func (a *Application) resolvePendingAdmissionCloses() {
 			continue
 		}
 		state := a.controller.Snapshot()
-		if state.ProgramDocumentID != documentID || state.ProgramRunID != runID {
+		disposition := frontend.ResolveDeferredAdmissionClose(true, runID, nil, state.ProgramDocumentID == documentID && state.ProgramRunID == runID)
+		if disposition == frontend.DeferredAdmissionCloseWaitForExactRun {
+			continue
+		}
+		if disposition != frontend.DeferredAdmissionCloseReissueNormal {
+			delete(a.pendingAdmissionCloses, documentID)
 			continue
 		}
 		a.documents.ClearClosePending(documentID)

@@ -143,6 +143,23 @@ func TestShutdownCoordinatorStopAndFinalCloseAreExactOnce(t *testing.T) {
 	}
 }
 
+func TestShutdownCoordinatorCancelledPackageStopKeepsItsOneLogicalDocument(t *testing.T) {
+	// Auxiliary views deliberately have no DocumentID. A package therefore
+	// contributes one entry to shutdown regardless of how many views it owns.
+	const packageDocument app.DocumentID = 7
+	target := ShutdownStopTarget{DocumentID: packageDocument, RunID: 19}
+	coordinator, attempt := beginShutdown(t, []app.DocumentID{packageDocument, 8}, target)
+	if phase := confirmShutdown(coordinator, attempt, target); phase != ShutdownWaitingForStopConfirmation {
+		t.Fatalf("package shutdown phase = %v", phase)
+	}
+	if _, ok := coordinator.ConfirmStop(attempt, false); ok || coordinator.Phase() != ShutdownIdle {
+		t.Fatalf("cancelled package Stop retained shutdown ownership: %v", coordinator.Phase())
+	}
+	if _, ok := coordinator.NextDocumentToClose(attempt); ok {
+		t.Fatal("cancelled package Stop authorized document close")
+	}
+}
+
 func TestShutdownCoordinatorFailedAndStaleStopResultsDoNotClose(t *testing.T) {
 	target := ShutdownStopTarget{DocumentID: 4, RunID: 5}
 	coordinator, first := beginShutdown(t, []app.DocumentID{4}, target)

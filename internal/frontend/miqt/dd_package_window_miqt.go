@@ -375,49 +375,16 @@ func (w *DDPackageWindow) SetPackageExecution(snapshot frontend.PackageExecution
 		return
 	}
 	w.executionID = snapshot.ID
-	if snapshot.Phase == frontend.PackageExecutionStartRejected {
-		w.executionIdentity.SetText(fmt.Sprintf("Start rejected: %s — %s", jobName, stepName))
-		status := "No program was started."
-		if snapshot.Presentation.RunID != 0 {
-			status += fmt.Sprintf(" Previous admitted RunID %d remains in this step's history.", snapshot.Presentation.RunID)
-		}
-		w.executionStatus.SetText(status)
-		w.executionProgress.SetText("Acknowledged commands: 0 / 0")
-		w.executionBar.SetMaximum(1)
-		w.executionBar.SetValue(0)
-		if snapshot.AttemptErr != nil {
-			w.executionError.SetText(snapshot.AttemptErr.Error())
-		} else {
-			w.executionError.Clear()
-		}
-		w.pauseExecution.SetEnabled(false)
-		w.resumeExecution.SetEnabled(false)
-		w.stopExecution.SetEnabled(false)
-		w.viewActive.SetEnabled(true)
-		return
-	}
-	active := snapshot.Phase == frontend.PackageExecutionActive
-	prefix := "Last execution"
-	if snapshot.Phase == frontend.PackageExecutionStartPending {
-		prefix = "Start pending"
-	} else if snapshot.Phase == frontend.PackageExecutionAwaitingState {
-		prefix = "Start admitted — awaiting controller state"
-	} else if active {
-		prefix = "Current execution"
-	}
-	w.executionIdentity.SetText(fmt.Sprintf("%s: %s — %s", prefix, jobName, stepName))
-	w.executionStatus.SetText("Status: " + snapshot.Presentation.StatusText(snapshot.State))
-	w.executionProgress.SetText(fmt.Sprintf("Acknowledged commands: %d / %d", snapshot.Presentation.Complete, snapshot.Presentation.Total))
-	maximum := snapshot.Presentation.Total
-	if maximum < 1 {
-		maximum = 1
-	}
-	w.executionBar.SetMaximum(maximum)
-	w.executionBar.SetValue(snapshot.Presentation.Complete)
-	w.executionError.SetText(snapshot.Presentation.Error)
-	w.pauseExecution.SetEnabled(snapshot.Controls.Pause)
-	w.resumeExecution.SetEnabled(snapshot.Controls.Resume)
-	w.stopExecution.SetEnabled(snapshot.Controls.Stop)
+	display := frontend.PackageExecutionDisplayFor(snapshot)
+	w.executionIdentity.SetText(fmt.Sprintf("%s: %s — %s", display.Prefix, jobName, stepName))
+	w.executionStatus.SetText(display.Status)
+	w.executionProgress.SetText(display.Progress)
+	w.executionBar.SetMaximum(display.ProgressMaximum)
+	w.executionBar.SetValue(display.ProgressValue)
+	w.executionError.SetText(display.Error)
+	w.pauseExecution.SetEnabled(display.PauseEnabled)
+	w.resumeExecution.SetEnabled(display.ResumeEnabled)
+	w.stopExecution.SetEnabled(display.StopEnabled)
 	w.viewActive.SetEnabled(true)
 }
 

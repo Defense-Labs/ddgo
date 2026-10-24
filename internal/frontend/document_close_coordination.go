@@ -13,6 +13,36 @@ type DocumentStopDisposition uint8
 // selected-document authorization.
 type DocumentCloseApprovals map[app.DocumentID]app.RunID
 
+// DeferredAdmissionCloseDisposition is the narrow decision made when a Start
+// result arrives for a document whose native close was deferred. It does not
+// authorize Stop or destruction itself; the application still re-enters its
+// ordinary close policy, which validates exact controller ownership.
+type DeferredAdmissionCloseDisposition uint8
+
+const (
+	DeferredAdmissionCloseNone DeferredAdmissionCloseDisposition = iota
+	DeferredAdmissionCloseRetryNormal
+	DeferredAdmissionCloseWaitForExactRun
+	DeferredAdmissionCloseReissueNormal
+)
+
+// ResolveDeferredAdmissionClose keeps a failed admission from stranding a
+// close request, while requiring a successful admission to be observed under
+// its exact RunID before normal close policy is reissued. A zero RunID is not
+// an admitted execution and is treated like a rejection for close purposes.
+func ResolveDeferredAdmissionClose(closePending bool, runID app.RunID, err error, exactRunObserved bool) DeferredAdmissionCloseDisposition {
+	if !closePending {
+		return DeferredAdmissionCloseNone
+	}
+	if err != nil || runID == 0 {
+		return DeferredAdmissionCloseRetryNormal
+	}
+	if !exactRunObserved {
+		return DeferredAdmissionCloseWaitForExactRun
+	}
+	return DeferredAdmissionCloseReissueNormal
+}
+
 const (
 	DocumentStopInvalid DocumentStopDisposition = iota
 	DocumentStopCloseIndependently

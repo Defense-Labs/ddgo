@@ -208,3 +208,36 @@ func TestPackageStepFeedbackUsesTheSameCurrentRunPolicyAsAuxiliary(t *testing.T)
 		})
 	}
 }
+
+func TestPackageExecutionDisplayKeepsPendingAttemptSeparateFromHistory(t *testing.T) {
+	completed := DocumentExecutionPresentation{
+		RunID: 31, Status: app.ProgramCompleted, Total: 12, Complete: 12,
+		Message: "Completed after controller Idle", Error: "old admission error",
+	}
+	pending := PackageExecutionPresentation{
+		Presentation: completed, Phase: PackageExecutionStartPending,
+		Controls: DocumentExecutionControls{Pause: true, Resume: true, Stop: true},
+	}
+	display := PackageExecutionDisplayFor(pending)
+	if display.Prefix != "Start pending" || display.Error != "" || display.Status == "" || display.Progress != "Previous execution: Acknowledged commands: 12 / 12" {
+		t.Fatalf("pending display inherited historical feedback: %+v", display)
+	}
+	if display.PauseEnabled || display.ResumeEnabled || display.StopEnabled {
+		t.Fatalf("unadmitted attempt exposed actions: %+v", display)
+	}
+
+	rejected := pending
+	rejected.Phase = PackageExecutionStartRejected
+	rejected.AttemptErr = errors.New("second rejection")
+	display = PackageExecutionDisplayFor(rejected)
+	if display.Error != "second rejection" || display.Progress != "Acknowledged commands: 0 / 0" {
+		t.Fatalf("rejected attempt did not use its own feedback: %+v", display)
+	}
+
+	awaiting := pending
+	awaiting.Phase, awaiting.AttemptRunID = PackageExecutionAwaitingState, 32
+	display = PackageExecutionDisplayFor(awaiting)
+	if display.Error != "" || display.Status != "Start admitted as RunID 32 — awaiting controller state." || display.Progress != "Acknowledged commands: 0 / 0" {
+		t.Fatalf("awaiting display inherited history: %+v", display)
+	}
+}

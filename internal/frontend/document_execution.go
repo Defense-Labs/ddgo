@@ -25,6 +25,76 @@ type PackageStepFeedback struct {
 	Error      string
 }
 
+// PackageExecutionDisplay is the toolkit-neutral presentation of the package
+// execution strip. Attempt phases deliberately do not borrow error or progress
+// text from a retained admitted run: a new admission is not that prior run.
+type PackageExecutionDisplay struct {
+	Prefix          string
+	Status          string
+	Progress        string
+	ProgressMaximum int
+	ProgressValue   int
+	Error           string
+	PauseEnabled    bool
+	ResumeEnabled   bool
+	StopEnabled     bool
+}
+
+// PackageExecutionDisplayFor keeps the package strip's attempt feedback
+// separate from retained RunID presentation. It is shared by the Qt window
+// and toolkit-independent tests so a pending retry cannot show an old Start
+// rejection or a historical run error as its own failure.
+func PackageExecutionDisplayFor(snapshot PackageExecutionPresentation) PackageExecutionDisplay {
+	presentation := snapshot.Presentation
+	if snapshot.Phase == PackageExecutionStartRejected {
+		status := "No program was started."
+		if presentation.RunID != 0 {
+			status += fmt.Sprintf(" Previous admitted RunID %d remains in this step's history.", presentation.RunID)
+		}
+		errorText := ""
+		if snapshot.AttemptErr != nil {
+			errorText = snapshot.AttemptErr.Error()
+		}
+		return PackageExecutionDisplay{
+			Prefix: "Start rejected", Status: status, Progress: "Acknowledged commands: 0 / 0",
+			ProgressMaximum: 1, Error: errorText,
+		}
+	}
+	if snapshot.Phase == PackageExecutionStartPending {
+		progress := "Acknowledged commands: 0 / 0"
+		status := "Start admission is pending."
+		if presentation.RunID != 0 {
+			status += fmt.Sprintf(" Previous admitted RunID %d remains in this step's history.", presentation.RunID)
+			progress = fmt.Sprintf("Previous execution: Acknowledged commands: %d / %d", presentation.Complete, presentation.Total)
+		}
+		return PackageExecutionDisplay{Prefix: "Start pending", Status: status, Progress: progress, ProgressMaximum: 1}
+	}
+	if snapshot.Phase == PackageExecutionAwaitingState {
+		runText := "Start admitted — awaiting controller state."
+		if snapshot.AttemptRunID != 0 {
+			runText = fmt.Sprintf("Start admitted as RunID %d — awaiting controller state.", snapshot.AttemptRunID)
+		}
+		return PackageExecutionDisplay{
+			Prefix: "Start admitted — awaiting controller state", Status: runText,
+			Progress: "Acknowledged commands: 0 / 0", ProgressMaximum: 1,
+		}
+	}
+	prefix := "Last execution"
+	if snapshot.Phase == PackageExecutionActive {
+		prefix = "Current execution"
+	}
+	maximum := presentation.Total
+	if maximum < 1 {
+		maximum = 1
+	}
+	return PackageExecutionDisplay{
+		Prefix: prefix, Status: "Status: " + presentation.StatusText(snapshot.State),
+		Progress:        fmt.Sprintf("Acknowledged commands: %d / %d", presentation.Complete, presentation.Total),
+		ProgressMaximum: maximum, ProgressValue: presentation.Complete, Error: presentation.Error,
+		PauseEnabled: snapshot.Controls.Pause, ResumeEnabled: snapshot.Controls.Resume, StopEnabled: snapshot.Controls.Stop,
+	}
+}
+
 func PackageStepExecutionFeedback(hasGCode bool, resourceErr error, snapshot *ExecutionSessionSnapshot) PackageStepFeedback {
 	if !hasGCode {
 		return PackageStepFeedback{Message: "This step has no G-code to run."}

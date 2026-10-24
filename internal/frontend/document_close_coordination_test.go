@@ -31,6 +31,7 @@ func TestClassifyDocumentStopResult(t *testing.T) {
 		{"independent success", nil, true, stoppedDocumentState(documentID, runID), false, DocumentStopCloseIndependently},
 		{"shutdown transfer", nil, true, stoppedDocumentState(documentID, runID), true, DocumentStopTransferToShutdown},
 		{"controller failure", errors.New("stop failed"), true, stoppedDocumentState(documentID, runID), true, DocumentStopInvalid},
+		{"draining is still active", nil, true, app.State{ProgramDocumentID: documentID, ProgramRunID: runID, ProgramStatus: app.ProgramDraining, MachineReadiness: app.MachineReadinessNormal}, false, DocumentStopInvalid},
 		{"recovery required", nil, true, app.State{ProgramDocumentID: documentID, ProgramRunID: runID, ProgramStatus: app.ProgramFailed, MachineReadiness: app.MachineReadinessRecoveryRequired}, true, DocumentStopInvalid},
 		{"replacement run", nil, true, stoppedDocumentState(documentID, runID+1), true, DocumentStopInvalid},
 		{"closed old document", nil, false, stoppedDocumentState(documentID, runID), false, DocumentStopInvalid},
@@ -38,6 +39,29 @@ func TestClassifyDocumentStopResult(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := ClassifyDocumentStopResult(tt.err, tt.open, documentID, runID, tt.state, tt.shutdown); got != tt.want {
 				t.Fatalf("ClassifyDocumentStopResult() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveDeferredAdmissionClose(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		pending bool
+		runID   app.RunID
+		err     error
+		exact   bool
+		want    DeferredAdmissionCloseDisposition
+	}{
+		{"not deferred", false, 11, nil, true, DeferredAdmissionCloseNone},
+		{"rejected admission retries normal close", true, 0, errors.New("controller busy"), false, DeferredAdmissionCloseRetryNormal},
+		{"zero run never waits forever", true, 0, nil, false, DeferredAdmissionCloseRetryNormal},
+		{"successful admission awaits its exact state", true, 11, nil, false, DeferredAdmissionCloseWaitForExactRun},
+		{"exact active or terminal state reissues normal policy", true, 11, nil, true, DeferredAdmissionCloseReissueNormal},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ResolveDeferredAdmissionClose(tt.pending, tt.runID, tt.err, tt.exact); got != tt.want {
+				t.Fatalf("ResolveDeferredAdmissionClose() = %v, want %v", got, tt.want)
 			}
 		})
 	}

@@ -660,6 +660,87 @@ func TestExecutionSessionsRejectedStartRestoresEligibilityWithMachineReadiness(t
 	}
 }
 
+func TestExecutionSessionsPendingRetryDoesNotPresentPriorAttemptAsCurrentError(t *testing.T) {
+	manager := NewExecutionSessions(sessionState(0, 0, "", 0), 1)
+	id := PackageStepExecutionSessionID(7, 1, "machining")
+	step, _ := manager.Add(id, "G0 X1", testSessionProgram(), nil)
+
+	first, ok := manager.BeginStart(id)
+	if !ok || !manager.AssociateRun(id, first, 0, errors.New("first rejection")) {
+		t.Fatal("first rejection was not retained")
+	}
+	rejected, ok := manager.PackageExecution(7)
+	if !ok || rejected.Phase != PackageExecutionStartRejected || rejected.AttemptErr == nil {
+		t.Fatalf("rejected package attempt = %+v, %v", rejected, ok)
+	}
+	if display := PackageExecutionDisplayFor(rejected); display.Error != "first rejection" {
+		t.Fatalf("rejected attempt feedback = %+v", display)
+	}
+
+	second, ok := manager.BeginStart(id)
+	if !ok {
+		t.Fatal("retry was not accepted")
+	}
+	pending, ok := manager.PackageExecution(7)
+	if !ok || pending.Phase != PackageExecutionStartPending || pending.AttemptErr != nil || pending.AttemptRunID != 0 {
+		t.Fatalf("pending retry = %+v, %v", pending, ok)
+	}
+	if display := PackageExecutionDisplayFor(pending); display.Error != "" || display.PauseEnabled || display.ResumeEnabled || display.StopEnabled {
+		t.Fatalf("pending retry inherited prior rejection: %+v", display)
+	}
+	if snapshot := step.Snapshot(); snapshot.Presentation.RunID != 0 || snapshot.Controls.Pause || snapshot.Controls.Resume || snapshot.Controls.Stop {
+		t.Fatalf("pending retry invented active execution: %+v", snapshot)
+	}
+	if manager.AssociateRun(id, first, 41, nil) {
+		t.Fatal("stale first result replaced pending retry")
+	}
+	if !manager.AssociateRun(id, second, 42, nil) {
+		t.Fatal("second admission was rejected")
+	}
+	awaiting, ok := manager.PackageExecution(7)
+	if !ok || awaiting.Phase != PackageExecutionAwaitingState || awaiting.AttemptRunID != 42 {
+		t.Fatalf("admitted retry = %+v, %v", awaiting, ok)
+	}
+	if display := PackageExecutionDisplayFor(awaiting); display.Error != "" || display.PauseEnabled || display.ResumeEnabled || display.StopEnabled {
+		t.Fatalf("awaiting retry presentation = %+v", display)
+	}
+}
+
+func TestExecutionSessionsPendingRetryLabelsPriorFailedRunAsHistory(t *testing.T) {
+	manager := NewExecutionSessions(sessionState(0, 0, "", 0), 1)
+	id := PackageStepExecutionSessionID(7, 1, "machining")
+	step, _ := manager.Add(id, "G0 X1", testSessionProgram(), nil)
+	request, ok := manager.BeginStart(id)
+	if !ok || !manager.AssociateRun(id, request, 31, nil) {
+		t.Fatal("initial admission failed")
+	}
+	failed := sessionState(7, 31, app.ProgramFailed, 2)
+	failed.ProgramError = "controller failure"
+	manager.ApplyEvent(app.Event{StateRevision: 2, State: failed})
+	manager.ApplyEvent(app.Event{Kind: app.EventError, StateRevision: 2, ErrorDocumentID: 7, ErrorRunID: 31, Err: errors.New("run-scoped failure")})
+	history := step.Snapshot().Presentation
+
+	rejected, ok := manager.BeginStart(id)
+	if !ok || !manager.AssociateRun(id, rejected, 0, errors.New("admission rejection")) {
+		t.Fatal("intermediate rejection failed")
+	}
+	pendingRequest, ok := manager.BeginStart(id)
+	if !ok {
+		t.Fatal("pending retry was rejected")
+	}
+	pending, _ := manager.PackageExecution(7)
+	display := PackageExecutionDisplayFor(pending)
+	if display.Error != "" || display.Progress != "Previous execution: Acknowledged commands: 2 / 2" {
+		t.Fatalf("pending retry confused historical failure with current attempt: %+v", display)
+	}
+	if current := step.Snapshot().Presentation; !reflect.DeepEqual(current, history) {
+		t.Fatalf("pending retry changed retained failed run: before=%+v after=%+v", history, current)
+	}
+	if !manager.AssociateRun(id, pendingRequest, 32, nil) || step.Snapshot().Presentation.RunID != 32 {
+		t.Fatal("later exact RunID was not associated")
+	}
+}
+
 func TestExecutionSessionsPackageObserverIsOwnerScoped(t *testing.T) {
 	manager := NewExecutionSessions(sessionState(0, 0, "", 0), 1)
 	for i := 0; i < 100; i++ {
