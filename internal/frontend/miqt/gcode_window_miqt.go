@@ -33,7 +33,6 @@ type GCodeWindow struct {
 	progressBar         *qt.QProgressBar
 	followCheck         *qt.QCheckBox
 	isAuxiliary         bool
-	executionDisabled   bool
 
 	session         *frontend.ExecutionSession
 	sessionSnapshot frontend.ExecutionSessionSnapshot
@@ -50,21 +49,22 @@ type GCodeWindow struct {
 }
 
 // SetPackageAuxiliary marks this window as a supplementary package-step view.
-// It has no controller callbacks in DD-B2; the visible header is both the
-// navigation affordance and an ownership cue in the native task switcher.
+// DD-B3 uses the same attached ExecutionSession and callbacks as the owning
+// package window; the header is navigation and ownership context only.
 func (w *GCodeWindow) SetPackageAuxiliary(packageName, stepName string, back func()) {
 	if w.isAuxiliary {
 		return
 	}
 	w.isAuxiliary = true
-	w.executionDisabled = true
 	w.window.SetWindowTitle(stepName + " — " + packageName + " — DDGo")
-	w.onRun, w.onPause, w.onResume, w.onStop = nil, nil, nil, nil
+	// A session is attached immediately after auxiliary construction. Keep the
+	// controls inert during that short setup interval, then let the shared
+	// session's exact RunID policy control them.
 	w.runButton.SetEnabled(false)
 	w.pauseButton.SetEnabled(false)
 	w.resumeButton.SetEnabled(false)
 	w.stopButton.SetEnabled(false)
-	w.statusLabel.SetText("Package-step execution is not available yet.")
+	w.statusLabel.SetText("Preparing package step execution…")
 	w.packageHeader = qt.NewQWidget(nil)
 	headerLayout := qt.NewQHBoxLayout(nil)
 	headerLayout.SetContentsMargins(8, 4, 8, 4)
@@ -243,9 +243,6 @@ func (w *GCodeWindow) SetExecutionSession(session *frontend.ExecutionSession, ru
 
 func (w *GCodeWindow) renderExecution() {
 	controls := w.sessionSnapshot.Controls
-	if w.executionDisabled {
-		controls.Run, controls.Pause, controls.Resume, controls.Stop = false, false, false, false
-	}
 	w.runButton.SetEnabled(controls.Run)
 	w.pauseButton.SetEnabled(controls.Pause)
 	w.resumeButton.SetEnabled(controls.Resume)

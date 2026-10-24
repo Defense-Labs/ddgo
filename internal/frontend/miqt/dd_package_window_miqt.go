@@ -17,26 +17,44 @@ import (
 	qt "github.com/mappu/miqt/qt6"
 )
 
-// DDPackageWindow is the first-class native view for a read-only .dd package.
-// It deliberately contains no execution controls: package-step execution is a
-// DD-B3 concern. Its auxiliary G-code views are owned by the package document.
+// DDPackageWindow is the first-class native view for a .dd package. It can
+// manually execute one selected G-code step, while the package itself remains
+// the logical document and lifetime owner of every step session.
 type DDPackageWindow struct {
-	pkg        *ddpackage.Package
-	documentID app.DocumentID
-	window     *qt.QMainWindow
-	jobCombo   *qt.QComboBox
-	steps      *qt.QListWidget
-	detail     *qt.QTextEdit
-	image      *qt.QLabel
-	openGCode  *qt.QPushButton
-	warnings   *qt.QLabel
+	pkg               *ddpackage.Package
+	documentID        app.DocumentID
+	window            *qt.QMainWindow
+	jobCombo          *qt.QComboBox
+	steps             *qt.QListWidget
+	detail            *qt.QTextEdit
+	image             *qt.QLabel
+	openGCode         *qt.QPushButton
+	runStep           *qt.QPushButton
+	warnings          *qt.QLabel
+	executionIdentity *qt.QLabel
+	executionStatus   *qt.QLabel
+	executionProgress *qt.QLabel
+	executionError    *qt.QLabel
+	executionBar      *qt.QProgressBar
+	pauseExecution    *qt.QPushButton
+	resumeExecution   *qt.QPushButton
+	stopExecution     *qt.QPushButton
+	viewActive        *qt.QPushButton
 
-	jobIndex       int
-	stepIndex      int
-	onOpenStep     func(int, ddpackage.Step)
-	onClose        func()
-	onCloseRequest func() bool
-	closeNotified  bool
+	jobIndex            int
+	stepIndex           int
+	onOpenStep          func(int, ddpackage.Step)
+	onSelectStep        func(int, ddpackage.Step)
+	onRunStep           func(int, ddpackage.Step)
+	onAction            func(frontend.ExecutionSessionID, string)
+	onViewActive        func(frontend.ExecutionSessionID)
+	executionID         frontend.ExecutionSessionID
+	hasExecution        bool
+	selectedSnapshot    frontend.ExecutionSessionSnapshot
+	hasSelectedSnapshot bool
+	onClose             func()
+	onCloseRequest      func() bool
+	closeNotified       bool
 }
 
 func newDDPackageWindow(id app.DocumentID, pkg *ddpackage.Package, openStep func(int, ddpackage.Step)) *DDPackageWindow {
@@ -79,6 +97,10 @@ func newDDPackageWindow(id app.DocumentID, pkg *ddpackage.Package, openStep func
 	w.openGCode = qt.NewQPushButton(nil)
 	w.openGCode.SetText("Open G-code View")
 	rightLayout.AddWidget(w.openGCode.QWidget)
+	w.runStep = qt.NewQPushButton(nil)
+	w.runStep.SetText("Run Selected Step")
+	w.runStep.SetToolTip("Runs only this step's G-code; package workflow directives are not executed.")
+	rightLayout.AddWidget(w.runStep.QWidget)
 	split.AddWidget(right)
 	split.SetStretchFactor(0, 2)
 	split.SetStretchFactor(1, 5)
@@ -88,10 +110,36 @@ func newDDPackageWindow(id app.DocumentID, pkg *ddpackage.Package, openStep func
 	strip.SetTitle("Package Execution")
 	stripLayout := qt.NewQVBoxLayout(nil)
 	strip.SetLayout(stripLayout.QLayout)
-	stripText := qt.NewQLabel(nil)
-	stripText.SetText("No package step running — package execution controls are available in a future release.")
-	stripText.SetWordWrap(true)
-	stripLayout.AddWidget(stripText.QWidget)
+	w.executionIdentity = qt.NewQLabel(nil)
+	w.executionIdentity.SetWordWrap(true)
+	stripLayout.AddWidget(w.executionIdentity.QWidget)
+	w.executionStatus = qt.NewQLabel(nil)
+	w.executionStatus.SetWordWrap(true)
+	stripLayout.AddWidget(w.executionStatus.QWidget)
+	w.executionProgress = qt.NewQLabel(nil)
+	stripLayout.AddWidget(w.executionProgress.QWidget)
+	w.executionBar = qt.NewQProgressBar(nil)
+	w.executionBar.SetMinimum(0)
+	w.executionBar.SetMaximum(1)
+	stripLayout.AddWidget(w.executionBar.QWidget)
+	for _, item := range []struct {
+		text string
+		set  func(*qt.QPushButton)
+	}{
+		{"Pause", func(button *qt.QPushButton) { w.pauseExecution = button }},
+		{"Resume", func(button *qt.QPushButton) { w.resumeExecution = button }},
+		{"Stop", func(button *qt.QPushButton) { w.stopExecution = button }},
+		{"View Active G-code", func(button *qt.QPushButton) { w.viewActive = button }},
+	} {
+		button := qt.NewQPushButton(nil)
+		button.SetText(item.text)
+		item.set(button)
+		stripLayout.AddWidget(button.QWidget)
+	}
+	w.executionError = qt.NewQLabel(nil)
+	w.executionError.SetWordWrap(true)
+	w.executionError.SetStyleSheet("color: #b00020;")
+	stripLayout.AddWidget(w.executionError.QWidget)
 	layout.AddWidget(strip.QWidget)
 	w.warnings = qt.NewQLabel(nil)
 	w.warnings.SetWordWrap(true)
@@ -110,6 +158,19 @@ func newDDPackageWindow(id app.DocumentID, pkg *ddpackage.Package, openStep func
 	w.openGCode.OnClicked(func() {
 		if step, ok := w.selectedStep(); ok && step.GCodePath != "" && w.onOpenStep != nil {
 			w.onOpenStep(w.jobIndex, step)
+		}
+	})
+	w.runStep.OnClicked(func() {
+		if step, ok := w.selectedStep(); ok && w.onRunStep != nil {
+			w.onRunStep(w.jobIndex, step)
+		}
+	})
+	w.pauseExecution.OnClicked(func() { w.requestExecutionAction("pause") })
+	w.resumeExecution.OnClicked(func() { w.requestExecutionAction("resume") })
+	w.stopExecution.OnClicked(func() { w.requestExecutionAction("stop") })
+	w.viewActive.OnClicked(func() {
+		if w.hasExecution && w.onViewActive != nil {
+			w.onViewActive(w.executionID)
 		}
 	})
 	w.window.OnCloseEvent(func(super func(*qt.QCloseEvent), event *qt.QCloseEvent) {
@@ -135,6 +196,7 @@ func newDDPackageWindow(id app.DocumentID, pkg *ddpackage.Package, openStep func
 		}
 		w.warnings.SetText("Package compatibility notes: " + strings.Join(messages, "\n"))
 	}
+	w.renderExecution()
 	return w
 }
 
@@ -154,7 +216,12 @@ func (w *DDPackageWindow) selectJob(index int) {
 	}
 }
 
-func (w *DDPackageWindow) selectStep(index int) { w.stepIndex = index; w.renderStep() }
+func (w *DDPackageWindow) selectStep(index int) {
+	w.stepIndex = index
+	w.hasSelectedSnapshot = false
+	w.renderStep()
+	w.notifySelectedStep()
+}
 
 func (w *DDPackageWindow) selectedStep() (ddpackage.Step, bool) {
 	if w.jobIndex < 0 || w.jobIndex >= len(w.pkg.Jobs) {
@@ -177,6 +244,7 @@ func (w *DDPackageWindow) renderStep() {
 		w.detail.SetPlainText(jobText + "\n\nNo steps are declared for this job.")
 		w.image.Clear()
 		w.openGCode.SetEnabled(false)
+		w.runStep.SetEnabled(false)
 		return
 	}
 	text := "Job: " + w.pkg.Jobs[w.jobIndex].Name + "\n\n" + jobText + "\n\nStep: " + step.Name
@@ -204,6 +272,7 @@ func (w *DDPackageWindow) renderStep() {
 	}
 	w.detail.SetPlainText(text) // Plain text deliberately avoids untrusted HTML/network resources.
 	w.openGCode.SetEnabled(step.GCodePath != "")
+	w.renderSelectedControls()
 	w.image.Clear()
 	if step.ImagePath != "" {
 		data, err := w.pkg.ReadResource(step.ImagePath)
@@ -230,6 +299,107 @@ func (w *DDPackageWindow) renderStep() {
 			return
 		}
 		w.image.SetPixmap(pixmap.Scaled2(800, 500, qt.KeepAspectRatio))
+	}
+}
+
+// SetExecutionCallbacks is called only after the package document has been
+// registered. This matters because selection during native construction must
+// not create a session for a not-yet-owned document.
+func (w *DDPackageWindow) SetExecutionCallbacks(selectStep, runStep func(int, ddpackage.Step), action func(frontend.ExecutionSessionID, string), viewActive func(frontend.ExecutionSessionID)) {
+	w.onSelectStep, w.onRunStep, w.onAction, w.onViewActive = selectStep, runStep, action, viewActive
+	w.notifySelectedStep()
+}
+
+func (w *DDPackageWindow) notifySelectedStep() {
+	if step, ok := w.selectedStep(); ok && w.onSelectStep != nil {
+		w.onSelectStep(w.jobIndex, step)
+	}
+}
+
+// SetSelectedStepExecution applies only the selected step's own session
+// snapshot. A sibling's matching package DocumentID is never enough to make
+// this button control that sibling's RunID.
+func (w *DDPackageWindow) SetSelectedStepExecution(snapshot frontend.ExecutionSessionSnapshot) {
+	step, ok := w.selectedStep()
+	if !ok || snapshot.ID != frontend.PackageStepExecutionSessionID(w.documentID, w.jobIndex+1, step.ID) {
+		return
+	}
+	w.selectedSnapshot, w.hasSelectedSnapshot = snapshot, true
+	w.renderSelectedControls()
+}
+
+func (w *DDPackageWindow) renderSelectedControls() {
+	step, ok := w.selectedStep()
+	if !ok || step.GCodePath == "" {
+		w.runStep.SetEnabled(false)
+		return
+	}
+	if !w.hasSelectedSnapshot {
+		// Before lazy loading, source existence is the only fact known. The
+		// application always revalidates controller/session eligibility on click.
+		w.runStep.SetEnabled(true)
+		return
+	}
+	w.runStep.SetEnabled(w.selectedSnapshot.Controls.Run)
+}
+
+// SetPackageExecution renders an authoritative ExecutionSessions projection.
+// It does not infer execution from the currently selected job or step.
+func (w *DDPackageWindow) SetPackageExecution(snapshot frontend.ExecutionSessionSnapshot, jobName, stepName string, present bool) {
+	w.hasExecution = present
+	if !present {
+		w.executionID = frontend.ExecutionSessionID{}
+		w.renderExecution()
+		return
+	}
+	w.executionID = snapshot.ID
+	if step, ok := w.selectedStep(); ok && snapshot.ID == frontend.PackageStepExecutionSessionID(w.documentID, w.jobIndex+1, step.ID) {
+		w.selectedSnapshot = snapshot
+		w.hasSelectedSnapshot = true
+		w.renderSelectedControls()
+	}
+	active := snapshot.State.ProgramDocumentID == snapshot.ID.DocumentID && snapshot.State.ProgramRunID == snapshot.Presentation.RunID && snapshot.State.ProgramStatus.IsActive()
+	prefix := "Last execution"
+	if snapshot.StartPending || snapshot.Presentation.RunID == 0 {
+		prefix = "Starting"
+	} else if active {
+		prefix = "Current execution"
+	}
+	w.executionIdentity.SetText(fmt.Sprintf("%s: %s — %s", prefix, jobName, stepName))
+	w.executionStatus.SetText("Status: " + snapshot.Presentation.StatusText(snapshot.State))
+	w.executionProgress.SetText(fmt.Sprintf("Acknowledged commands: %d / %d", snapshot.Presentation.Complete, snapshot.Presentation.Total))
+	maximum := snapshot.Presentation.Total
+	if maximum < 1 {
+		maximum = 1
+	}
+	w.executionBar.SetMaximum(maximum)
+	w.executionBar.SetValue(snapshot.Presentation.Complete)
+	w.executionError.SetText(snapshot.Presentation.Error)
+	w.pauseExecution.SetEnabled(snapshot.Controls.Pause)
+	w.resumeExecution.SetEnabled(snapshot.Controls.Resume)
+	w.stopExecution.SetEnabled(snapshot.Controls.Stop)
+	w.viewActive.SetEnabled(true)
+}
+
+func (w *DDPackageWindow) renderExecution() {
+	if w.hasExecution {
+		return
+	}
+	w.executionIdentity.SetText("No package step has run")
+	w.executionStatus.SetText("Manual execution is available for individual G-code steps only.")
+	w.executionProgress.SetText("Acknowledged commands: 0 / 0")
+	w.executionBar.SetMaximum(1)
+	w.executionBar.SetValue(0)
+	w.executionError.Clear()
+	w.pauseExecution.SetEnabled(false)
+	w.resumeExecution.SetEnabled(false)
+	w.stopExecution.SetEnabled(false)
+	w.viewActive.SetEnabled(false)
+}
+
+func (w *DDPackageWindow) requestExecutionAction(action string) {
+	if w.hasExecution && w.onAction != nil {
+		w.onAction(w.executionID, action)
 	}
 }
 

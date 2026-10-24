@@ -29,15 +29,17 @@ type Application struct {
 	sessions   *frontend.ExecutionSessions
 	mainWindow *MainWindow
 
-	pendingDocumentCloses  map[app.DocumentID]app.RunID
-	approvedDocumentCloses frontend.DocumentCloseApprovals
-	documentCloseResults   chan documentCloseResult
-	pendingDocumentStarts  map[frontend.ExecutionSessionID]documentStartRequest
-	documentStartResults   chan documentStartResult
-	pendingDocumentActions map[frontend.ExecutionSessionID]app.RunID
-	documentActionResults  chan documentActionResult
-	packageViews           frontend.PackageAuxiliaryViews
-	packageSessions        map[app.DocumentID]map[frontend.ExecutionSessionID]struct{}
+	pendingDocumentCloses   map[app.DocumentID]app.RunID
+	pendingAdmissionCloses  map[app.DocumentID]app.RunID
+	approvedDocumentCloses  frontend.DocumentCloseApprovals
+	documentCloseResults    chan documentCloseResult
+	pendingDocumentStarts   map[frontend.ExecutionSessionID]documentStartRequest
+	documentStartResults    chan documentStartResult
+	pendingDocumentActions  map[frontend.ExecutionSessionID]app.RunID
+	documentActionResults   chan documentActionResult
+	packageViews            frontend.PackageAuxiliaryViews
+	packageSessions         map[app.DocumentID]map[frontend.ExecutionSessionID]struct{}
+	packageSessionObservers map[app.DocumentID]map[frontend.ExecutionSessionID]func()
 
 	shutdown            frontend.ShutdownCoordinator
 	shutdownStopResults chan shutdownStopResult
@@ -88,6 +90,7 @@ func (a *Application) Run() error {
 	a.documents.SetOnClose(a.documentClosed)
 	a.sessions = frontend.NewExecutionSessions(state, revision)
 	a.pendingDocumentCloses = make(map[app.DocumentID]app.RunID)
+	a.pendingAdmissionCloses = make(map[app.DocumentID]app.RunID)
 	a.approvedDocumentCloses = make(frontend.DocumentCloseApprovals)
 	a.documentCloseResults = make(chan documentCloseResult, 16)
 	a.pendingDocumentStarts = make(map[frontend.ExecutionSessionID]documentStartRequest)
@@ -95,6 +98,7 @@ func (a *Application) Run() error {
 	a.pendingDocumentActions = make(map[frontend.ExecutionSessionID]app.RunID)
 	a.documentActionResults = make(chan documentActionResult, 16)
 	a.packageSessions = make(map[app.DocumentID]map[frontend.ExecutionSessionID]struct{})
+	a.packageSessionObservers = make(map[app.DocumentID]map[frontend.ExecutionSessionID]func())
 	a.shutdownStopResults = make(chan shutdownStopResult, 2)
 
 	mainWindow := newMainWindow(a.controller, func() { a.openGCodeFile() }, a.showExecutionDocument, a.canShowExecutionDocument)
@@ -156,6 +160,9 @@ func (a *Application) openPackageFile(path string) {
 		return
 	}
 	if opened {
+		if window, ok := entry.Window.(*DDPackageWindow); ok {
+			a.configurePackageExecution(entry, window)
+		}
 		entry.Window.Focus()
 	}
 	a.refreshExecutionFocusAvailability()
@@ -163,7 +170,7 @@ func (a *Application) openPackageFile(path string) {
 
 func (a *Application) openPackageStep(documentID app.DocumentID, jobIndex int, step ddpackage.Step) {
 	entry, ok := a.documents.Entry(documentID)
-	if !ok || entry.Kind != frontend.DocumentKindDDPackage || entry.Package == nil || jobIndex < 0 || jobIndex >= len(entry.Package.Jobs) {
+	if !ok {
 		return
 	}
 	id := frontend.PackageStepExecutionSessionID(documentID, jobIndex+1, step.ID)
@@ -171,12 +178,11 @@ func (a *Application) openPackageStep(documentID app.DocumentID, jobIndex int, s
 		view.Focus()
 		return
 	}
-	source, err := entry.Package.ReadStepGCode(step)
+	session, document, err := a.ensurePackageStepSession(documentID, jobIndex, step.ID)
 	if err != nil {
 		qt.QMessageBox_Warning(documentParent(entry), "Unable to Open Step G-code", err.Error())
 		return
 	}
-	document := gcode.Document{Path: entry.CanonicalPath + "!" + step.GCodePath, Name: filepath.Base(step.GCodePath), Source: string(source)}
 	window := newGCodeWindow(document, func() { a.openGCodeFile() })
 	packageName := entry.Package.DisplayName
 	window.SetPackageAuxiliary(packageName, step.Name, func() { a.focusPackage(documentID) })
@@ -188,28 +194,147 @@ func (a *Application) openPackageStep(documentID app.DocumentID, jobIndex int, s
 		existing.Focus()
 		return
 	}
-	program, parseErr := gcode.ProgramFromDocument(document)
-	session, sessionErr := a.sessions.Add(id, document.Source, program, parseErr)
-	if sessionErr != nil {
-		session, _ = a.sessions.Session(id)
-	}
 	if session != nil {
-		// DD-B2 attaches the shared session for presentation/lifetime only. No
-		// command callback is supplied, and GCodeWindow's auxiliary capability
-		// forces all program controls disabled until DD-B3 wires package runs.
-		window.SetExecutionSession(session, nil, nil, nil, nil)
-		if a.packageSessions[documentID] == nil {
-			a.packageSessions[documentID] = make(map[frontend.ExecutionSessionID]struct{})
-		}
-		a.packageSessions[documentID][id] = struct{}{}
+		window.SetExecutionSession(session,
+			func() { a.startDocumentProgram(id) },
+			func() { a.documentProgramAction(id, "pause") },
+			func() { a.documentProgramAction(id, "resume") },
+			func() { a.documentProgramAction(id, "stop") },
+		)
 	}
-	// Sessions are deliberately created only when an operator opens this step's
-	// source view, never eagerly for every package step. DD-B2 attaches them for
-	// shared presentation/lifetime preparation only; it does not admit a run.
 	a.windows.AddWithClose(window, func() {
 		a.packageViews.Remove(documentID, id, token)
 	})
 	window.show()
+}
+
+// ensurePackageStepSession is the one lazy source/program/session path for a
+// package step. It is used by both the package window and its auxiliary view,
+// so neither can create a competing execution context for the same step.
+func (a *Application) ensurePackageStepSession(documentID app.DocumentID, jobIndex int, stepID string) (*frontend.ExecutionSession, gcode.Document, error) {
+	entry, ok := a.documents.Entry(documentID)
+	if !ok || entry.Kind != frontend.DocumentKindDDPackage || entry.Package == nil || jobIndex < 0 || jobIndex >= len(entry.Package.Jobs) {
+		return nil, gcode.Document{}, fmt.Errorf("package document is no longer open")
+	}
+	var step ddpackage.Step
+	found := false
+	for _, candidate := range entry.Package.Jobs[jobIndex].Steps {
+		if candidate.ID == stepID {
+			step, found = candidate, true
+			break
+		}
+	}
+	if !found || step.GCodePath == "" {
+		return nil, gcode.Document{}, fmt.Errorf("selected package step has no G-code resource")
+	}
+	id := frontend.PackageStepExecutionSessionID(documentID, jobIndex+1, step.ID)
+	if session, exists := a.sessions.Session(id); exists {
+		snapshot := session.Snapshot()
+		return session, gcode.Document{Path: entry.CanonicalPath + "!" + step.GCodePath, Name: filepath.Base(step.GCodePath), Source: snapshot.Source}, nil
+	}
+	source, err := entry.Package.ReadStepGCode(step)
+	if err != nil {
+		return nil, gcode.Document{}, err
+	}
+	document := gcode.Document{Path: entry.CanonicalPath + "!" + step.GCodePath, Name: filepath.Base(step.GCodePath), Source: string(source)}
+	program, parseErr := gcode.ProgramFromDocument(document)
+	session, err := a.sessions.Add(id, document.Source, program, parseErr)
+	if err != nil {
+		return nil, gcode.Document{}, err
+	}
+	if a.packageSessions[documentID] == nil {
+		a.packageSessions[documentID] = make(map[frontend.ExecutionSessionID]struct{})
+	}
+	a.packageSessions[documentID][id] = struct{}{}
+	a.observePackageSession(documentID, id, session)
+	return session, document, nil
+}
+
+func (a *Application) configurePackageExecution(entry frontend.DocumentEntry, window *DDPackageWindow) {
+	window.SetExecutionCallbacks(
+		func(jobIndex int, step ddpackage.Step) {
+			if session, _, err := a.ensurePackageStepSession(entry.ID, jobIndex, step.ID); err == nil {
+				window.SetSelectedStepExecution(session.Snapshot())
+			}
+		},
+		func(jobIndex int, step ddpackage.Step) {
+			if _, _, err := a.ensurePackageStepSession(entry.ID, jobIndex, step.ID); err != nil {
+				qt.QMessageBox_Warning(documentParent(entry), "Unable to Run Step", err.Error())
+				return
+			}
+			a.startDocumentProgram(frontend.PackageStepExecutionSessionID(entry.ID, jobIndex+1, step.ID))
+		},
+		func(id frontend.ExecutionSessionID, action string) { a.documentProgramAction(id, action) },
+		func(id frontend.ExecutionSessionID) { a.openPackageSessionView(id) },
+	)
+	a.refreshPackageExecution(entry.ID)
+}
+
+func (a *Application) observePackageSession(documentID app.DocumentID, id frontend.ExecutionSessionID, session *frontend.ExecutionSession) {
+	if a.packageSessionObservers[documentID] == nil {
+		a.packageSessionObservers[documentID] = make(map[frontend.ExecutionSessionID]func())
+	}
+	if _, exists := a.packageSessionObservers[documentID][id]; exists {
+		return
+	}
+	a.packageSessionObservers[documentID][id] = session.Attach(func(snapshot frontend.ExecutionSessionSnapshot) {
+		entry, open := a.documents.Entry(documentID)
+		if !open {
+			return
+		}
+		if window, ok := entry.Window.(*DDPackageWindow); ok {
+			window.SetSelectedStepExecution(snapshot)
+		}
+		a.refreshPackageExecution(documentID)
+	})
+}
+
+func (a *Application) refreshPackageExecution(documentID app.DocumentID) {
+	entry, open := a.documents.Entry(documentID)
+	if !open || entry.Kind != frontend.DocumentKindDDPackage {
+		return
+	}
+	window, ok := entry.Window.(*DDPackageWindow)
+	if !ok {
+		return
+	}
+	snapshot, present := a.sessions.PackageExecution(documentID)
+	if !present {
+		window.SetPackageExecution(frontend.ExecutionSessionSnapshot{}, "", "", false)
+		return
+	}
+	jobIndex := snapshot.ID.PackageStep.JobIndex - 1
+	if jobIndex < 0 || jobIndex >= len(entry.Package.Jobs) {
+		window.SetPackageExecution(frontend.ExecutionSessionSnapshot{}, "", "", false)
+		return
+	}
+	for _, step := range entry.Package.Jobs[jobIndex].Steps {
+		if step.ID == snapshot.ID.PackageStep.StepID {
+			window.SetPackageExecution(snapshot, entry.Package.Jobs[jobIndex].Name, step.Name, true)
+			return
+		}
+	}
+	window.SetPackageExecution(frontend.ExecutionSessionSnapshot{}, "", "", false)
+}
+
+func (a *Application) openPackageSessionView(id frontend.ExecutionSessionID) {
+	if id.Standalone() {
+		return
+	}
+	entry, ok := a.documents.Entry(id.DocumentID)
+	if !ok || entry.Kind != frontend.DocumentKindDDPackage || entry.Package == nil {
+		return
+	}
+	jobIndex := id.PackageStep.JobIndex - 1
+	if jobIndex < 0 || jobIndex >= len(entry.Package.Jobs) {
+		return
+	}
+	for _, step := range entry.Package.Jobs[jobIndex].Steps {
+		if step.ID == id.PackageStep.StepID {
+			a.openPackageStep(id.DocumentID, jobIndex, step)
+			return
+		}
+	}
 }
 
 func (a *Application) focusPackage(id app.DocumentID) {
@@ -247,6 +372,7 @@ func (a *Application) drainControllerEvents() {
 		case event := <-a.controller.Events():
 			a.dispatcher.Dispatch(event)
 			a.sessions.ApplyEvent(event)
+			a.resolvePendingAdmissionCloses()
 		default:
 			a.drainDocumentStartResults()
 			a.drainDocumentActionResults()
@@ -264,7 +390,8 @@ func (a *Application) startDocumentProgram(sessionID frontend.ExecutionSessionID
 	if _, pending := a.pendingDocumentStarts[sessionID]; pending || a.documents.ClosePending(id) {
 		return
 	}
-	if _, ok := a.documents.Entry(id); !ok {
+	entry, open := a.documents.Entry(id)
+	if !open || (entry.Kind == frontend.DocumentKindGCode && !sessionID.Standalone()) || (entry.Kind == frontend.DocumentKindDDPackage && sessionID.Standalone()) {
 		return
 	}
 	session, ok := a.sessions.Session(sessionID)
@@ -308,33 +435,51 @@ func (a *Application) drainDocumentStartResults() {
 			if !open {
 				continue
 			}
-			window, ok := entry.Window.(*GCodeWindow)
-			if !ok {
-				continue
-			}
 			if !a.sessions.AssociateRun(result.sessionID, result.requestID, result.runID, result.err) {
 				continue
 			}
 			if !a.documents.ClosePending(result.documentID) {
 				continue
 			}
-			a.documents.ClearClosePending(result.documentID)
 			state := a.controller.Snapshot()
 			if result.err != nil {
+				a.documents.ClearClosePending(result.documentID)
 				if !state.ProgramStatus.IsActive() {
-					_ = window.Close()
+					_ = entry.Window.Close()
 				}
 				continue
 			}
-			// A successful admission is never auto-stopped. Reissue the close
-			// request on the UI thread so the normal Stop-and-Close confirmation
-			// governs this exact run.
-			if state.ProgramDocumentID == result.documentID && state.ProgramRunID == result.runID && state.ProgramStatus.IsActive() {
-				_ = window.Close()
-			}
+			// The controller may return Start before its revisioned state event
+			// reaches the UI. Keep the document alive until that exact RunID is
+			// observable; then reissue the native close so normal Stop-and-Close
+			// (or terminal close) decides safely.
+			a.pendingAdmissionCloses[result.documentID] = result.runID
+			a.resolvePendingAdmissionCloses()
 		default:
 			return
 		}
+	}
+}
+
+func (a *Application) resolvePendingAdmissionCloses() {
+	for documentID, runID := range a.pendingAdmissionCloses {
+		if a.hasPendingSessionStart(documentID) {
+			continue
+		}
+		entry, open := a.documents.Entry(documentID)
+		if !open || !a.documents.ClosePending(documentID) {
+			delete(a.pendingAdmissionCloses, documentID)
+			continue
+		}
+		state := a.controller.Snapshot()
+		if state.ProgramDocumentID != documentID || state.ProgramRunID != runID {
+			continue
+		}
+		a.documents.ClearClosePending(documentID)
+		delete(a.pendingAdmissionCloses, documentID)
+		// A running/paused/draining run reaches requestDocumentClose and needs
+		// explicit verified Stop-and-Close. A terminal exact run closes normally.
+		_ = entry.Window.Close()
 	}
 }
 
@@ -352,7 +497,12 @@ func (a *Application) documentProgramAction(sessionID frontend.ExecutionSessionI
 		return
 	}
 	session, ok := a.sessions.Session(sessionID)
-	if !ok || !session.BeginAction(runID) {
+	if !ok {
+		return
+	}
+	controls := session.Snapshot().Controls
+	allowed := (action == "pause" && controls.Pause) || (action == "resume" && controls.Resume) || (action == "stop" && controls.Stop)
+	if !allowed || !session.BeginAction(runID) {
 		return
 	}
 	a.pendingDocumentActions[sessionID] = runID
@@ -535,6 +685,7 @@ func (a *Application) drainDocumentCloseResults() {
 
 func (a *Application) documentClosed(entry frontend.DocumentEntry) {
 	delete(a.pendingDocumentCloses, entry.ID)
+	delete(a.pendingAdmissionCloses, entry.ID)
 	delete(a.pendingDocumentStarts, frontend.StandaloneExecutionSessionID(entry.ID))
 	delete(a.pendingDocumentActions, frontend.StandaloneExecutionSessionID(entry.ID))
 	delete(a.approvedDocumentCloses, entry.ID)
@@ -549,6 +700,14 @@ func (a *Application) documentClosed(entry frontend.DocumentEntry) {
 			a.refreshExecutionFocusAvailability()
 			return
 		}
+		for id, detach := range a.packageSessionObservers[entry.ID] {
+			if detach != nil {
+				detach()
+			}
+			delete(a.pendingDocumentStarts, id)
+			delete(a.pendingDocumentActions, id)
+		}
+		delete(a.packageSessionObservers, entry.ID)
 		for id := range a.packageSessions[entry.ID] {
 			if a.sessions != nil {
 				a.sessions.Remove(id)

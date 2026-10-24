@@ -493,3 +493,36 @@ func TestExecutionSessionsKeepSiblingControlsLockedWhenStatePrecedesAdmission(t 
 		t.Fatal("stale state released sibling")
 	}
 }
+
+func TestExecutionSessionsPackageExecutionUsesExactStepNotSelection(t *testing.T) {
+	manager := NewExecutionSessions(sessionState(0, 0, "", 0), 1)
+	stepAID := PackageStepExecutionSessionID(7, 1, "step-a")
+	stepBID := PackageStepExecutionSessionID(7, 1, "step-b")
+	stepA, _ := manager.Add(stepAID, "G0 X1", testSessionProgram(), nil)
+	_, _ = manager.Add(stepBID, "G0 X2", testSessionProgram(), nil)
+
+	request, ok := manager.BeginStart(stepAID)
+	if !ok {
+		t.Fatal("start admission rejected")
+	}
+	if snapshot, ok := manager.PackageExecution(7); !ok || snapshot.ID != stepAID || !snapshot.StartPending {
+		t.Fatalf("pending package execution = %+v, %v", snapshot, ok)
+	}
+	if !manager.AssociateRun(stepAID, request, 41, nil) {
+		t.Fatal("could not associate run")
+	}
+	manager.ApplyEvent(app.Event{StateRevision: 2, State: sessionState(7, 41, app.ProgramRunning, 1)})
+	if snapshot, ok := manager.PackageExecution(7); !ok || snapshot.ID != stepAID || snapshot.Presentation.RunID != 41 || snapshot.Presentation.Status != app.ProgramRunning {
+		t.Fatalf("active package execution = %+v, %v", snapshot, ok)
+	}
+	manager.ApplyEvent(app.Event{StateRevision: 3, State: sessionState(7, 41, app.ProgramCompleted, 2)})
+	if snapshot, ok := manager.PackageExecution(7); !ok || snapshot.ID != stepAID || snapshot.Presentation.Status != app.ProgramCompleted {
+		t.Fatalf("historical package execution = %+v, %v", snapshot, ok)
+	}
+	if stepA.Snapshot().Presentation.RunID != 41 {
+		t.Fatal("source session lost its retained run")
+	}
+	if _, ok := manager.PackageExecution(8); ok {
+		t.Fatal("execution leaked to another package owner")
+	}
+}

@@ -88,7 +88,7 @@ chapter 19. The public source uses a custom YAML parser and historically treats
 the first parsed document as the root manifest; DDGo instead requires one
 standard-YAML document with an explicit sequence root.
 
-DDGo now presents a loaded package as one first-class, read-only package
+DDGo now presents a loaded package as one first-class package
 document. It browses manifest-order jobs and steps, preserves text/Markdown,
 shows bounded in-memory images when Qt can decode them, lists resource
 references and complete path/field/message loader diagnostics, and can open a supplementary source-only
@@ -97,8 +97,10 @@ without extracting resources, are keyed by package document/job/step identity,
 and provide Back to Package navigation. Closing an auxiliary view does not
 close the package; accepted package closure closes its auxiliary views.
 
-This is viewing only. DDGo does not yet execute package G-code, advance a
-guided workflow, evaluate conditions, display models externally, or act on
-pause/reset/timeout/jump/popup metadata. A future wizard may request controller
-work only after binding every action to package document, step, and RunID while
-retaining current controller safety interlocks.
+DDGo can manually run one step containing valid G-code from either the package
+window or that step's auxiliary view. This is an exact package-document,
+step-session, and controller-RunID operation; it is not a Run Entire Package
+operation. DDGo does not advance a guided workflow, evaluate conditions,
+display models externally, or act on pause/reset/timeout/jump/popup metadata.
+Those fields remain retained for future guided-workflow support and are not
+implied by manually running a step.

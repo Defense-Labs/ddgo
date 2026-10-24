@@ -319,6 +319,46 @@ func (m *ExecutionSessions) Session(id ExecutionSessionID) (*ExecutionSession, b
 	return s, ok
 }
 
+// PackageExecution returns the package step which is pending admission,
+// currently owns the controller run, or most recently ran, in that order.
+// It is deliberately a manager projection rather than a window concern:
+// package selection is navigation state and must never decide execution
+// ownership. A package has at most one unresolved admission by BeginStart's
+// owner-level rule, and RunIDs provide a deterministic ordering for retained
+// historical step presentations.
+func (m *ExecutionSessions) PackageExecution(documentID app.DocumentID) (ExecutionSessionSnapshot, bool) {
+	var pending *ExecutionSession
+	var active *ExecutionSession
+	var latest *ExecutionSession
+	for id, session := range m.sessions {
+		if id.DocumentID != documentID || id.Standalone() {
+			continue
+		}
+		if session.startPending || session.awaitingRunState != 0 {
+			pending = session
+			continue
+		}
+		if session.presentation.RunID != 0 && m.currentState.ProgramDocumentID == documentID &&
+			m.currentState.ProgramRunID == session.presentation.RunID && m.currentState.ProgramStatus.IsActive() {
+			active = session
+			continue
+		}
+		if session.presentation.RunID != 0 && (latest == nil || session.presentation.RunID > latest.presentation.RunID) {
+			latest = session
+		}
+	}
+	if pending != nil {
+		return pending.Snapshot(), true
+	}
+	if active != nil {
+		return active.Snapshot(), true
+	}
+	if latest != nil {
+		return latest.Snapshot(), true
+	}
+	return ExecutionSessionSnapshot{}, false
+}
+
 // BeginStart is the owner-level admission check used by application command
 // callbacks. Standalone sessions retain their existing behavior. For a future
 // package, sibling steps sharing the owner DocumentID cannot speculatively
