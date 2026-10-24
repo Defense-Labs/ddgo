@@ -29,17 +29,19 @@ type Application struct {
 	sessions   *frontend.ExecutionSessions
 	mainWindow *MainWindow
 
-	pendingDocumentCloses   map[app.DocumentID]app.RunID
-	pendingAdmissionCloses  map[app.DocumentID]app.RunID
-	approvedDocumentCloses  frontend.DocumentCloseApprovals
-	documentCloseResults    chan documentCloseResult
-	pendingDocumentStarts   map[frontend.ExecutionSessionID]documentStartRequest
-	documentStartResults    chan documentStartResult
-	pendingDocumentActions  map[frontend.ExecutionSessionID]app.RunID
-	documentActionResults   chan documentActionResult
-	packageViews            frontend.PackageAuxiliaryViews
-	packageSessions         map[app.DocumentID]map[frontend.ExecutionSessionID]struct{}
-	packageSessionObservers map[app.DocumentID]map[frontend.ExecutionSessionID]func()
+	pendingDocumentCloses    map[app.DocumentID]app.RunID
+	pendingAdmissionCloses   map[app.DocumentID]app.RunID
+	approvedDocumentCloses   frontend.DocumentCloseApprovals
+	documentCloseResults     chan documentCloseResult
+	pendingDocumentStarts    map[frontend.ExecutionSessionID]documentStartRequest
+	documentStartResults     chan documentStartResult
+	pendingDocumentActions   map[frontend.ExecutionSessionID]app.RunID
+	documentActionResults    chan documentActionResult
+	packageViews             frontend.PackageAuxiliaryViews
+	packageSessions          map[app.DocumentID]map[frontend.ExecutionSessionID]struct{}
+	packageObservers         map[app.DocumentID]func()
+	selectedPackageObservers map[app.DocumentID]func()
+	selectedPackageSessions  map[app.DocumentID]frontend.ExecutionSessionID
 
 	shutdown            frontend.ShutdownCoordinator
 	shutdownStopResults chan shutdownStopResult
@@ -98,7 +100,9 @@ func (a *Application) Run() error {
 	a.pendingDocumentActions = make(map[frontend.ExecutionSessionID]app.RunID)
 	a.documentActionResults = make(chan documentActionResult, 16)
 	a.packageSessions = make(map[app.DocumentID]map[frontend.ExecutionSessionID]struct{})
-	a.packageSessionObservers = make(map[app.DocumentID]map[frontend.ExecutionSessionID]func())
+	a.packageObservers = make(map[app.DocumentID]func())
+	a.selectedPackageObservers = make(map[app.DocumentID]func())
+	a.selectedPackageSessions = make(map[app.DocumentID]frontend.ExecutionSessionID)
 	a.shutdownStopResults = make(chan shutdownStopResult, 2)
 
 	mainWindow := newMainWindow(a.controller, func() { a.openGCodeFile() }, a.showExecutionDocument, a.canShowExecutionDocument)
@@ -246,7 +250,6 @@ func (a *Application) ensurePackageStepSession(documentID app.DocumentID, jobInd
 		a.packageSessions[documentID] = make(map[frontend.ExecutionSessionID]struct{})
 	}
 	a.packageSessions[documentID][id] = struct{}{}
-	a.observePackageSession(documentID, id, session)
 	return session, document, nil
 }
 
@@ -254,11 +257,14 @@ func (a *Application) configurePackageExecution(entry frontend.DocumentEntry, wi
 	window.SetExecutionCallbacks(
 		func(jobIndex int, step ddpackage.Step) {
 			if session, _, err := a.ensurePackageStepSession(entry.ID, jobIndex, step.ID); err == nil {
-				window.SetSelectedStepExecution(session.Snapshot())
+				a.observeSelectedPackageSession(entry.ID, session)
+			} else {
+				window.SetSelectedStepUnavailable(jobIndex, step.ID, err)
 			}
 		},
 		func(jobIndex int, step ddpackage.Step) {
 			if _, _, err := a.ensurePackageStepSession(entry.ID, jobIndex, step.ID); err != nil {
+				window.SetSelectedStepUnavailable(jobIndex, step.ID, err)
 				qt.QMessageBox_Warning(documentParent(entry), "Unable to Run Step", err.Error())
 				return
 			}
@@ -267,17 +273,32 @@ func (a *Application) configurePackageExecution(entry frontend.DocumentEntry, wi
 		func(id frontend.ExecutionSessionID, action string) { a.documentProgramAction(id, action) },
 		func(id frontend.ExecutionSessionID) { a.openPackageSessionView(id) },
 	)
-	a.refreshPackageExecution(entry.ID)
+	if previous := a.packageObservers[entry.ID]; previous != nil {
+		previous()
+	}
+	a.packageObservers[entry.ID] = a.sessions.AttachPackage(entry.ID, func(presentation frontend.PackageExecutionPresentation) {
+		a.applyPackageExecution(entry.ID, presentation)
+	})
 }
 
-func (a *Application) observePackageSession(documentID app.DocumentID, id frontend.ExecutionSessionID, session *frontend.ExecutionSession) {
-	if a.packageSessionObservers[documentID] == nil {
-		a.packageSessionObservers[documentID] = make(map[frontend.ExecutionSessionID]func())
-	}
-	if _, exists := a.packageSessionObservers[documentID][id]; exists {
+func (a *Application) observeSelectedPackageSession(documentID app.DocumentID, session *frontend.ExecutionSession) {
+	id := session.ID()
+	if a.selectedPackageSessions[documentID] == id {
+		if entry, open := a.documents.Entry(documentID); open {
+			if window, ok := entry.Window.(*DDPackageWindow); ok {
+				window.SetSelectedStepExecution(session.Snapshot())
+			}
+		}
 		return
 	}
-	a.packageSessionObservers[documentID][id] = session.Attach(func(snapshot frontend.ExecutionSessionSnapshot) {
+	if detach := a.selectedPackageObservers[documentID]; detach != nil {
+		detach()
+	}
+	a.selectedPackageSessions[documentID] = id
+	a.selectedPackageObservers[documentID] = session.Attach(func(snapshot frontend.ExecutionSessionSnapshot) {
+		if a.selectedPackageSessions[documentID] != snapshot.ID {
+			return
+		}
 		entry, open := a.documents.Entry(documentID)
 		if !open {
 			return
@@ -285,11 +306,10 @@ func (a *Application) observePackageSession(documentID app.DocumentID, id fronte
 		if window, ok := entry.Window.(*DDPackageWindow); ok {
 			window.SetSelectedStepExecution(snapshot)
 		}
-		a.refreshPackageExecution(documentID)
 	})
 }
 
-func (a *Application) refreshPackageExecution(documentID app.DocumentID) {
+func (a *Application) applyPackageExecution(documentID app.DocumentID, presentation frontend.PackageExecutionPresentation) {
 	entry, open := a.documents.Entry(documentID)
 	if !open || entry.Kind != frontend.DocumentKindDDPackage {
 		return
@@ -298,23 +318,22 @@ func (a *Application) refreshPackageExecution(documentID app.DocumentID) {
 	if !ok {
 		return
 	}
-	snapshot, present := a.sessions.PackageExecution(documentID)
-	if !present {
-		window.SetPackageExecution(frontend.ExecutionSessionSnapshot{}, "", "", false)
+	if presentation.Phase == frontend.PackageExecutionNone {
+		window.SetPackageExecution(frontend.PackageExecutionPresentation{}, "", "", false)
 		return
 	}
-	jobIndex := snapshot.ID.PackageStep.JobIndex - 1
+	jobIndex := presentation.ID.PackageStep.JobIndex - 1
 	if jobIndex < 0 || jobIndex >= len(entry.Package.Jobs) {
-		window.SetPackageExecution(frontend.ExecutionSessionSnapshot{}, "", "", false)
+		window.SetPackageExecution(frontend.PackageExecutionPresentation{}, "", "", false)
 		return
 	}
 	for _, step := range entry.Package.Jobs[jobIndex].Steps {
-		if step.ID == snapshot.ID.PackageStep.StepID {
-			window.SetPackageExecution(snapshot, entry.Package.Jobs[jobIndex].Name, step.Name, true)
+		if step.ID == presentation.ID.PackageStep.StepID {
+			window.SetPackageExecution(presentation, entry.Package.Jobs[jobIndex].Name, step.Name, true)
 			return
 		}
 	}
-	window.SetPackageExecution(frontend.ExecutionSessionSnapshot{}, "", "", false)
+	window.SetPackageExecution(frontend.PackageExecutionPresentation{}, "", "", false)
 }
 
 func (a *Application) openPackageSessionView(id frontend.ExecutionSessionID) {
@@ -441,12 +460,12 @@ func (a *Application) drainDocumentStartResults() {
 			if !a.documents.ClosePending(result.documentID) {
 				continue
 			}
-			state := a.controller.Snapshot()
 			if result.err != nil {
 				a.documents.ClearClosePending(result.documentID)
-				if !state.ProgramStatus.IsActive() {
-					_ = entry.Window.Close()
-				}
+				// Reissue normal close policy even when another document owns an
+				// active run. A failed package admission has no RunID to stop and
+				// must not leave this package permanently close-pending.
+				_ = entry.Window.Close()
 				continue
 			}
 			// The controller may return Start before its revisioned state event
@@ -502,7 +521,7 @@ func (a *Application) documentProgramAction(sessionID frontend.ExecutionSessionI
 	}
 	controls := session.Snapshot().Controls
 	allowed := (action == "pause" && controls.Pause) || (action == "resume" && controls.Resume) || (action == "stop" && controls.Stop)
-	if !allowed || !session.BeginAction(runID) {
+	if !allowed || !a.sessions.BeginAction(sessionID, runID) {
 		return
 	}
 	a.pendingDocumentActions[sessionID] = runID
@@ -530,9 +549,7 @@ func (a *Application) drainDocumentActionResults() {
 			}
 			delete(a.pendingDocumentActions, result.sessionID)
 			if _, ok := a.documents.Entry(result.documentID); ok {
-				if session, exists := a.sessions.Session(result.sessionID); exists {
-					session.FinishAction(result.runID, result.err)
-				}
+				_ = a.sessions.FinishAction(result.sessionID, result.runID, result.err)
 			}
 		default:
 			return
@@ -700,14 +717,19 @@ func (a *Application) documentClosed(entry frontend.DocumentEntry) {
 			a.refreshExecutionFocusAvailability()
 			return
 		}
-		for id, detach := range a.packageSessionObservers[entry.ID] {
-			if detach != nil {
-				detach()
-			}
+		if detach := a.packageObservers[entry.ID]; detach != nil {
+			detach()
+		}
+		if detach := a.selectedPackageObservers[entry.ID]; detach != nil {
+			detach()
+		}
+		delete(a.packageObservers, entry.ID)
+		delete(a.selectedPackageObservers, entry.ID)
+		delete(a.selectedPackageSessions, entry.ID)
+		for id := range a.packageSessions[entry.ID] {
 			delete(a.pendingDocumentStarts, id)
 			delete(a.pendingDocumentActions, id)
 		}
-		delete(a.packageSessionObservers, entry.ID)
 		for id := range a.packageSessions[entry.ID] {
 			if a.sessions != nil {
 				a.sessions.Remove(id)

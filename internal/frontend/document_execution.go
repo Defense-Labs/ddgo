@@ -16,6 +16,51 @@ type DocumentExecutionControls struct {
 	Stop   bool
 }
 
+// PackageStepFeedback is the compact, toolkit-independent explanation shown
+// beside Run Selected Step. It is derived from the session snapshot and
+// controller state rather than from Qt selection state.
+type PackageStepFeedback struct {
+	RunEnabled bool
+	Message    string
+	Error      string
+}
+
+func PackageStepExecutionFeedback(hasGCode bool, resourceErr error, snapshot *ExecutionSessionSnapshot) PackageStepFeedback {
+	if !hasGCode {
+		return PackageStepFeedback{Message: "This step has no G-code to run."}
+	}
+	if resourceErr != nil {
+		return PackageStepFeedback{Message: "Step G-code is unavailable.", Error: resourceErr.Error()}
+	}
+	if snapshot == nil {
+		return PackageStepFeedback{Message: "Preparing step execution…"}
+	}
+	if snapshot.ParseError != nil {
+		return PackageStepFeedback{Message: "Step G-code is invalid.", Error: snapshot.ParseError.Error()}
+	}
+	if snapshot.StartErr != nil {
+		return PackageStepFeedback{Message: "Start rejected.", Error: snapshot.StartErr.Error()}
+	}
+	if snapshot.Controls.Run {
+		return PackageStepFeedback{RunEnabled: true, Message: "Ready to run this step."}
+	}
+	state := snapshot.State
+	switch {
+	case !state.IsConnected():
+		return PackageStepFeedback{Message: "Machine is not connected."}
+	case state.EStopStatus != app.EStopClear:
+		return PackageStepFeedback{Message: "Machine emergency stop is active."}
+	case state.MachineReadiness != app.MachineReadinessNormal:
+		return PackageStepFeedback{Message: "Machine recovery is required before running."}
+	case snapshot.StartPending || snapshot.AwaitingRunState || snapshot.OwnerStartBlocked:
+		return PackageStepFeedback{Message: "A program Start admission is pending."}
+	case state.ProgramStatus.IsActive():
+		return PackageStepFeedback{Message: "Another program is active."}
+	default:
+		return PackageStepFeedback{Message: "This step is not currently eligible to run."}
+	}
+}
+
 // SourceHighlightAction separates logical execution highlighting from native
 // widget behavior. Reveal is requested only when a new line is highlighted or
 // Follow Execution was just enabled; repeated state repainting is inert.

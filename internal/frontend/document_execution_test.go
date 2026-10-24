@@ -131,3 +131,51 @@ func TestSourceHighlightUpdate(t *testing.T) {
 		})
 	}
 }
+
+func TestPackageStepExecutionFeedback(t *testing.T) {
+	ready := ExecutionSessionSnapshot{Controls: DocumentExecutionControls{Run: true}, State: app.State{ConnectionStatus: app.ConnectionConnected, EStopStatus: app.EStopClear, MachineReadiness: app.MachineReadinessNormal}}
+	invalid := ready
+	invalid.ParseError = errors.New("line 2: unsupported command")
+	rejected := ready
+	rejected.StartErr = errors.New("controller is not ready")
+	disconnected := ready
+	disconnected.Controls.Run = false
+	disconnected.State.ConnectionStatus = app.ConnectionDisconnected
+	estop := ready
+	estop.Controls.Run = false
+	estop.State.EStopStatus = app.EStopActive
+	recovery := ready
+	recovery.Controls.Run = false
+	recovery.State.MachineReadiness = app.MachineReadinessRecoveryRequired
+	pending := ready
+	pending.Controls.Run = false
+	pending.StartPending = true
+
+	tests := []struct {
+		name        string
+		hasGCode    bool
+		resourceErr error
+		snapshot    *ExecutionSessionSnapshot
+		wantRun     bool
+		wantText    string
+		wantError   string
+	}{
+		{"no gcode", false, nil, nil, false, "This step has no G-code to run.", ""},
+		{"resource", true, errors.New("missing Code/a.nc"), nil, false, "Step G-code is unavailable.", "missing Code/a.nc"},
+		{"invalid", true, nil, &invalid, false, "Step G-code is invalid.", "line 2: unsupported command"},
+		{"rejected", true, nil, &rejected, false, "Start rejected.", "controller is not ready"},
+		{"disconnected", true, nil, &disconnected, false, "Machine is not connected.", ""},
+		{"estop", true, nil, &estop, false, "Machine emergency stop is active.", ""},
+		{"recovery", true, nil, &recovery, false, "Machine recovery is required before running.", ""},
+		{"pending", true, nil, &pending, false, "A program Start admission is pending.", ""},
+		{"ready", true, nil, &ready, true, "Ready to run this step.", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := PackageStepExecutionFeedback(tt.hasGCode, tt.resourceErr, tt.snapshot)
+			if got.RunEnabled != tt.wantRun || got.Message != tt.wantText || got.Error != tt.wantError {
+				t.Fatalf("feedback = %+v, want run=%v message=%q error=%q", got, tt.wantRun, tt.wantText, tt.wantError)
+			}
+		})
+	}
+}

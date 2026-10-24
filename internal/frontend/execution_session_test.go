@@ -2,6 +2,7 @@ package frontend
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/ianbruene/ddgo/internal/app"
@@ -359,6 +360,9 @@ func TestExecutionSessionsHoldRunAdmissionUntilAuthoritativeState(t *testing.T) 
 	if got := terminal.Snapshot(); got.Presentation.Status != app.ProgramCompleted || got.Controls.Run != true {
 		t.Fatalf("buffered terminal state did not resolve admission: %+v", got)
 	}
+	if got, ok := terminalManager.PackageExecution(10); !ok || got.Phase != PackageExecutionHistorical || got.ID != terminalID {
+		t.Fatalf("buffered terminal package projection = %+v, %v", got, ok)
+	}
 
 	standalone, err := NewExecutionSession(StandaloneExecutionSessionID(9), "G0 X1", testSessionProgram(), nil, sessionState(0, 0, "", 0))
 	if err != nil {
@@ -505,7 +509,7 @@ func TestExecutionSessionsPackageExecutionUsesExactStepNotSelection(t *testing.T
 	if !ok {
 		t.Fatal("start admission rejected")
 	}
-	if snapshot, ok := manager.PackageExecution(7); !ok || snapshot.ID != stepAID || !snapshot.StartPending {
+	if snapshot, ok := manager.PackageExecution(7); !ok || snapshot.ID != stepAID || snapshot.Phase != PackageExecutionStartPending {
 		t.Fatalf("pending package execution = %+v, %v", snapshot, ok)
 	}
 	if !manager.AssociateRun(stepAID, request, 41, nil) {
@@ -524,5 +528,74 @@ func TestExecutionSessionsPackageExecutionUsesExactStepNotSelection(t *testing.T
 	}
 	if _, ok := manager.PackageExecution(8); ok {
 		t.Fatal("execution leaked to another package owner")
+	}
+}
+
+func TestExecutionSessionsRetainRejectedPackageAttemptAndPriorRun(t *testing.T) {
+	manager := NewExecutionSessions(sessionState(0, 0, "", 0), 1)
+	stepID := PackageStepExecutionSessionID(7, 1, "machining")
+	step, _ := manager.Add(stepID, "G0 X1", testSessionProgram(), nil)
+
+	request, ok := manager.BeginStart(stepID)
+	if !ok || !manager.AssociateRun(stepID, request, 31, nil) {
+		t.Fatal("first admission failed")
+	}
+	manager.ApplyEvent(app.Event{StateRevision: 2, State: sessionState(7, 31, app.ProgramCompleted, 2)})
+	request, ok = manager.BeginStart(stepID)
+	if !ok {
+		t.Fatal("repeat admission was rejected before controller result")
+	}
+	if !manager.AssociateRun(stepID, request, 0, errors.New("controller is not ready")) {
+		t.Fatal("rejected result was not accepted")
+	}
+	got, ok := manager.PackageExecution(7)
+	if !ok || got.Phase != PackageExecutionStartRejected || got.ID != stepID || got.AttemptErr == nil || got.AttemptErr.Error() != "controller is not ready" {
+		t.Fatalf("rejected attempt projection = %+v, %v", got, ok)
+	}
+	if got.Controls.Pause || got.Controls.Resume || got.Controls.Stop {
+		t.Fatalf("rejected attempt exposed actions: %+v", got.Controls)
+	}
+	if retained := step.Snapshot().Presentation; retained.RunID != 31 || retained.Status != app.ProgramCompleted {
+		t.Fatalf("rejected repeat destroyed successful history: %+v", retained)
+	}
+	newRequest, ok := manager.BeginStart(stepID)
+	if !ok {
+		t.Fatal("new attempt was not admitted after rejection")
+	}
+	if manager.AssociateRun(stepID, request, 0, errors.New("stale rejection")) {
+		t.Fatal("stale result was accepted for the newer attempt")
+	}
+	if got, ok := manager.PackageExecution(7); !ok || got.Phase != PackageExecutionStartPending || got.AttemptSequence <= 1 || got.AttemptErr != nil {
+		t.Fatalf("stale rejection overwrote newer attempt: %+v, %v", got, ok)
+	}
+	if !manager.AssociateRun(stepID, newRequest, 32, nil) {
+		t.Fatal("new successful admission was rejected")
+	}
+}
+
+func TestExecutionSessionsPackageObserverIsOwnerScoped(t *testing.T) {
+	manager := NewExecutionSessions(sessionState(0, 0, "", 0), 1)
+	for i := 0; i < 100; i++ {
+		id := PackageStepExecutionSessionID(7, 1, fmt.Sprintf("step-%d", i))
+		if _, err := manager.Add(id, "G0 X1", testSessionProgram(), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	updates := 0
+	detach := manager.AttachPackage(7, func(PackageExecutionPresentation) { updates++ })
+	stepID := PackageStepExecutionSessionID(7, 1, "step-0")
+	request, ok := manager.BeginStart(stepID)
+	if !ok || !manager.AssociateRun(stepID, request, 51, nil) {
+		t.Fatal("could not prepare active run")
+	}
+	updates = 0
+	manager.ApplyEvent(app.Event{StateRevision: 2, State: sessionState(7, 51, app.ProgramRunning, 1)})
+	if updates != 1 {
+		t.Fatalf("package observer updates = %d, want one regardless of retained steps", updates)
+	}
+	detach()
+	manager.ApplyEvent(app.Event{StateRevision: 3, State: sessionState(7, 51, app.ProgramCompleted, 2)})
+	if updates != 1 {
+		t.Fatalf("detached package observer received %d updates", updates)
 	}
 }

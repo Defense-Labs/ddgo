@@ -42,16 +42,19 @@ func (id ExecutionSessionID) Valid() bool {
 // input for every view attached to a session. It is a value copy so views do
 // not retain mutable session state.
 type ExecutionSessionSnapshot struct {
-	ID               ExecutionSessionID
-	Source           string
-	Program          gcode.Program
-	ParseError       error
-	Presentation     DocumentExecutionPresentation
-	State            app.State
-	StartPending     bool
-	OperationPending bool
-	LastOperationErr error
-	Controls         DocumentExecutionControls
+	ID                ExecutionSessionID
+	Source            string
+	Program           gcode.Program
+	ParseError        error
+	Presentation      DocumentExecutionPresentation
+	State             app.State
+	StartPending      bool
+	AwaitingRunState  bool
+	OwnerStartBlocked bool
+	OperationPending  bool
+	StartErr          error
+	LastOperationErr  error
+	Controls          DocumentExecutionControls
 }
 
 // ExecutionSession holds execution state independently of native windows.
@@ -70,6 +73,7 @@ type ExecutionSession struct {
 	awaitingRunState  app.RunID
 	ownerStartBlocked bool
 	operationPending  bool
+	startErr          error
 	lastOperationErr  error
 	nextRequest       uint64
 	startRequest      uint64
@@ -101,13 +105,59 @@ func (s *ExecutionSession) ID() ExecutionSessionID { return s.id }
 
 func (s *ExecutionSession) Snapshot() ExecutionSessionSnapshot {
 	return ExecutionSessionSnapshot{
+		ID:                s.id,
+		Source:            s.source,
+		Program:           cloneExecutionProgram(s.program),
+		ParseError:        s.parseErr,
+		Presentation:      cloneExecutionPresentation(s.presentation),
+		State:             s.state,
+		StartPending:      s.startPending,
+		AwaitingRunState:  s.awaitingRunState != 0,
+		OwnerStartBlocked: s.ownerStartBlocked,
+		OperationPending:  s.operationPending,
+		StartErr:          s.startErr,
+		LastOperationErr:  s.lastOperationErr,
+		Controls: SessionExecutionControlState(s.id, s.presentation.RunID,
+			s.parseErr == nil && len(s.program.Lines) > 0, s.startPending, s.awaitingRunState != 0, s.ownerStartBlocked, s.operationPending, s.state),
+	}
+}
+
+// PackageExecutionPhase describes the package-level attempt independently of
+// controller RunID history. A rejected admission has no RunID, but remains an
+// important operator-visible execution attempt.
+type PackageExecutionPhase uint8
+
+const (
+	PackageExecutionNone PackageExecutionPhase = iota
+	PackageExecutionStartPending
+	PackageExecutionAwaitingState
+	PackageExecutionActive
+	PackageExecutionStartRejected
+	PackageExecutionHistorical
+)
+
+// PackageExecutionPresentation is intentionally lighter than an
+// ExecutionSessionSnapshot: the package strip never needs a mutable copy of
+// the G-code program. It combines exact session state with a monotonically
+// ordered package Start attempt.
+type PackageExecutionPresentation struct {
+	ID               ExecutionSessionID
+	Presentation     DocumentExecutionPresentation
+	State            app.State
+	OperationPending bool
+	LastOperationErr error
+	Controls         DocumentExecutionControls
+	Phase            PackageExecutionPhase
+	AttemptSequence  uint64
+	AttemptRunID     app.RunID
+	AttemptErr       error
+}
+
+func (s *ExecutionSession) packagePresentation() PackageExecutionPresentation {
+	return PackageExecutionPresentation{
 		ID:               s.id,
-		Source:           s.source,
-		Program:          cloneExecutionProgram(s.program),
-		ParseError:       s.parseErr,
 		Presentation:     cloneExecutionPresentation(s.presentation),
 		State:            s.state,
-		StartPending:     s.startPending,
 		OperationPending: s.operationPending,
 		LastOperationErr: s.lastOperationErr,
 		Controls: SessionExecutionControlState(s.id, s.presentation.RunID,
@@ -172,6 +222,7 @@ func (s *ExecutionSession) BeginStart() (uint64, bool) {
 	s.nextRequest++
 	s.startRequest = s.nextRequest
 	s.startPending = true
+	s.startErr = nil
 	s.lastOperationErr = nil
 	s.notify()
 	return s.startRequest, true
@@ -188,6 +239,7 @@ func (s *ExecutionSession) FinishStart(request uint64, runID app.RunID, err erro
 	s.startRequest = 0
 	s.presentation.ReconcileAdmission(runID, err)
 	if err != nil {
+		s.startErr = err
 		s.lastOperationErr = err
 	} else if runID != 0 {
 		// StartProgram has accepted a run, but the session must not expose a
@@ -287,17 +339,34 @@ type ExecutionSessions struct {
 	stateRevision  app.StateRevision
 	currentState   app.State
 	maxPendingRuns int
+
+	nextPackageAttempt  uint64
+	packageAttempts     map[app.DocumentID]packageExecutionAttempt
+	nextPackageObserver uint64
+	packageObservers    map[app.DocumentID]map[uint64]func(PackageExecutionPresentation)
+	lastActivePackage   app.DocumentID
+}
+
+type packageExecutionAttempt struct {
+	sequence uint64
+	id       ExecutionSessionID
+	request  uint64
+	runID    app.RunID
+	err      error
+	phase    PackageExecutionPhase
 }
 
 func NewExecutionSessions(state app.State, revision app.StateRevision) *ExecutionSessions {
 	return &ExecutionSessions{
-		sessions:       make(map[ExecutionSessionID]*ExecutionSession),
-		runOwners:      make(map[app.RunID]ExecutionSessionID),
-		pendingStates:  make(map[app.RunID]app.State),
-		pendingEvents:  make(map[app.RunID][]app.Event),
-		stateRevision:  revision,
-		currentState:   state,
-		maxPendingRuns: 32,
+		sessions:         make(map[ExecutionSessionID]*ExecutionSession),
+		runOwners:        make(map[app.RunID]ExecutionSessionID),
+		pendingStates:    make(map[app.RunID]app.State),
+		pendingEvents:    make(map[app.RunID][]app.Event),
+		stateRevision:    revision,
+		currentState:     state,
+		maxPendingRuns:   32,
+		packageAttempts:  make(map[app.DocumentID]packageExecutionAttempt),
+		packageObservers: make(map[app.DocumentID]map[uint64]func(PackageExecutionPresentation)),
 	}
 }
 
@@ -319,6 +388,49 @@ func (m *ExecutionSessions) Session(id ExecutionSessionID) (*ExecutionSession, b
 	return s, ok
 }
 
+// AttachPackage observes one package execution projection. Unlike attaching
+// to every visited step, this produces one package-strip callback per relevant
+// owner transition. It is UI-thread owned, synchronous, and detachable before
+// the owning native package window is destroyed.
+func (m *ExecutionSessions) AttachPackage(documentID app.DocumentID, observer func(PackageExecutionPresentation)) func() {
+	if documentID == 0 || observer == nil {
+		return func() {}
+	}
+	m.nextPackageObserver++
+	id := m.nextPackageObserver
+	if id == 0 {
+		m.nextPackageObserver++
+		id = m.nextPackageObserver
+	}
+	if m.packageObservers[documentID] == nil {
+		m.packageObservers[documentID] = make(map[uint64]func(PackageExecutionPresentation))
+	}
+	m.packageObservers[documentID][id] = observer
+	observer(m.packageExecution(documentID))
+	removed := false
+	return func() {
+		if removed {
+			return
+		}
+		removed = true
+		delete(m.packageObservers[documentID], id)
+		if len(m.packageObservers[documentID]) == 0 {
+			delete(m.packageObservers, documentID)
+		}
+	}
+}
+
+func (m *ExecutionSessions) notifyPackage(documentID app.DocumentID) {
+	observers := m.packageObservers[documentID]
+	if len(observers) == 0 {
+		return
+	}
+	presentation := m.packageExecution(documentID)
+	for _, observer := range observers {
+		observer(presentation)
+	}
+}
+
 // PackageExecution returns the package step which is pending admission,
 // currently owns the controller run, or most recently ran, in that order.
 // It is deliberately a manager projection rather than a window concern:
@@ -326,16 +438,16 @@ func (m *ExecutionSessions) Session(id ExecutionSessionID) (*ExecutionSession, b
 // ownership. A package has at most one unresolved admission by BeginStart's
 // owner-level rule, and RunIDs provide a deterministic ordering for retained
 // historical step presentations.
-func (m *ExecutionSessions) PackageExecution(documentID app.DocumentID) (ExecutionSessionSnapshot, bool) {
-	var pending *ExecutionSession
+func (m *ExecutionSessions) PackageExecution(documentID app.DocumentID) (PackageExecutionPresentation, bool) {
+	presentation := m.packageExecution(documentID)
+	return presentation, presentation.Phase != PackageExecutionNone
+}
+
+func (m *ExecutionSessions) packageExecution(documentID app.DocumentID) PackageExecutionPresentation {
 	var active *ExecutionSession
 	var latest *ExecutionSession
 	for id, session := range m.sessions {
 		if id.DocumentID != documentID || id.Standalone() {
-			continue
-		}
-		if session.startPending || session.awaitingRunState != 0 {
-			pending = session
 			continue
 		}
 		if session.presentation.RunID != 0 && m.currentState.ProgramDocumentID == documentID &&
@@ -347,16 +459,30 @@ func (m *ExecutionSessions) PackageExecution(documentID app.DocumentID) (Executi
 			latest = session
 		}
 	}
-	if pending != nil {
-		return pending.Snapshot(), true
-	}
 	if active != nil {
-		return active.Snapshot(), true
+		out := active.packagePresentation()
+		out.Phase = PackageExecutionActive
+		return out
+	}
+	attempt, hasAttempt := m.packageAttempts[documentID]
+	if hasAttempt {
+		if session, exists := m.sessions[attempt.id]; exists {
+			out := session.packagePresentation()
+			out.Phase, out.AttemptSequence, out.AttemptRunID, out.AttemptErr = attempt.phase, attempt.sequence, attempt.runID, attempt.err
+			if attempt.phase == PackageExecutionStartPending || attempt.phase == PackageExecutionAwaitingState || attempt.phase == PackageExecutionStartRejected {
+				return out
+			}
+		}
 	}
 	if latest != nil {
-		return latest.Snapshot(), true
+		out := latest.packagePresentation()
+		out.Phase = PackageExecutionHistorical
+		if hasAttempt && attempt.id == latest.id {
+			out.AttemptSequence, out.AttemptRunID = attempt.sequence, attempt.runID
+		}
+		return out
 	}
-	return ExecutionSessionSnapshot{}, false
+	return PackageExecutionPresentation{}
 }
 
 // BeginStart is the owner-level admission check used by application command
@@ -373,9 +499,14 @@ func (m *ExecutionSessions) BeginStart(id ExecutionSessionID) (uint64, bool) {
 	}
 	request, accepted := s.BeginStart()
 	if accepted {
+		if !id.Standalone() {
+			m.nextPackageAttempt++
+			m.packageAttempts[id.DocumentID] = packageExecutionAttempt{sequence: m.nextPackageAttempt, id: id, request: request, phase: PackageExecutionStartPending}
+		}
 		// The session's own transition notifies its views. Refreshing the owner
 		// immediately updates every sibling before any controller state arrives.
 		m.refreshPackageAdmission(id.DocumentID, false)
+		m.notifyPackage(id.DocumentID)
 	}
 	return request, accepted
 }
@@ -390,7 +521,11 @@ func (m *ExecutionSessions) Remove(id ExecutionSessionID) {
 	}
 	s.detachAll()
 	delete(m.sessions, id)
+	if attempt, exists := m.packageAttempts[id.DocumentID]; exists && attempt.id == id {
+		delete(m.packageAttempts, id.DocumentID)
+	}
 	m.refreshPackageAdmission(id.DocumentID, false)
+	m.notifyPackage(id.DocumentID)
 }
 
 func (m *ExecutionSessions) AssociateRun(id ExecutionSessionID, request uint64, runID app.RunID, err error) bool {
@@ -403,18 +538,24 @@ func (m *ExecutionSessions) AssociateRun(id ExecutionSessionID, request uint64, 
 		return false
 	}
 	if err != nil || runID == 0 {
+		m.recordPackageAttempt(id, request, runID, err, PackageExecutionStartRejected)
 		m.refreshPackageAdmission(id.DocumentID, true)
+		m.notifyPackage(id.DocumentID)
 		return true
 	}
 	if oldRunID != 0 && oldRunID != runID {
 		delete(m.runOwners, oldRunID)
 	}
 	m.runOwners[runID] = id
+	m.recordPackageAttempt(id, request, runID, nil, PackageExecutionAwaitingState)
 	if state, pending := m.pendingStates[runID]; pending {
 		delete(m.pendingStates, runID)
 		// This state may be older than m.currentState. It belongs to this exact
 		// run's history but must not replace current machine-control policy.
 		s.applyRunState(state)
+		if !state.ProgramStatus.IsActive() {
+			m.recordPackageAttempt(id, request, runID, nil, PackageExecutionHistorical)
+		}
 		s.notify()
 	}
 	for _, event := range m.pendingEvents[runID] {
@@ -422,11 +563,14 @@ func (m *ExecutionSessions) AssociateRun(id ExecutionSessionID, request uint64, 
 	}
 	delete(m.pendingEvents, runID)
 	m.refreshPackageAdmission(id.DocumentID, true)
+	m.notifyPackage(id.DocumentID)
 	return true
 }
 
 func (m *ExecutionSessions) ApplyEvent(event app.Event) {
 	if event.StateRevision > m.stateRevision {
+		previousActive := m.lastActivePackage
+		nextActive := app.DocumentID(0)
 		m.stateRevision = event.StateRevision
 		m.currentState = event.State
 		for _, s := range m.sessions {
@@ -437,10 +581,24 @@ func (m *ExecutionSessions) ApplyEvent(event app.Event) {
 			if s, exists := m.sessions[owner]; exists {
 				s.applyRunState(event.State)
 				s.notify()
+				if attempt, exists := m.packageAttempts[owner.DocumentID]; exists && attempt.id == owner && attempt.runID == runID && !event.State.ProgramStatus.IsActive() {
+					attempt.phase = PackageExecutionHistorical
+					m.packageAttempts[owner.DocumentID] = attempt
+				}
 				m.refreshPackageAdmission(owner.DocumentID, false)
+				if !owner.Standalone() && event.State.ProgramStatus.IsActive() {
+					nextActive = owner.DocumentID
+				}
 			}
 		} else if m.awaitingAdmission(event.State.ProgramDocumentID) && runID != 0 {
 			m.rememberState(runID, event.State)
+		}
+		m.lastActivePackage = nextActive
+		if nextActive != 0 {
+			m.notifyPackage(nextActive)
+		}
+		if previousActive != 0 && previousActive != nextActive {
+			m.notifyPackage(previousActive)
 		}
 	}
 	if event.Kind != app.EventError || event.ErrorRunID == 0 {
@@ -449,12 +607,47 @@ func (m *ExecutionSessions) ApplyEvent(event app.Event) {
 	if owner, ok := m.runOwners[event.ErrorRunID]; ok {
 		if s, exists := m.sessions[owner]; exists {
 			s.ApplyEvent(event)
+			if !owner.Standalone() {
+				m.notifyPackage(owner.DocumentID)
+			}
 		}
 		return
 	}
 	if m.awaitingAdmission(event.ErrorDocumentID) {
 		m.rememberEvent(event.ErrorRunID, event)
 	}
+}
+
+func (m *ExecutionSessions) recordPackageAttempt(id ExecutionSessionID, request uint64, runID app.RunID, err error, phase PackageExecutionPhase) {
+	if id.Standalone() {
+		return
+	}
+	attempt, exists := m.packageAttempts[id.DocumentID]
+	if !exists || attempt.id != id || attempt.request != request {
+		return
+	}
+	attempt.runID, attempt.err, attempt.phase = runID, err, phase
+	m.packageAttempts[id.DocumentID] = attempt
+}
+
+// BeginAction and FinishAction keep local package-strip controls synchronized
+// without requiring one package observer per retained step.
+func (m *ExecutionSessions) BeginAction(id ExecutionSessionID, runID app.RunID) bool {
+	session, ok := m.sessions[id]
+	if !ok || !session.BeginAction(runID) {
+		return false
+	}
+	m.notifyPackage(id.DocumentID)
+	return true
+}
+
+func (m *ExecutionSessions) FinishAction(id ExecutionSessionID, runID app.RunID, err error) bool {
+	session, ok := m.sessions[id]
+	if !ok || !session.FinishAction(runID, err) {
+		return false
+	}
+	m.notifyPackage(id.DocumentID)
+	return true
 }
 
 // packageAdmissionBlocked is the sole package-owner admission rule. Only

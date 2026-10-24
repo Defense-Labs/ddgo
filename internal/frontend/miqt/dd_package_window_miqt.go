@@ -30,6 +30,7 @@ type DDPackageWindow struct {
 	image             *qt.QLabel
 	openGCode         *qt.QPushButton
 	runStep           *qt.QPushButton
+	selectedStatus    *qt.QLabel
 	warnings          *qt.QLabel
 	executionIdentity *qt.QLabel
 	executionStatus   *qt.QLabel
@@ -101,6 +102,10 @@ func newDDPackageWindow(id app.DocumentID, pkg *ddpackage.Package, openStep func
 	w.runStep.SetText("Run Selected Step")
 	w.runStep.SetToolTip("Runs only this step's G-code; package workflow directives are not executed.")
 	rightLayout.AddWidget(w.runStep.QWidget)
+	w.selectedStatus = qt.NewQLabel(nil)
+	w.selectedStatus.SetWordWrap(true)
+	w.selectedStatus.SetStyleSheet("color: #555555;")
+	rightLayout.AddWidget(w.selectedStatus.QWidget)
 	split.AddWidget(right)
 	split.SetStretchFactor(0, 2)
 	split.SetStretchFactor(1, 5)
@@ -244,7 +249,7 @@ func (w *DDPackageWindow) renderStep() {
 		w.detail.SetPlainText(jobText + "\n\nNo steps are declared for this job.")
 		w.image.Clear()
 		w.openGCode.SetEnabled(false)
-		w.runStep.SetEnabled(false)
+		w.applySelectedFeedback(frontend.PackageStepExecutionFeedback(false, nil, nil))
 		return
 	}
 	text := "Job: " + w.pkg.Jobs[w.jobIndex].Name + "\n\n" + jobText + "\n\nStep: " + step.Name
@@ -328,24 +333,41 @@ func (w *DDPackageWindow) SetSelectedStepExecution(snapshot frontend.ExecutionSe
 	w.renderSelectedControls()
 }
 
+func (w *DDPackageWindow) SetSelectedStepUnavailable(jobIndex int, stepID string, err error) {
+	step, ok := w.selectedStep()
+	if !ok || w.jobIndex != jobIndex || step.ID != stepID {
+		return
+	}
+	w.hasSelectedSnapshot = false
+	w.applySelectedFeedback(frontend.PackageStepExecutionFeedback(true, err, nil))
+}
+
 func (w *DDPackageWindow) renderSelectedControls() {
 	step, ok := w.selectedStep()
 	if !ok || step.GCodePath == "" {
-		w.runStep.SetEnabled(false)
+		w.applySelectedFeedback(frontend.PackageStepExecutionFeedback(false, nil, nil))
 		return
 	}
 	if !w.hasSelectedSnapshot {
-		// Before lazy loading, source existence is the only fact known. The
-		// application always revalidates controller/session eligibility on click.
-		w.runStep.SetEnabled(true)
+		w.applySelectedFeedback(frontend.PackageStepExecutionFeedback(true, nil, nil))
 		return
 	}
-	w.runStep.SetEnabled(w.selectedSnapshot.Controls.Run)
+	snapshot := w.selectedSnapshot
+	w.applySelectedFeedback(frontend.PackageStepExecutionFeedback(true, nil, &snapshot))
+}
+
+func (w *DDPackageWindow) applySelectedFeedback(feedback frontend.PackageStepFeedback) {
+	w.runStep.SetEnabled(feedback.RunEnabled)
+	text := feedback.Message
+	if feedback.Error != "" {
+		text += "\n" + feedback.Error
+	}
+	w.selectedStatus.SetText(text)
 }
 
 // SetPackageExecution renders an authoritative ExecutionSessions projection.
 // It does not infer execution from the currently selected job or step.
-func (w *DDPackageWindow) SetPackageExecution(snapshot frontend.ExecutionSessionSnapshot, jobName, stepName string, present bool) {
+func (w *DDPackageWindow) SetPackageExecution(snapshot frontend.PackageExecutionPresentation, jobName, stepName string, present bool) {
 	w.hasExecution = present
 	if !present {
 		w.executionID = frontend.ExecutionSessionID{}
@@ -353,15 +375,33 @@ func (w *DDPackageWindow) SetPackageExecution(snapshot frontend.ExecutionSession
 		return
 	}
 	w.executionID = snapshot.ID
-	if step, ok := w.selectedStep(); ok && snapshot.ID == frontend.PackageStepExecutionSessionID(w.documentID, w.jobIndex+1, step.ID) {
-		w.selectedSnapshot = snapshot
-		w.hasSelectedSnapshot = true
-		w.renderSelectedControls()
+	if snapshot.Phase == frontend.PackageExecutionStartRejected {
+		w.executionIdentity.SetText(fmt.Sprintf("Start rejected: %s — %s", jobName, stepName))
+		status := "No program was started."
+		if snapshot.Presentation.RunID != 0 {
+			status += fmt.Sprintf(" Previous admitted RunID %d remains in this step's history.", snapshot.Presentation.RunID)
+		}
+		w.executionStatus.SetText(status)
+		w.executionProgress.SetText("Acknowledged commands: 0 / 0")
+		w.executionBar.SetMaximum(1)
+		w.executionBar.SetValue(0)
+		if snapshot.AttemptErr != nil {
+			w.executionError.SetText(snapshot.AttemptErr.Error())
+		} else {
+			w.executionError.Clear()
+		}
+		w.pauseExecution.SetEnabled(false)
+		w.resumeExecution.SetEnabled(false)
+		w.stopExecution.SetEnabled(false)
+		w.viewActive.SetEnabled(true)
+		return
 	}
-	active := snapshot.State.ProgramDocumentID == snapshot.ID.DocumentID && snapshot.State.ProgramRunID == snapshot.Presentation.RunID && snapshot.State.ProgramStatus.IsActive()
+	active := snapshot.Phase == frontend.PackageExecutionActive
 	prefix := "Last execution"
-	if snapshot.StartPending || snapshot.Presentation.RunID == 0 {
-		prefix = "Starting"
+	if snapshot.Phase == frontend.PackageExecutionStartPending {
+		prefix = "Start pending"
+	} else if snapshot.Phase == frontend.PackageExecutionAwaitingState {
+		prefix = "Start admitted — awaiting controller state"
 	} else if active {
 		prefix = "Current execution"
 	}
