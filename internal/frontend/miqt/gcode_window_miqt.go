@@ -242,31 +242,26 @@ func (w *GCodeWindow) SetExecutionSession(session *frontend.ExecutionSession, ru
 }
 
 func (w *GCodeWindow) renderExecution() {
-	controls := w.sessionSnapshot.Controls
-	w.runButton.SetEnabled(controls.Run)
-	w.pauseButton.SetEnabled(controls.Pause)
-	w.resumeButton.SetEnabled(controls.Resume)
-	w.stopButton.SetEnabled(controls.Stop)
-	presentation := w.sessionSnapshot.Presentation
-	w.statusLabel.SetText("Status: " + presentation.StatusText(w.sessionSnapshot.State))
-	w.progressLabel.SetText(fmt.Sprintf("Acknowledged commands: %d / %d", presentation.Complete, presentation.Total))
-	maximum := presentation.Total
-	if maximum < 1 {
-		maximum = 1
-	}
-	w.progressBar.SetMaximum(maximum)
-	w.progressBar.SetValue(presentation.Complete)
-	if presentation.NextLine > 0 {
-		w.lineLabel.SetText(fmt.Sprintf("Next command: source line %d", presentation.NextLine))
-	} else if presentation.Status == app.ProgramDraining {
+	display := frontend.ExecutionAttemptDisplayFor(w.sessionSnapshot)
+	w.runButton.SetEnabled(display.RunEnabled)
+	w.pauseButton.SetEnabled(display.PauseEnabled)
+	w.resumeButton.SetEnabled(display.ResumeEnabled)
+	w.stopButton.SetEnabled(display.StopEnabled)
+	w.statusLabel.SetText("Status: " + display.Status)
+	w.progressLabel.SetText(display.Progress)
+	w.progressBar.SetMaximum(display.ProgressMaximum)
+	w.progressBar.SetValue(display.ProgressValue)
+	if display.NextLine > 0 {
+		w.lineLabel.SetText(fmt.Sprintf("Next command: source line %d", display.NextLine))
+	} else if display.Draining {
 		w.lineLabel.SetText("All commands acknowledged — awaiting Idle")
 	} else {
 		w.lineLabel.SetText("Next command: none")
 	}
 	// This is intentionally called for zero too: completed, draining, stopped,
 	// and failed runs must not leave a stale pending-command marker behind.
-	w.sourceView.SetExecutionHighlight(presentation.NextLine, w.followCheck.IsChecked())
-	w.errorLabel.SetText(presentation.Error)
+	w.sourceView.SetExecutionHighlight(display.NextLine, w.followCheck.IsChecked())
+	w.errorLabel.SetText(display.Error)
 }
 
 func (w *GCodeWindow) show()                            { w.window.Show() }

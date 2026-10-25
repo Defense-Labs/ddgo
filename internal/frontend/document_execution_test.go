@@ -241,3 +241,47 @@ func TestPackageExecutionDisplayKeepsPendingAttemptSeparateFromHistory(t *testin
 		t.Fatalf("awaiting display inherited history: %+v", display)
 	}
 }
+
+func TestExecutionAttemptDisplaySeparatesCurrentStartAttemptFromHistory(t *testing.T) {
+	history := DocumentExecutionPresentation{
+		DocumentID: 7, RunID: 31, Status: app.ProgramFailed, Total: 2, Complete: 2,
+		Message: "Failed", Error: "run-scoped failure",
+	}
+	rejected := ExecutionSessionSnapshot{
+		ID:           PackageStepExecutionSessionID(7, 1, "step"),
+		Presentation: history,
+		StartErr:     errors.New("admission rejected"),
+		Controls:     DocumentExecutionControls{Run: true},
+	}
+	display := ExecutionAttemptDisplayFor(rejected)
+	if display.Status != "Start rejected." || display.Error != "admission rejected" || display.Progress != "Acknowledged commands: 0 / 0" || !display.RunEnabled || display.PauseEnabled || display.ResumeEnabled || display.StopEnabled {
+		t.Fatalf("rejected attempt display = %+v", display)
+	}
+
+	pending := rejected
+	pending.StartErr = nil
+	pending.StartPending = true
+	pending.Controls = DocumentExecutionControls{}
+	display = ExecutionAttemptDisplayFor(pending)
+	if display.Status != "Start admission is pending." || display.Error != "" || display.Progress != "Acknowledged commands: 0 / 0" || display.RunEnabled || display.PauseEnabled || display.ResumeEnabled || display.StopEnabled {
+		t.Fatalf("pending retry inherited historical feedback: %+v", display)
+	}
+
+	awaiting := pending
+	awaiting.StartPending, awaiting.AwaitingRunState = false, true
+	awaiting.Presentation.RunID = 32
+	display = ExecutionAttemptDisplayFor(awaiting)
+	if display.Status != "Start admitted as RunID 32 — awaiting controller state." || display.Error != "" || display.Progress != "Acknowledged commands: 0 / 0" {
+		t.Fatalf("awaiting retry display = %+v", display)
+	}
+
+	standalone := ExecutionSessionSnapshot{
+		ID:           StandaloneExecutionSessionID(8),
+		Presentation: DocumentExecutionPresentation{DocumentID: 8, RunID: 9, Status: app.ProgramRunning, Total: 2, Complete: 1, NextLine: 5, Message: "Running"},
+		Controls:     DocumentExecutionControls{Pause: true, Stop: true},
+	}
+	display = ExecutionAttemptDisplayFor(standalone)
+	if display.Status != "Running" || display.Progress != "Acknowledged commands: 1 / 2" || display.NextLine != 5 || !display.PauseEnabled || !display.StopEnabled {
+		t.Fatalf("standalone active display regressed: %+v", display)
+	}
+}

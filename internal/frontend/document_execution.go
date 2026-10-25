@@ -25,6 +25,65 @@ type PackageStepFeedback struct {
 	Error      string
 }
 
+// ExecutionAttemptDisplay is the toolkit-neutral execution panel view for a
+// single session. It intentionally separates a current Start attempt from the
+// retained admitted-run presentation so every view agrees about which error
+// and progress belong to the current attempt.
+type ExecutionAttemptDisplay struct {
+	Status          string
+	Progress        string
+	ProgressMaximum int
+	ProgressValue   int
+	Error           string
+	NextLine        int
+	Draining        bool
+	RunEnabled      bool
+	PauseEnabled    bool
+	ResumeEnabled   bool
+	StopEnabled     bool
+}
+
+// ExecutionAttemptDisplayFor is shared by standalone and package auxiliary
+// G-code windows. A pending or awaiting Start has not reached authoritative
+// controller execution state, so it cannot inherit prior errors, progress, or
+// active controls from the retained presentation.
+func ExecutionAttemptDisplayFor(snapshot ExecutionSessionSnapshot) ExecutionAttemptDisplay {
+	controls := snapshot.Controls
+	if snapshot.StartPending {
+		return ExecutionAttemptDisplay{
+			Status: "Start admission is pending.", Progress: "Acknowledged commands: 0 / 0",
+			ProgressMaximum: 1,
+		}
+	}
+	if snapshot.AwaitingRunState {
+		status := "Start admitted — awaiting controller state."
+		if snapshot.Presentation.RunID != 0 {
+			status = fmt.Sprintf("Start admitted as RunID %d — awaiting controller state.", snapshot.Presentation.RunID)
+		}
+		return ExecutionAttemptDisplay{
+			Status: status, Progress: "Acknowledged commands: 0 / 0", ProgressMaximum: 1,
+		}
+	}
+	if snapshot.StartErr != nil {
+		return ExecutionAttemptDisplay{
+			Status: "Start rejected.", Progress: "Acknowledged commands: 0 / 0",
+			ProgressMaximum: 1, Error: snapshot.StartErr.Error(), RunEnabled: controls.Run,
+		}
+	}
+	presentation := snapshot.Presentation
+	maximum := presentation.Total
+	if maximum < 1 {
+		maximum = 1
+	}
+	return ExecutionAttemptDisplay{
+		Status:          presentation.StatusText(snapshot.State),
+		Progress:        fmt.Sprintf("Acknowledged commands: %d / %d", presentation.Complete, presentation.Total),
+		ProgressMaximum: maximum, ProgressValue: presentation.Complete, Error: presentation.Error,
+		NextLine: presentation.NextLine, Draining: presentation.Status == app.ProgramDraining,
+		RunEnabled: controls.Run, PauseEnabled: controls.Pause, ResumeEnabled: controls.Resume, StopEnabled: controls.Stop,
+	}
+}
+
 // PackageExecutionDisplay is the toolkit-neutral presentation of the package
 // execution strip. Attempt phases deliberately do not borrow error or progress
 // text from a retained admitted run: a new admission is not that prior run.

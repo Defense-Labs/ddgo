@@ -741,6 +741,46 @@ func TestExecutionSessionsPendingRetryLabelsPriorFailedRunAsHistory(t *testing.T
 	}
 }
 
+func TestExecutionSessionsPackageAndAuxiliaryDisplaysAgreeOnPendingRetry(t *testing.T) {
+	manager := NewExecutionSessions(sessionState(0, 0, "", 0), 1)
+	id := PackageStepExecutionSessionID(7, 1, "machining")
+	step, _ := manager.Add(id, "G0 X1", testSessionProgram(), nil)
+	request, ok := manager.BeginStart(id)
+	if !ok || !manager.AssociateRun(id, request, 31, nil) {
+		t.Fatal("initial admission failed")
+	}
+	manager.ApplyEvent(app.Event{StateRevision: 2, State: sessionState(7, 31, app.ProgramCompleted, 2)})
+	request, ok = manager.BeginStart(id)
+	if !ok || !manager.AssociateRun(id, request, 0, errors.New("second admission rejected")) {
+		t.Fatal("rejected retry was not retained")
+	}
+	retry, ok := manager.BeginStart(id)
+	if !ok {
+		t.Fatal("pending retry was rejected")
+	}
+	pkg, ok := manager.PackageExecution(7)
+	if !ok || pkg.Phase != PackageExecutionStartPending {
+		t.Fatalf("package pending state = %+v, %v", pkg, ok)
+	}
+	packageDisplay := PackageExecutionDisplayFor(pkg)
+	auxiliaryDisplay := ExecutionAttemptDisplayFor(step.Snapshot())
+	if packageDisplay.Error != "" || auxiliaryDisplay.Error != "" || packageDisplay.PauseEnabled || auxiliaryDisplay.PauseEnabled || packageDisplay.StopEnabled || auxiliaryDisplay.StopEnabled {
+		t.Fatalf("package and auxiliary disagreed on pending ownership: package=%+v auxiliary=%+v", packageDisplay, auxiliaryDisplay)
+	}
+	if !manager.AssociateRun(id, retry, 32, nil) {
+		t.Fatal("retry admission failed")
+	}
+	manager.ApplyEvent(app.Event{StateRevision: 3, State: sessionState(7, 32, app.ProgramRunning, 1)})
+	auxiliaryDisplay = ExecutionAttemptDisplayFor(step.Snapshot())
+	if step.Snapshot().Presentation.RunID != 32 || auxiliaryDisplay.Status != "Running" || auxiliaryDisplay.Error != "" || auxiliaryDisplay.Progress != "Acknowledged commands: 1 / 2" {
+		t.Fatalf("auxiliary did not transition to exact new run: presentation=%+v display=%+v", step.Snapshot().Presentation, auxiliaryDisplay)
+	}
+	manager.ApplyEvent(app.Event{StateRevision: 2, State: sessionState(7, 31, app.ProgramFailed, 2)})
+	if got := step.Snapshot().Presentation.RunID; got != 32 {
+		t.Fatalf("stale old-run event replaced new presentation: %d", got)
+	}
+}
+
 func TestExecutionSessionsPackageObserverIsOwnerScoped(t *testing.T) {
 	manager := NewExecutionSessions(sessionState(0, 0, "", 0), 1)
 	for i := 0; i < 100; i++ {
