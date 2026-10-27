@@ -66,11 +66,15 @@ func (w *GCodeWindow) SetPackageAuxiliary(packageName, stepName string, back fun
 	w.stopButton.SetEnabled(false)
 	w.statusLabel.SetText("Preparing package step execution…")
 	w.packageHeader = qt.NewQWidget(nil)
+	// This row is navigation context, not document content. Keep it at its
+	// layout-derived height so all extra vertical space belongs to the splitter.
+	w.packageHeader.SetSizePolicy2(qt.QSizePolicy__Preferred, qt.QSizePolicy__Fixed)
 	headerLayout := qt.NewQHBoxLayout(nil)
 	headerLayout.SetContentsMargins(8, 4, 8, 4)
 	w.packageHeader.SetLayout(headerLayout.QLayout)
 	button := qt.NewQPushButton(nil)
-	button.SetText("← Back to Package — " + packageName)
+	button.SetText("← Back to Package")
+	button.SetSizePolicy2(qt.QSizePolicy__Maximum, qt.QSizePolicy__Fixed)
 	button.OnClicked(func() {
 		if back != nil {
 			back()
@@ -108,7 +112,10 @@ func newGCodeWindow(document gcode.Document, onOpen func()) *GCodeWindow {
 	w.centralLayout = qt.NewQVBoxLayout(nil)
 	w.centralLayout.SetContentsMargins(0, 0, 0, 0)
 	w.central.SetLayout(w.centralLayout.QLayout)
-	w.centralLayout.AddWidget(w.splitter.QWidget)
+	// The splitter is the document content and should receive every bit of
+	// surplus vertical space. Package navigation, when inserted above it, stays
+	// at its compact size hint.
+	w.centralLayout.AddWidget2(w.splitter.QWidget, 1)
 	// This is the sole SetCentralWidget call for the lifetime of this window.
 	w.window.SetCentralWidget(w.central)
 
