@@ -281,6 +281,184 @@ func TestLegacyColonFallbackDoesNotRewriteIndentedMarkdown(t *testing.T) {
 	}
 }
 
+func TestLegacyMarkdownPreservesStructuralBoundariesAndUnknownMetadata(t *testing.T) {
+	manifest := `- job_name: First job
+  future_job_field: retained before steps
+  job_steps:
+    - step_name: First step
+      step_markdown: |
+Instructions belonging only to the first step.
+      future_step_field: retained after markdown
+      step_text: Note: continue carefully.
+    - step_name: Second step
+      step_text: Next operation.
+  'future job field': retained after steps
+- job_name: Second job
+  job_steps:
+    - step_name: Third step
+      step_text: Final operation.
+`
+	pkg, err := Load(writePackage(t, zipEntry{name: manifestName, data: manifest}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pkg.Jobs) != 2 || len(pkg.Jobs[0].Steps) != 2 || len(pkg.Jobs[1].Steps) != 1 {
+		t.Fatalf("job/step structure = %+v", pkg.Jobs)
+	}
+	first := pkg.Jobs[0]
+	if first.Metadata["future_job_field"] != "retained before steps" || first.Metadata["future job field"] != "retained after steps" {
+		t.Fatalf("job metadata = %+v", first.Metadata)
+	}
+	if first.Steps[0].Markdown != "Instructions belonging only to the first step.\n" || first.Steps[0].Metadata["future_step_field"] != "retained after markdown" {
+		t.Fatalf("first step = %+v", first.Steps[0])
+	}
+	if first.Steps[1].Name != "Second step" || pkg.Jobs[1].Name != "Second job" || pkg.Jobs[1].Steps[0].Name != "Third step" {
+		t.Fatalf("step/job order = %+v", pkg.Jobs)
+	}
+}
+
+func TestLegacyFallbackProtectsValidBlockScalars(t *testing.T) {
+	manifest := "- job_name: Example\n" +
+		"  job_steps:\n" +
+		"    - step_name: Instructions\n" +
+		"      step_markdown: |-\n" +
+		"        # Instructions\n\n" +
+		"        step_text: Reminder: inspect the equipment.\n" +
+		"        - Markdown list item\n" +
+		"        # Markdown comment\n" +
+		"        \tTabbed Markdown text\n" +
+		"      step_text: Note: this triggers legacy colon handling.\n" +
+		"    - step_name: Folded\n" +
+		"      step_markdown: >+\n" +
+		"        Folded line one\n" +
+		"        Folded line two\n"
+	pkg, err := Load(writePackage(t, zipEntry{name: manifestName, data: manifest}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps := pkg.Jobs[0].Steps
+	if got, want := steps[0].Markdown, "# Instructions\n\nstep_text: Reminder: inspect the equipment.\n- Markdown list item\n# Markdown comment\n\tTabbed Markdown text"; got != want {
+		t.Fatalf("literal Markdown changed:\n got %q\nwant %q", got, want)
+	}
+	if steps[0].Text != "Note: this triggers legacy colon handling." {
+		t.Fatalf("legacy text = %q", steps[0].Text)
+	}
+	if steps[1].Markdown != "Folded line one Folded line two\n" {
+		t.Fatalf("folded Markdown = %q", steps[1].Markdown)
+	}
+}
+
+func TestLegacySubmanifestPreservesMarkdownBoundary(t *testing.T) {
+	root := `- job_name: Root
+  job_steps:
+    - manifest_file: child.yml
+`
+	child := `- step_name: Included
+  step_markdown: |
+Included instructions.
+  future_step_field: retained
+  step_text: Note: included text.
+- step_name: Following
+  step_text: Ready.
+`
+	pkg, err := Load(writePackage(t,
+		zipEntry{name: manifestName, data: root},
+		zipEntry{name: "child.yml", data: child},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps := pkg.Jobs[0].Steps
+	if len(steps) != 2 || steps[0].Markdown != "Included instructions.\n" || steps[0].Metadata["future_step_field"] != "retained" || steps[1].Name != "Following" {
+		t.Fatalf("expanded legacy submanifest = %+v", steps)
+	}
+}
+
+func TestLegacyMarkdownStopsAtUnknownJobField(t *testing.T) {
+	manifest := `- job_name: Example
+  job_steps:
+    - step_name: Instructions
+      step_markdown: |
+Last paragraph in the step.
+  future_job_field: retained
+`
+	pkg, err := Load(writePackage(t, zipEntry{name: manifestName, data: manifest}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := pkg.Jobs[0]
+	if job.Steps[0].Markdown != "Last paragraph in the step.\n" || job.Metadata["future_job_field"] != "retained" {
+		t.Fatalf("legacy Markdown absorbed unknown job field: %+v", job)
+	}
+}
+
+func TestLegacyCompatibilityOutputLimit(t *testing.T) {
+	input := strings.Repeat(" ", 24) + "step_markdown: |\n" + "x\n" + "x\n" + "x\n" + "x\n"
+	if len(input) >= 64 {
+		t.Fatalf("test input unexpectedly exceeds custom source limit: %d", len(input))
+	}
+	if _, _, _, err := legacyManifestCompatibility([]byte(input), "fixture.yml", 64); err == nil || !strings.Contains(err.Error(), "128-byte expansion limit") {
+		t.Fatalf("legacyManifestCompatibility() error = %v, want bounded expansion error", err)
+	}
+
+	withinLimit := strings.Repeat(" ", 24) + "step_markdown: |\n" + "x\n" + "x\n"
+	if _, _, changed, err := legacyManifestCompatibility([]byte(withinLimit), "fixture.yml", 64); err != nil || !changed {
+		t.Fatalf("legacyManifestCompatibility(within limit) = changed %v, err %v", changed, err)
+	}
+	normalized, _, _, err := legacyManifestCompatibility([]byte(withinLimit), "fixture.yml", 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minimumLimit := (int64(len(normalized)) + 1) / 2
+	if _, _, _, err := legacyManifestCompatibility([]byte(withinLimit), "fixture.yml", minimumLimit); err != nil {
+		t.Fatalf("normalization at its output boundary failed: %v", err)
+	}
+	if len(normalized)%2 == 0 {
+		if _, _, _, err := legacyManifestCompatibility([]byte(withinLimit), "fixture.yml", minimumLimit-1); err == nil {
+			t.Fatal("normalization exceeding its output boundary unexpectedly succeeded")
+		}
+	}
+	if _, err := legacyCompatibilityOutputLimit(0); err == nil {
+		t.Fatal("zero manifest limit unexpectedly accepted")
+	}
+	if _, err := legacyCompatibilityOutputLimit(int64(^uint64(0) >> 1)); err == nil {
+		t.Fatal("overflowing manifest limit unexpectedly accepted")
+	}
+}
+
+func TestLoadWithLimitsBoundsLegacyNormalization(t *testing.T) {
+	indent := strings.Repeat(" ", 48)
+	manifest := "- job_name: Example\n" +
+		"  job_steps:\n" +
+		"    -\n" +
+		indent + "step_name: Instructions\n" +
+		indent + "step_markdown: |\n" +
+		strings.Repeat("x\n", 8)
+	limits := DefaultLimits()
+	limits.MaxManifestBytes = 256
+	if len(manifest) >= int(limits.MaxManifestBytes) {
+		t.Fatalf("test manifest unexpectedly exceeds source limit: %d", len(manifest))
+	}
+	pkg, err := LoadWithLimits(writePackage(t, zipEntry{name: manifestName, data: manifest}), limits)
+	if pkg != nil || err == nil || !strings.Contains(err.Error(), "512-byte expansion limit") {
+		t.Fatalf("LoadWithLimits() = pkg=%v err=%v, want custom compatibility expansion error", pkg, err)
+	}
+}
+
+func TestLegacyMarkdownRejectsAmbiguousStructuralContent(t *testing.T) {
+	manifest := `- job_name: Example
+  job_steps:
+    - step_name: Instructions
+      step_markdown: |
+Paragraph before an ambiguous line.
+future_field: could be Markdown or structure
+`
+	pkg, err := Load(writePackage(t, zipEntry{name: manifestName, data: manifest}))
+	if pkg != nil || err == nil || !strings.Contains(err.Error(), "ambiguous unindented Markdown boundary") {
+		t.Fatalf("Load() = pkg=%v err=%v, want ambiguity rejection", pkg, err)
+	}
+}
+
 func TestLegacyCompatibilityRejectsUnsupportedTabsAndMalformedYAML(t *testing.T) {
 	tests := []struct {
 		name, manifest, want string

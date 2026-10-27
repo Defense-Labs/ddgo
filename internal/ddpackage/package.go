@@ -293,7 +293,7 @@ func validateArchiveEntry(file *zip.File) (bool, error) {
 }
 
 func parseManifest(data []byte, manifestPath string, resources map[string][]byte, limits Limits) ([]Job, []Diagnostic, error) {
-	root, compatibilityWarnings, err := decodeYAML(data, manifestPath)
+	root, compatibilityWarnings, err := decodeYAML(data, manifestPath, limits.MaxManifestBytes)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -317,12 +317,12 @@ func parseManifest(data []byte, manifestPath string, resources map[string][]byte
 	return jobs, warnings, nil
 }
 
-func decodeYAML(data []byte, source string) (*yaml.Node, []Diagnostic, error) {
+func decodeYAML(data []byte, source string, manifestLimit int64) (*yaml.Node, []Diagnostic, error) {
 	root, err := decodeYAMLStrict(data, source)
 	if err == nil {
 		return root, nil, nil
 	}
-	normalized, warnings, changed, compatibilityErr := legacyManifestCompatibility(data, source)
+	normalized, warnings, changed, compatibilityErr := legacyManifestCompatibility(data, source, manifestLimit)
 	if compatibilityErr != nil {
 		return nil, nil, fmt.Errorf("%v; legacy compatibility in %q failed: %w", err, source, compatibilityErr)
 	}
@@ -428,7 +428,7 @@ func expandSubmanifest(name string, resources map[string][]byte, limits Limits, 
 	if int64(len(data)) > limits.MaxManifestBytes {
 		return nil, fmt.Errorf("submanifest %q exceeds manifest size limit of %d bytes", name, limits.MaxManifestBytes)
 	}
-	root, compatibilityWarnings, err := decodeYAML(data, name)
+	root, compatibilityWarnings, err := decodeYAML(data, name, limits.MaxManifestBytes)
 	if err != nil {
 		return nil, err
 	}

@@ -79,8 +79,9 @@ use `manifest.yml`; DDGo requires the latter exactly. Standard YAML is always
 parsed first with YAML v3. When that strict parse fails, DDGo has a bounded,
 line-aware fallback for a small set of observed historic DDCut conventions:
 
-- literal `step_markdown: |` content that starts at column zero, ending only at
-  a following correctly indented recognized step field;
+- literal `step_markdown: |` content that starts at column zero, ending at a
+  structural boundary in its containing step/job (including an unknown mapping
+  field, a later step, or a later job);
 - tabs on otherwise blank or comment-only lines;
 - unquoted colon-space text in the documented human-text fields (`job_name`,
   `job_text`, `step_name`, `step_text`, popup text/title, and the WCS failure
@@ -89,12 +90,19 @@ line-aware fallback for a small set of observed historic DDCut conventions:
 
 The fallback is not a permissive YAML replacement. It rejects tabs used for
 actual YAML indentation, leaves resource paths and numeric fields alone, and
-returns an error when it cannot produce one strict YAML document. Recovered
+returns an error when it cannot produce one strict YAML document or safely
+classify a legacy Markdown boundary. Correctly indented literal and folded
+block scalars are preserved without line-level compatibility rewriting, even
+when another field elsewhere requires fallback. Unknown job and step metadata
+continues to be retained rather than becoming Markdown content. Recovered
 manifests receive concise nonfatal compatibility diagnostics. The archive's
 original manifest bytes are never rewritten; only a bounded in-memory parsing
-buffer is supplied to YAML v3 after strict decoding failed. Root manifests and
-submanifests use the same policy and remain subject to the existing manifest,
-resource, archive, inclusion-depth, and expanded-step limits.
+buffer is supplied to YAML v3 after strict decoding failed. That normalized
+buffer is capped at twice the configured per-manifest byte limit; each expanded
+line is checked before indentation, quoting, or output construction. Root
+manifests and submanifests use the same policy and remain subject to the
+existing manifest, resource, archive, inclusion-depth, and expanded-step
+limits.
 
 Initial loader development had no real-world fixtures and therefore used only
 synthetic archives. A later compatibility investigation validated manifest
