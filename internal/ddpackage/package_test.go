@@ -197,6 +197,108 @@ func TestLoadPreservesMultipleJobs(t *testing.T) {
 	}
 }
 
+func TestLoadLegacyManifestFormattingCompatibility(t *testing.T) {
+	manifest := "- job_name: Legacy package\n" +
+		"  job_text: Important note: use the supplied fixture.\n" +
+		"\t  # legacy separator\n" +
+		"  job_steps:\n" +
+		"\t \n" +
+		"    -  step_name: Instructions\n" +
+		"      step_markdown: |\n" +
+		"First paragraph.\n\n" +
+		"Second paragraph with **formatting**.\n" +
+		"      step_text: Note: verify that the workspace is clear.\n" +
+		"      step_image: Images/example.png\n" +
+		"    - manifest_file: steps.yml\n" +
+		"    - step_name: Final\n" +
+		"      step_gcode: Code/final.nc\n" +
+		"      timeout: 120 # ordinary YAML comment\n"
+	submanifest := "- step_name: Sub step\n  step_text: Reminder: inspect the clamp.\n"
+	pkg, err := Load(writePackage(t,
+		zipEntry{name: manifestName, data: manifest},
+		zipEntry{name: "steps.yml", data: submanifest},
+		zipEntry{name: "Images/example.png", data: "image"},
+		zipEntry{name: "Code/final.nc", data: "G0 X1\n"},
+	))
+	if err != nil {
+		t.Fatalf("Load(legacy manifest) error: %v", err)
+	}
+	if len(pkg.Jobs) != 1 || pkg.Jobs[0].Name != "Legacy package" || pkg.Jobs[0].Text != "Important note: use the supplied fixture." {
+		t.Fatalf("legacy job = %+v", pkg.Jobs)
+	}
+	steps := pkg.Jobs[0].Steps
+	if len(steps) != 3 || steps[0].Name != "Instructions" || steps[1].Name != "Sub step" || steps[2].Name != "Final" {
+		t.Fatalf("legacy step order = %+v", steps)
+	}
+	if steps[0].Markdown != "First paragraph.\n\nSecond paragraph with **formatting**.\n" || steps[0].Text != "Note: verify that the workspace is clear." || steps[0].ImagePath != "Images/example.png" {
+		t.Fatalf("legacy Markdown/text = %+v", steps[0])
+	}
+	if steps[1].Text != "Reminder: inspect the clamp." || steps[1].ManifestPath != "steps.yml" || steps[2].GCodePath != "Code/final.nc" || steps[2].Timeout == nil || *steps[2].Timeout != 120 {
+		t.Fatalf("legacy submanifest/resource metadata = %+v / %+v", steps[1], steps[2])
+	}
+	if len(pkg.Warnings) < 4 {
+		t.Fatalf("legacy compatibility diagnostics = %+v", pkg.Warnings)
+	}
+}
+
+func TestLoadStrictManifestDoesNotEmitCompatibilityWarning(t *testing.T) {
+	manifest := `- job_name: "Strict: package"
+  job_text: "Note: quoted"
+  job_steps:
+    - step_name: Instructions
+      step_markdown: |
+        First paragraph.
+
+        Second paragraph.
+      step_text: "Note: quoted text"
+`
+	pkg, err := Load(writePackage(t, zipEntry{name: manifestName, data: manifest}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pkg.Warnings) != 0 || pkg.Jobs[0].Steps[0].Markdown != "First paragraph.\n\nSecond paragraph.\n" || pkg.Jobs[0].Text != "Note: quoted" {
+		t.Fatalf("strict manifest changed or warned: %+v / %+v", pkg, pkg.Warnings)
+	}
+}
+
+func TestLegacyColonFallbackDoesNotRewriteIndentedMarkdown(t *testing.T) {
+	manifest := `- job_name: Example
+  job_steps:
+    - step_name: Instructions
+      step_markdown: |
+        First paragraph.
+
+        Second paragraph.
+      step_text: Note: this triggers only the colon compatibility fallback.
+`
+	pkg, err := Load(writePackage(t, zipEntry{name: manifestName, data: manifest}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := pkg.Jobs[0].Steps[0]
+	if step.Markdown != "First paragraph.\n\nSecond paragraph.\n" || step.Text != "Note: this triggers only the colon compatibility fallback." {
+		t.Fatalf("fallback rewrote standard Markdown: %+v", step)
+	}
+}
+
+func TestLegacyCompatibilityRejectsUnsupportedTabsAndMalformedYAML(t *testing.T) {
+	tests := []struct {
+		name, manifest, want string
+	}{
+		{"tab indentation", "- job_name: x\n\tjob_steps: []\n", "tab in YAML content"},
+		{"unterminated quote", "- job_name: \"unterminated\n", "parse YAML"},
+		{"unindented structural content remains invalid", "- job_name: x\n  job_steps:\n    - step_name: x\n      step_markdown: |\n- step_name: not safely distinguishable\n", "has no job_name"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pkg, err := Load(writePackage(t, zipEntry{name: manifestName, data: tt.manifest}))
+			if err == nil || pkg != nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Load() = pkg=%v err=%v, want %q", pkg, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsMissingAndMalformedRequiredStructure(t *testing.T) {
 	tests := []struct {
 		name    string

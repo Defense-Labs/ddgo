@@ -293,7 +293,7 @@ func validateArchiveEntry(file *zip.File) (bool, error) {
 }
 
 func parseManifest(data []byte, manifestPath string, resources map[string][]byte, limits Limits) ([]Job, []Diagnostic, error) {
-	root, err := decodeYAML(data, manifestPath)
+	root, compatibilityWarnings, err := decodeYAML(data, manifestPath)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -303,7 +303,7 @@ func parseManifest(data []byte, manifestPath string, resources map[string][]byte
 	if len(root.Content) == 0 {
 		return nil, nil, fmt.Errorf("manifest %q contains no jobs", manifestPath)
 	}
-	warnings := []Diagnostic{}
+	warnings := append([]Diagnostic(nil), compatibilityWarnings...)
 	jobs := make([]Job, 0, len(root.Content))
 	expandedCount := 0
 	for index, jobNode := range root.Content {
@@ -317,7 +317,26 @@ func parseManifest(data []byte, manifestPath string, resources map[string][]byte
 	return jobs, warnings, nil
 }
 
-func decodeYAML(data []byte, source string) (*yaml.Node, error) {
+func decodeYAML(data []byte, source string) (*yaml.Node, []Diagnostic, error) {
+	root, err := decodeYAMLStrict(data, source)
+	if err == nil {
+		return root, nil, nil
+	}
+	normalized, warnings, changed, compatibilityErr := legacyManifestCompatibility(data, source)
+	if compatibilityErr != nil {
+		return nil, nil, fmt.Errorf("%v; legacy compatibility in %q failed: %w", err, source, compatibilityErr)
+	}
+	if !changed {
+		return nil, nil, err
+	}
+	root, fallbackErr := decodeYAMLStrict(normalized, source)
+	if fallbackErr != nil {
+		return nil, nil, fmt.Errorf("%v; legacy compatibility in %q did not produce valid YAML: %w", err, source, fallbackErr)
+	}
+	return root, warnings, nil
+}
+
+func decodeYAMLStrict(data []byte, source string) (*yaml.Node, error) {
 	var document yaml.Node
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	if err := decoder.Decode(&document); err != nil {
@@ -409,10 +428,11 @@ func expandSubmanifest(name string, resources map[string][]byte, limits Limits, 
 	if int64(len(data)) > limits.MaxManifestBytes {
 		return nil, fmt.Errorf("submanifest %q exceeds manifest size limit of %d bytes", name, limits.MaxManifestBytes)
 	}
-	root, err := decodeYAML(data, name)
+	root, compatibilityWarnings, err := decodeYAML(data, name)
 	if err != nil {
 		return nil, err
 	}
+	*warnings = append(*warnings, compatibilityWarnings...)
 	return expandStepList(root, name, resources, limits, append(chain, name), depth+1, warnings, expandedCount)
 }
 

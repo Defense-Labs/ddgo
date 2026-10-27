@@ -75,11 +75,34 @@ compression-ratio checks continue to apply to all resources.
 ## Compatibility scope and future integration
 
 The manual calls the root file `[Link]` in prose but examples and public DDCut
-use `manifest.yml`; DDGo requires the latter exactly. No real-world package
-fixtures were available for this phase, so compatibility is covered by
-documented synthetic archives. The legacy C++ parser has custom YAML behavior;
-DDGo intentionally uses maintained YAML v3 and reports malformed or unsupported
-structure rather than emulating undocumented parser quirks.
+use `manifest.yml`; DDGo requires the latter exactly. Standard YAML is always
+parsed first with YAML v3. When that strict parse fails, DDGo has a bounded,
+line-aware fallback for a small set of observed historic DDCut conventions:
+
+- literal `step_markdown: |` content that starts at column zero, ending only at
+  a following correctly indented recognized step field;
+- tabs on otherwise blank or comment-only lines;
+- unquoted colon-space text in the documented human-text fields (`job_name`,
+  `job_text`, `step_name`, `step_text`, popup text/title, and the WCS failure
+  message); and
+- an extra space after a sequence marker on a mapping item.
+
+The fallback is not a permissive YAML replacement. It rejects tabs used for
+actual YAML indentation, leaves resource paths and numeric fields alone, and
+returns an error when it cannot produce one strict YAML document. Recovered
+manifests receive concise nonfatal compatibility diagnostics. The archive's
+original manifest bytes are never rewritten; only a bounded in-memory parsing
+buffer is supplied to YAML v3 after strict decoding failed. Root manifests and
+submanifests use the same policy and remain subject to the existing manifest,
+resource, archive, inclusion-depth, and expanded-step limits.
+
+Initial loader development had no real-world fixtures and therefore used only
+synthetic archives. A later compatibility investigation validated manifest
+structure against one locally supplied legacy package; this does not claim
+universal compatibility with every historic `.dd` dialect or archive layout.
+The legacy C++ parser has custom YAML behavior; DDGo intentionally recognizes
+only the documented deviations above rather than emulating arbitrary malformed
+syntax.
 
 Reference material reviewed: [DDCutPublic](https://github.com/Defdist/DDCutPublic)
 (`Archive`, `Manifest`, `Job`, `Operation`, and `DDFile`) and the
