@@ -122,11 +122,13 @@ standard-YAML document with an explicit sequence root.
 DDGo now presents a loaded package as one first-class package
 document. It browses manifest-order jobs and steps, preserves text/Markdown,
 shows bounded in-memory images when Qt can decode them, lists resource
-references and complete path/field/message loader diagnostics, and can open a supplementary source-only
-G-code view for any `step_gcode`. These views use the retained archive snapshot
-without extracting resources, are keyed by package document/job/step identity,
-and provide Back to Package navigation. Closing an auxiliary view does not
-close the package; accepted package closure closes its auxiliary views.
+references and complete path/field/message loader diagnostics, and can open a
+supplementary G-code view for any `step_gcode`. These views use the retained
+archive snapshot without extracting resources, provide read-only source
+display plus execution controls, progress, and status for their associated
+step session, and provide Back to Package navigation. Closing an auxiliary
+view does not close the package; accepted package closure closes its auxiliary
+views.
 
 DDGo can manually run one step containing valid G-code from either the package
 window or that step's auxiliary view. This is an exact package-document,

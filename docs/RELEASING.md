@@ -101,7 +101,7 @@ The universal macOS app is built by packaging separate `arm64` and `x86_64` app 
 DDGo Windows releases target Windows 10 or later on 64-bit/x64-compatible systems. Windows 7 and Windows 8/8.1 are unsupported. The installer enforces this support floor with Inno Setup `MinVersion=10.0`, and Windows release artifacts are amd64/x64-compatible. The portable ZIP has the same operating-system requirement; extracting it on an older Windows version does not make that version supported.
 
 1. Install packages in an MSYS2 MINGW64 shell:
-   `pacman -S --needed mingw-w64-x86_64-go mingw-w64-x86_64-gcc mingw-w64-x86_64-qt5-base mingw-w64-x86_64-pkgconf zip`
+   `pacman -S --needed mingw-w64-x86_64-go mingw-w64-x86_64-gcc mingw-w64-x86_64-qt6-base mingw-w64-x86_64-pkgconf zip`
 2. Build executable in that shell:
    `GOOS=windows GOARCH=amd64 CGO_ENABLED=1 go build -tags 'miqt serial' -ldflags '-s -w -H windowsgui' -o dist/ddgo-windows-amd64.exe ./cmd/ddgo`
 3. Stage Windows app with runtime DLLs:
