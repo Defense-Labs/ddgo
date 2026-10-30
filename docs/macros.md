@@ -55,9 +55,10 @@ M101 G54X G55X 0.001
 
 ```gcode
 M102 <destination-WCS-axis> = <expression>
+M102 <destination-WCS-axis> <expression>
 ```
 
-`M102` evaluates a finite arithmetic expression and writes the result to the explicit destination WCS axis through the runtime WCS writer. The handler does not verify writeback. Expressions support numeric literals, process-local variables, compact WCS-axis references such as `G54Z`, unary `+`/`-`, `+`, `-`, `*`, `/`, and parentheses. WCS offsets are read through `$#` only when the expression references a WCS value. Inside M102/M106 expressions, WCS-axis references must use compact form such as `G54Z`; spaced forms such as `G54 Z` and `WCS G54 Z` are not expression syntax.
+`M102` evaluates a finite arithmetic expression and writes the result to the explicit destination WCS axis through the runtime WCS writer. The equals sign is optional for compatibility with legacy G-code; the destination and expression must still be separated by whitespace when `=` is omitted. The handler does not verify writeback. Expressions support numeric literals, process-local variables, compact WCS-axis references such as `G54Z`, unary `+`/`-`, `+`, `-`, `*`, `/`, and parentheses. WCS offsets are read through `$#` only when the expression references a WCS value. Inside M102/M106 expressions, WCS-axis references must use compact form such as `G54Z`; spaced forms such as `G54 Z` and `WCS G54 Z` are not expression syntax.
 
 Examples:
 
@@ -65,6 +66,7 @@ Examples:
 M102 G54Z = (G55Z + G56Z) / 2
 M102 G54X = depth + 0.125
 M102 G55Y = -1.25 * 2
+M102 G54Y ((G54Y+G55Y)/2)
 ```
 
 ### `M106` — assert a numeric comparison

@@ -90,22 +90,14 @@ func handleM101(ctx context.Context, runtime Runtime, inv Invocation) error {
 }
 
 func handleM102(ctx context.Context, runtime Runtime, inv Invocation) error {
-	parts := strings.SplitN(inv.RawArgs, "=", 2)
-	if len(parts) != 2 {
-		if strings.TrimSpace(inv.RawArgs) == "" {
-			return fmt.Errorf("missing destination WCS axis")
-		}
-		return fmt.Errorf("missing expression")
-	}
-	destText := strings.TrimSpace(parts[0])
-	if destText == "" {
-		return fmt.Errorf("missing destination WCS axis")
+	destText, expr, err := parseM102Arguments(inv.RawArgs)
+	if err != nil {
+		return err
 	}
 	dest, err := ParseWCSAxisRef(destText)
 	if err != nil {
 		return err
 	}
-	expr := strings.TrimSpace(parts[1])
 	if expr == "" {
 		return fmt.Errorf("missing expression")
 	}
@@ -125,6 +117,56 @@ func handleM102(ctx context.Context, runtime Runtime, inv Invocation) error {
 		return fmt.Errorf("non-finite expression result")
 	}
 	return runtime.WriteWCSOffset(ctx, dest.WCS, dest.Axis, value)
+}
+
+// parseM102Arguments accepts the historic whitespace-separated assignment
+// form as well as the explicit equals-sign form. The no-equals form consumes
+// only a complete destination reference accepted by ParseWCSAxisRef, leaving
+// all remaining fields for the arithmetic evaluator.
+func parseM102Arguments(raw string) (destination, expression string, err error) {
+	args := strings.TrimSpace(raw)
+	if args == "" {
+		return "", "", fmt.Errorf("missing destination WCS axis")
+	}
+	if destination, expression, found := strings.Cut(args, "="); found {
+		destination = strings.TrimSpace(destination)
+		if destination == "" {
+			return "", "", fmt.Errorf("missing destination WCS axis")
+		}
+		return destination, strings.TrimSpace(expression), nil
+	}
+
+	fields := strings.Fields(args)
+	if len(fields) == 0 {
+		return "", "", fmt.Errorf("missing destination WCS axis")
+	}
+	destinationFields := 1
+	if strings.EqualFold(fields[0], "WCS") {
+		// ParseWCSAxisRef supports both "WCS G54Y" and "WCS G54 Y".
+		if len(fields) > 1 {
+			if _, parseErr := ParseWCSAxisRef(strings.Join(fields[:2], " ")); parseErr == nil {
+				destinationFields = 2
+			} else {
+				destinationFields = 3
+			}
+		}
+	} else if isBareM102WCS(fields[0]) {
+		// ParseWCSAxisRef also supports the spaced destination form "G54 Y".
+		destinationFields = 2
+	}
+	if destinationFields > len(fields) {
+		destinationFields = len(fields)
+	}
+	destination = strings.Join(fields[:destinationFields], " ")
+	if destinationFields < len(fields) {
+		expression = strings.Join(fields[destinationFields:], " ")
+	}
+	return destination, expression, nil
+}
+
+func isBareM102WCS(value string) bool {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	return len(value) == 3 && value[0] == 'G' && value[1] == '5' && value[2] >= '4' && value[2] <= '9'
 }
 
 func handleM106(ctx context.Context, runtime Runtime, inv Invocation) error {

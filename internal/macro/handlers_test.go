@@ -343,6 +343,42 @@ func TestM102WritesExpressions(t *testing.T) {
 	}
 }
 
+func TestM102LegacySyntaxThroughGCodeParse(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		command string
+		value   float64
+		reads   int
+	}{
+		{"equals", "M102 G54Y = ((G54Y+G55Y)/2)", 20, 1},
+		{"reported legacy form", "M102 G54Y ((G54Y+G55Y)/2)", 20, 1},
+		{"legacy spaced arithmetic", "M102 G54Y (G54Y + G55Y) / 2", 20, 1},
+		{"equals spaced arithmetic", "M102 G54Y = (G54Y + G55Y) / 2", 20, 1},
+		{"legacy literal expression", "M102 G54Y 1 + 2", 3, 0},
+		{"legacy additional whitespace", "M102    G54Y    1 + 2", 3, 0},
+		{"legacy spaced destination", "M102 G54 Y 1 + 2", 3, 0},
+		{"legacy WCS destination", "M102 WCS G54 Y 1 + 2", 3, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			lines, err := gcode.Parse(tt.command)
+			if err != nil || len(lines) != 1 {
+				t.Fatalf("gcode.Parse(%q) = %#v, %v", tt.command, lines, err)
+			}
+			rt := &fakeRuntime{offsets: WCSOffsets{"G54": {Y: 10}, "G55": {Y: 30}}}
+			handled, err := NewDefaultEngine().Dispatch(context.Background(), rt, lines[0])
+			if err != nil || !handled {
+				t.Fatalf("Dispatch(%q) handled=%v err=%v", tt.command, handled, err)
+			}
+			if rt.readWCS != tt.reads {
+				t.Fatalf("ReadWCSOffsets(%q) = %d, want %d", tt.command, rt.readWCS, tt.reads)
+			}
+			if len(rt.writes) != 1 || rt.writes[0] != (wcsWrite{wcs: "G54", axis: AxisY, value: tt.value}) {
+				t.Fatalf("writes(%q) = %#v", tt.command, rt.writes)
+			}
+		})
+	}
+}
+
 func TestM102VariableContainingWCSSubstringDoesNotReadWCS(t *testing.T) {
 	rt := &fakeRuntime{}
 	rt.Variables().Set("depthG54Z", 2)
@@ -366,6 +402,9 @@ func TestM102Errors(t *testing.T) {
 	for _, tt := range []struct{ line, want string }{
 		{"M102", "missing destination WCS axis"}, {"M102 G54Z", "missing expression"}, {"M102 G60Z = 1", "unsupported WCS"},
 		{"M102 G54Z =", "missing expression"}, {"M102 G54Z = 1 / 0", "division by zero"}, {"M102 G54Z = missing", "unknown variable"}, {"M102 G54Z = 1e309", "non-finite"},
+		{"M102 G54A 1", "unsupported WCS axis"}, {"M102 G60Z 1", "unsupported WCS"}, {"M102 G54Z 1 + * 2", "unexpected token"},
+		{"M102 G54Z (1 + 2", "missing closing parenthesis"}, {"M102 G54Z 1 / 0", "division by zero"}, {"M102 G54Z missing", "unknown variable"},
+		{"M102 G54Z 1 2", "unexpected token"},
 	} {
 		_, err := NewDefaultEngine().Dispatch(context.Background(), &fakeRuntime{}, gcode.Line{Raw: tt.line, Text: tt.line})
 		if err == nil || !strings.Contains(err.Error(), tt.want) {
