@@ -18,6 +18,66 @@ expect_resolves() {
     fail "expected dependency to resolve: $dependency"
 }
 
+validate_qt_environment() {
+  local environment_file="$1"
+  local expected_pc_dir="$2"
+  local expected_source="$3"
+  local expected_version="$4"
+  local line
+  local actual_pc_dir=""
+  local actual_source=""
+  local actual_version=""
+  local actual_pc_dir_canonical=""
+  local expected_pc_dir_canonical=""
+  local pc_dir_count=0
+  local source_count=0
+  local version_count=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      QT_PKG_CONFIG_DIR=*)
+        pc_dir_count=$((pc_dir_count + 1))
+        actual_pc_dir="${line#QT_PKG_CONFIG_DIR=}"
+        ;;
+      QT_PKG_CONFIG_SOURCE=*)
+        source_count=$((source_count + 1))
+        actual_source="${line#QT_PKG_CONFIG_SOURCE=}"
+        ;;
+      QT_VERSION=*)
+        version_count=$((version_count + 1))
+        actual_version="${line#QT_VERSION=}"
+        ;;
+      *)
+        echo "expected only machine-readable Qt environment keys; unexpected stdout: $line" >&2
+        cat "$environment_file" >&2
+        fail "Qt configuration stdout contract changed"
+        ;;
+    esac
+  done < "$environment_file"
+
+  if [[ $pc_dir_count -ne 1 || $source_count -ne 1 || $version_count -ne 1 ]]; then
+    echo "expected one QT_PKG_CONFIG_DIR, QT_PKG_CONFIG_SOURCE, and QT_VERSION entry" >&2
+    cat "$environment_file" >&2
+    fail "Qt configuration stdout contract changed"
+  fi
+  if [[ ! -d "$actual_pc_dir" ]]; then
+    echo "Qt configuration reported a nonexistent QT_PKG_CONFIG_DIR: $actual_pc_dir" >&2
+    cat "$environment_file" >&2
+    fail "Qt configuration stdout contract changed"
+  fi
+  expected_pc_dir_canonical="$(cd "$expected_pc_dir" && pwd -P)"
+  actual_pc_dir_canonical="$(cd "$actual_pc_dir" && pwd -P)"
+  if [[ "$actual_pc_dir_canonical" != "$expected_pc_dir_canonical" || "$actual_source" != "$expected_source" || "$actual_version" != "$expected_version" ]]; then
+    echo "expected QT_PKG_CONFIG_DIR=$expected_pc_dir_canonical" >&2
+    echo "actual QT_PKG_CONFIG_DIR=$actual_pc_dir (canonical: $actual_pc_dir_canonical)" >&2
+    echo "expected QT_PKG_CONFIG_SOURCE=$expected_source; actual=$actual_source" >&2
+    echo "expected QT_VERSION=$expected_version; actual=$actual_version" >&2
+    echo "complete Qt configuration stdout:" >&2
+    cat "$environment_file" >&2
+    fail "Qt configuration stdout contract changed"
+  fi
+}
+
 # Exercise the shared load-command and rpath parsers without requiring macOS
 # tools. Real bundle verification still uses the runner's otool output.
 otool() {
@@ -53,7 +113,9 @@ fi
 unset -f otool
 
 tmpdir="$(mktemp -d)"
+tmpdir="$(cd "$tmpdir" && pwd -P)"
 cleanup() {
+  rm -f "${tmpdir_link:-}"
   rm -rf "$tmpdir"
 }
 trap cleanup EXIT
@@ -173,15 +235,31 @@ if ! PATH="$tmpdir/fake-bin:$PATH" bash "$repo_root/scripts/configure-macos-qt.s
   cat "$qt_diagnostics" >&2
   fail "Qt configuration helper rejected valid Qt framework fixture"
 fi
-grep -qx "QT_PKG_CONFIG_DIR=$generated_pc_dir" "$qt_environment" || fail "Qt configuration stdout contract changed"
-grep -qx 'QT_PKG_CONFIG_SOURCE=generated' "$qt_environment" || fail "Qt configuration did not generate fallback metadata"
-grep -qx 'QT_VERSION=6.12.0' "$qt_environment" || fail "Qt configuration reported an incorrect version"
+validate_qt_environment "$qt_environment" "$generated_pc_dir" generated 6.12.0
 for framework_name in QtCore QtGui QtWidgets; do
   module="Qt6${framework_name#Qt}"
   pc_file="$generated_pc_dir/$module.pc"
   grep -Fq "$framework_name.framework/Headers" "$pc_file" || fail "$module metadata used the wrong framework headers"
   grep -Fq -- "-framework $framework_name" "$pc_file" || fail "$module metadata used the wrong framework linker flag"
 done
+
+# The helper accepts a valid fixture through a symlink, but returns a canonical
+# metadata path. This covers macOS /var-to-/private/var path normalization.
+tmpdir_link="${tmpdir}-link"
+ln -s "$tmpdir" "$tmpdir_link"
+symlinked_environment="$tmpdir/symlinked-qt-environment"
+symlinked_pc_dir="$tmpdir_link/symlinked-generated-pc"
+if ! PATH="$tmpdir/fake-bin:$PATH" bash "$repo_root/scripts/configure-macos-qt.sh" "$tmpdir_link/qt" 6.12.0 "$symlinked_pc_dir" > "$symlinked_environment" 2> "$tmpdir/symlinked-qt-diagnostics"; then
+  cat "$tmpdir/symlinked-qt-diagnostics" >&2
+  fail "Qt configuration helper rejected a symlinked valid Qt fixture"
+fi
+validate_qt_environment "$symlinked_environment" "$tmpdir/symlinked-generated-pc" generated 6.12.0
+
+if PATH="$tmpdir/fake-bin:$PATH" bash "$repo_root/scripts/configure-macos-qt.sh" "$tmpdir/missing-qt" 6.12.0 "$tmpdir/missing-pc" > "$tmpdir/missing-environment" 2> "$tmpdir/missing-diagnostics"; then
+  fail "Qt configuration accepted a nonexistent Qt root"
+fi
+grep -Fq 'Qt root does not exist or is not a directory' "$tmpdir/missing-diagnostics" ||
+  fail "nonexistent Qt root diagnostic was not actionable"
 
 # A Core.framework lookalike must not satisfy Qt6Core's QtCore.framework
 # requirement. The helper's stderr remains visible even when stdout is used as
