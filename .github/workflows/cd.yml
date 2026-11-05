@@ -109,8 +109,6 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Run macOS toolchain static regressions
-        run: bash scripts/test-macos-toolchain.sh
       - name: Diagnose macOS runner
         run: |
           set -euo pipefail
@@ -126,6 +124,8 @@ jobs:
         run: |
           set -euo pipefail
           brew install pkgconf
+      - name: Run macOS toolchain static regressions
+        run: bash scripts/test-macos-toolchain.sh
       - name: Install pinned Qt distribution
         shell: bash
         run: |

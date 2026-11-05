@@ -128,4 +128,71 @@ for required in "go.mod" "go.sum" "configure-macos-qt.sh" 'steps.setup-go.output
   [[ "$cache_line" == *"$required"* ]] || fail "macOS build-cache key is missing $required"
 done
 
+# Run the actual Qt configuration helper against a lightweight fake qmake
+# installation. This validates framework naming and generated metadata without
+# claiming to validate real macOS linking.
+command -v pkg-config >/dev/null || fail "pkg-config is required for Qt configuration regression coverage"
+qt_fixture="$tmpdir/qt"
+for framework_name in QtCore QtGui QtWidgets; do
+  mkdir -p "$qt_fixture/lib/$framework_name.framework/Headers"
+  : > "$qt_fixture/lib/$framework_name.framework/$framework_name"
+done
+mkdir -p "$qt_fixture/bin" "$qt_fixture/include" "$qt_fixture/archdata/mkspecs" "$tmpdir/fake-bin"
+cat > "$qt_fixture/bin/qmake" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+qt_root="$(cd "$(dirname "$0")/.." && pwd -P)"
+[[ "$1" == "-query" ]] || exit 2
+case "$2" in
+  QT_VERSION) printf '%s\n' '6.12.0' ;;
+  QT_INSTALL_LIBS) printf '%s\n' "$qt_root/lib" ;;
+  QT_INSTALL_HEADERS) printf '%s\n' "$qt_root/include" ;;
+  QT_INSTALL_ARCHDATA) printf '%s\n' "$qt_root/archdata" ;;
+  *) exit 3 ;;
+esac
+EOF
+cat > "$qt_fixture/bin/macdeployqt" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > "$tmpdir/fake-bin/uname" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "-s" ]]; then
+  printf '%s\n' Darwin
+  exit 0
+fi
+exec /usr/bin/uname "$@"
+EOF
+chmod +x "$qt_fixture/bin/qmake" "$qt_fixture/bin/macdeployqt" "$tmpdir/fake-bin/uname"
+
+qt_environment="$tmpdir/qt-environment"
+qt_diagnostics="$tmpdir/qt-diagnostics"
+generated_pc_dir="$tmpdir/generated-pc"
+if ! PATH="$tmpdir/fake-bin:$PATH" bash "$repo_root/scripts/configure-macos-qt.sh" "$qt_fixture" 6.12.0 "$generated_pc_dir" > "$qt_environment" 2> "$qt_diagnostics"; then
+  cat "$qt_diagnostics" >&2
+  fail "Qt configuration helper rejected valid Qt framework fixture"
+fi
+grep -qx "QT_PKG_CONFIG_DIR=$generated_pc_dir" "$qt_environment" || fail "Qt configuration stdout contract changed"
+grep -qx 'QT_PKG_CONFIG_SOURCE=generated' "$qt_environment" || fail "Qt configuration did not generate fallback metadata"
+grep -qx 'QT_VERSION=6.12.0' "$qt_environment" || fail "Qt configuration reported an incorrect version"
+for framework_name in QtCore QtGui QtWidgets; do
+  module="Qt6${framework_name#Qt}"
+  pc_file="$generated_pc_dir/$module.pc"
+  grep -Fq "$framework_name.framework/Headers" "$pc_file" || fail "$module metadata used the wrong framework headers"
+  grep -Fq -- "-framework $framework_name" "$pc_file" || fail "$module metadata used the wrong framework linker flag"
+done
+
+# A Core.framework lookalike must not satisfy Qt6Core's QtCore.framework
+# requirement. The helper's stderr remains visible even when stdout is used as
+# a machine-readable environment file.
+mv "$qt_fixture/lib/QtCore.framework" "$qt_fixture/lib/QtCore.framework.missing"
+mkdir -p "$qt_fixture/lib/Core.framework/Headers"
+: > "$qt_fixture/lib/Core.framework/Core"
+if PATH="$tmpdir/fake-bin:$PATH" bash "$repo_root/scripts/configure-macos-qt.sh" "$qt_fixture" 6.12.0 "$tmpdir/invalid-pc" > "$tmpdir/invalid-environment" 2> "$tmpdir/invalid-diagnostics"; then
+  fail "Qt configuration accepted Core.framework as Qt6Core"
+fi
+grep -Fq 'missing required framework headers for Qt6Core (QtCore)' "$tmpdir/invalid-diagnostics" ||
+  fail "missing framework diagnostic was not actionable"
+
 echo "macOS toolchain static regression checks passed"
