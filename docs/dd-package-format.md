@@ -104,6 +104,15 @@ manifests and submanifests use the same policy and remain subject to the
 existing manifest, resource, archive, inclusion-depth, and expanded-step
 limits.
 
+Internally, all compatibility adjustments use one normalization pipeline: a
+line scanner retains original source lines, a small structural context tracks
+job, step, metadata, and scalar relationships, rule handlers make only the
+documented adjustments, and one bounded emitter creates the temporary YAML.
+This keeps diagnostics tied to original source lines and ensures a fallback
+result still requires YAML v3 validation. Generalized recovery of inconsistent
+YAML indentation is not implemented yet; ambiguous indentation remains an
+error rather than being guessed.
+
 Initial loader development had no real-world fixtures and therefore used only
 synthetic archives. A later compatibility investigation validated manifest
 structure against one locally supplied legacy package; this does not claim

@@ -6,163 +6,396 @@ import (
 	"strings"
 )
 
-// legacyManifestCompatibility performs the deliberately small fallback used
-// for historic DDCut manifests. It never changes archive bytes: the returned
-// buffer is only passed to yaml.v3 after strict parsing has already failed.
-func legacyManifestCompatibility(data []byte, source string, manifestLimit int64) ([]byte, []Diagnostic, bool, error) {
+// legacyNormalizationResult is the one internal result of compatibility
+// recovery. YAML remains subject to yaml.v3 parsing after normalization.
+type legacyNormalizationResult struct {
+	YAML        []byte
+	Changed     bool
+	Diagnostics []Diagnostic
+}
+
+type legacyLineKind uint8
+
+const (
+	legacyLinePlain legacyLineKind = iota
+	legacyLineBlank
+	legacyLineComment
+	legacyLineMapping
+	legacyLineSequenceMapping
+)
+
+// legacyManifestLine retains source text and a separately normalized working
+// value. Candidate fields are not structural facts until the context confirms
+// the line is outside a literal scalar body.
+type legacyManifestLine struct {
+	Number          int
+	Original        string
+	Content         string
+	LeadingSpaces   int
+	Blank           bool
+	Comment         bool
+	Kind            legacyLineKind
+	Field           legacyManifestField
+	HasCandidateMap bool
+	BlockHeader     bool
+}
+
+func scanLegacyManifest(data []byte) []legacyManifestLine {
+	source := string(data)
+	// Keep slices into one source string rather than a second full []string
+	// split buffer. The record count and all retained text are therefore linear
+	// in the manifest bytes already admitted by the loader.
+	lines := make([]legacyManifestLine, 0)
+	lineNumber := 1
+	for start := 0; ; {
+		end := strings.IndexByte(source[start:], '\n')
+		if end < 0 {
+			lines = append(lines, scanLegacyManifestLine(lineNumber, source[start:], source[start:]))
+			return lines
+		}
+		end += start
+		lines = append(lines, scanLegacyManifestLine(lineNumber, source[start:end], source[start:end]))
+		lineNumber++
+		start = end + 1
+	}
+}
+
+func scanLegacyManifestLine(number int, original, content string) legacyManifestLine {
+	trimmed := strings.TrimSpace(content)
+	line := legacyManifestLine{
+		Number:        number,
+		Original:      original,
+		Content:       content,
+		LeadingSpaces: leadingSpaces(content),
+	}
+	switch {
+	case trimmed == "":
+		line.Blank, line.Kind = true, legacyLineBlank
+	case strings.HasPrefix(trimmed, "#"):
+		line.Comment, line.Kind = true, legacyLineComment
+	case func() bool {
+		field, ok := legacyField(content)
+		line.Field, line.HasCandidateMap = field, ok
+		line.BlockHeader = ok && !field.list && isLiteralHeader(field.value)
+		return ok
+	}():
+		if line.Field.list {
+			line.Kind = legacyLineSequenceMapping
+		} else {
+			line.Kind = legacyLineMapping
+		}
+	default:
+		line.Kind = legacyLinePlain
+	}
+	return line
+}
+
+func (line legacyManifestLine) withContent(content string) legacyManifestLine {
+	return scanLegacyManifestLine(line.Number, line.Original, content)
+}
+
+// legacyNormalizationContext records only the local structure needed by the
+// current rules. It intentionally retains parent indentation instead of a
+// global width so a future indentation rule can reason about actual parents.
+type legacyNormalizationContext struct {
+	rootJobIndent  int
+	jobIndent      int
+	jobFieldIndent int
+	stepListIndent int
+	stepIndent     int
+	literalIndent  int
+	markdown       *legacyMarkdownRecovery
+}
+
+type legacyMarkdownRecovery struct {
+	headerIndent   int
+	jobFieldIndent int
+}
+
+func newLegacyNormalizationContext() legacyNormalizationContext {
+	return legacyNormalizationContext{
+		rootJobIndent:  -1,
+		jobIndent:      -1,
+		jobFieldIndent: -1,
+		stepListIndent: -1,
+		stepIndent:     -1,
+		literalIndent:  -1,
+	}
+}
+
+type legacyNormalizationActions struct {
+	markdownLines   []int
+	colonLines      []int
+	whitespaceLines []int
+}
+
+// legacyOutputEmitter is the sole normalized-buffer constructor. It enforces
+// the two-times-manifest limit before every transformed line is allocated.
+type legacyOutputEmitter struct {
+	source      string
+	limit       int64
+	buffer      strings.Builder
+	size        int64
+	firstOutput bool
+}
+
+func newLegacyOutputEmitter(source string, inputSize int, limit int64) *legacyOutputEmitter {
+	capacity := inputSize
+	if int64(capacity) > limit {
+		capacity = int(limit)
+	}
+	emitter := &legacyOutputEmitter{source: source, limit: limit, firstOutput: true}
+	emitter.buffer.Grow(capacity)
+	return emitter
+}
+
+func (e *legacyOutputEmitter) check(length int, sourceLine int) error {
+	contribution := int64(length)
+	if !e.firstOutput {
+		contribution++
+	}
+	if contribution < 0 || e.size > e.limit-contribution {
+		return fmt.Errorf("%s:%d: legacy normalization exceeded its %d-byte expansion limit", e.source, sourceLine, e.limit)
+	}
+	return nil
+}
+
+func (e *legacyOutputEmitter) emit(line legacyManifestLine, content string) error {
+	if err := e.check(len(content), line.Number); err != nil {
+		return err
+	}
+	if !e.firstOutput {
+		e.buffer.WriteByte('\n')
+		e.size++
+	}
+	e.buffer.WriteString(content)
+	e.size += int64(len(content))
+	e.firstOutput = false
+	return nil
+}
+
+func (e *legacyOutputEmitter) emitIndented(line legacyManifestLine, prefixLength int) error {
+	if prefixLength < 0 || len(line.Content) > math.MaxInt-prefixLength {
+		return fmt.Errorf("%s:%d: legacy normalization exceeded its %d-byte expansion limit", e.source, line.Number, e.limit)
+	}
+	lineLength := prefixLength + len(line.Content)
+	if err := e.check(lineLength, line.Number); err != nil {
+		return err
+	}
+	return e.emit(line, strings.Repeat(" ", prefixLength)+line.Content)
+}
+
+func (e *legacyOutputEmitter) bytes() []byte { return []byte(e.buffer.String()) }
+
+type legacyManifestNormalizer struct {
+	lines   []legacyManifestLine
+	context legacyNormalizationContext
+	emitter *legacyOutputEmitter
+	actions legacyNormalizationActions
+	changed bool
+}
+
+// normalizeLegacyManifest is the single compatibility normalization entry
+// point. Strict YAML parsing calls it only after yaml.v3 has rejected source.
+func normalizeLegacyManifest(data []byte, source string, manifestLimit int64) (legacyNormalizationResult, error) {
 	outputLimit, err := legacyCompatibilityOutputLimit(manifestLimit)
+	if err != nil {
+		return legacyNormalizationResult{}, err
+	}
+	normalizer := legacyManifestNormalizer{
+		lines:   scanLegacyManifest(data),
+		context: newLegacyNormalizationContext(),
+		emitter: newLegacyOutputEmitter(source, len(data), outputLimit),
+	}
+	if err := normalizer.normalize(); err != nil {
+		return legacyNormalizationResult{}, err
+	}
+	return legacyNormalizationResult{
+		YAML:        normalizer.emitter.bytes(),
+		Changed:     normalizer.changed,
+		Diagnostics: normalizer.diagnostics(source),
+	}, nil
+}
+
+func (n *legacyManifestNormalizer) normalize() error {
+	for index := 0; index < len(n.lines); {
+		line := n.lines[index]
+		if n.context.markdown != nil {
+			boundary, ambiguous := legacyMarkdownBoundary(line.Content, n.context.markdown.headerIndent, n.context.markdown.jobFieldIndent)
+			if ambiguous {
+				return fmt.Errorf("line %d is an ambiguous unindented Markdown boundary", line.Number)
+			}
+			if boundary {
+				n.context.markdown = nil
+				continue // Reconsider this line as document structure.
+			}
+			if err := n.emitter.emitIndented(line, n.context.markdown.headerIndent+2); err != nil {
+				return err
+			}
+			index++
+			continue
+		}
+		if n.context.literalIndent >= 0 {
+			if line.Blank || line.LeadingSpaces >= n.context.literalIndent {
+				if err := n.emitter.emit(line, line.Content); err != nil {
+					return err
+				}
+				index++
+				continue
+			}
+			n.context.literalIndent = -1
+		}
+
+		var err error
+		if line, err = n.normalizeWhitespace(line); err != nil {
+			return err
+		}
+		line = n.normalizeSequenceMarker(line)
+		if line.HasCandidateMap && !line.Field.list && line.Field.key == "step_markdown" && strings.TrimSpace(line.Field.value) == "|" {
+			if legacyMarkdownNeedsIndent(n.lines, index+1, line.Field.indent) {
+				if err := n.emitter.emit(line, line.Content); err != nil {
+					return err
+				}
+				n.context.markdown = &legacyMarkdownRecovery{headerIndent: line.Field.indent, jobFieldIndent: n.context.jobFieldIndent}
+				n.changed = true
+				n.actions.markdownLines = append(n.actions.markdownLines, line.Number)
+				index++
+				continue
+			}
+			if err := n.emitter.emit(line, line.Content); err != nil {
+				return err
+			}
+			n.context.literalIndent = literalContentIndent(n.lines, index+1, line.Field.indent)
+			index++
+			continue
+		}
+		if line, err = n.normalizeFreeText(line); err != nil {
+			return err
+		}
+		n.context.observe(line)
+		if line.BlockHeader {
+			n.context.literalIndent = literalContentIndent(n.lines, index+1, line.Field.indent)
+		}
+		if err := n.emitter.emit(line, line.Content); err != nil {
+			return err
+		}
+		index++
+	}
+	return nil
+}
+
+// observe centralizes the small amount of parent/child structure this phase
+// needs. It records observed indentation only; it deliberately does not try
+// to repair inconsistent indentation. A later rule can use these parent
+// relationships without adding another preprocessing pass.
+func (context *legacyNormalizationContext) observe(line legacyManifestLine) {
+	if !line.HasCandidateMap {
+		return
+	}
+	field := line.Field
+	if field.list && field.key == "job_name" {
+		context.rootJobIndent = field.indent
+		context.jobIndent = field.indent
+		context.stepListIndent = -1
+		context.stepIndent = -1
+		return
+	}
+	if !field.list && field.key == "job_steps" {
+		context.jobFieldIndent = field.indent
+		context.stepListIndent = -1
+		context.stepIndent = -1
+		return
+	}
+	if field.list && context.jobFieldIndent >= 0 && field.indent > context.jobFieldIndent {
+		context.stepListIndent = field.indent
+		context.stepIndent = field.indent
+		return
+	}
+	// Included manifests are root step sequences, so they have no enclosing
+	// job_steps field from which to infer their parent.
+	if field.list && field.key == "step_name" && context.jobFieldIndent < 0 {
+		context.stepListIndent = field.indent
+		context.stepIndent = field.indent
+	}
+}
+
+func (n *legacyManifestNormalizer) normalizeWhitespace(line legacyManifestLine) (legacyManifestLine, error) {
+	if !strings.ContainsRune(line.Content, '\t') {
+		return line, nil
+	}
+	trimmed := strings.TrimSpace(line.Content)
+	if trimmed == "" {
+		n.changed = true
+		n.actions.whitespaceLines = append(n.actions.whitespaceLines, line.Number)
+		return line.withContent(""), nil
+	}
+	if strings.HasPrefix(trimmed, "#") {
+		n.changed = true
+		n.actions.whitespaceLines = append(n.actions.whitespaceLines, line.Number)
+		return line.withContent(trimmed), nil
+	}
+	return legacyManifestLine{}, fmt.Errorf("line %d uses a tab in YAML content; only blank or comment-only tab lines are supported", line.Number)
+}
+
+func (n *legacyManifestNormalizer) normalizeSequenceMarker(line legacyManifestLine) legacyManifestLine {
+	if !line.HasCandidateMap || !line.Field.list {
+		return line
+	}
+	if normalized, did := normalizeLegacySequenceMarker(line.Content, line.Field.indent); did {
+		n.changed = true
+		return line.withContent(normalized)
+	}
+	return line
+}
+
+func (n *legacyManifestNormalizer) normalizeFreeText(line legacyManifestLine) (legacyManifestLine, error) {
+	if !line.HasCandidateMap || !legacyFreeTextField[line.Field.key] {
+		return line, nil
+	}
+	text, did := legacyFreeText(line.Field)
+	if !did {
+		return line, nil
+	}
+	length, err := text.rewrittenLength()
+	if err != nil {
+		return legacyManifestLine{}, err
+	}
+	if err := n.emitter.check(length, line.Number); err != nil {
+		return legacyManifestLine{}, err
+	}
+	n.changed = true
+	n.actions.colonLines = append(n.actions.colonLines, line.Number)
+	return line.withContent(text.rewrite()), nil
+}
+
+func (n *legacyManifestNormalizer) diagnostics(source string) []Diagnostic {
+	if !n.changed {
+		return nil
+	}
+	warnings := []Diagnostic{{Path: source, Message: "legacy manifest formatting was accepted"}}
+	if len(n.actions.markdownLines) != 0 {
+		warnings = append(warnings, Diagnostic{Path: source, Field: fmt.Sprintf("line %d", n.actions.markdownLines[0]), Message: "accepted legacy unindented Markdown block"})
+	}
+	if len(n.actions.colonLines) != 0 {
+		warnings = append(warnings, Diagnostic{Path: source, Field: fmt.Sprintf("line %d", n.actions.colonLines[0]), Message: "accepted unquoted free-text value containing a colon"})
+	}
+	if len(n.actions.whitespaceLines) != 0 {
+		warnings = append(warnings, Diagnostic{Path: source, Field: fmt.Sprintf("line %d", n.actions.whitespaceLines[0]), Message: "accepted tabs on blank or comment-only lines"})
+	}
+	return warnings
+}
+
+// legacyManifestCompatibility remains a narrow compatibility wrapper for
+// callers/tests that predate the unified result type.
+func legacyManifestCompatibility(data []byte, source string, manifestLimit int64) ([]byte, []Diagnostic, bool, error) {
+	result, err := normalizeLegacyManifest(data, source, manifestLimit)
 	if err != nil {
 		return nil, nil, false, err
 	}
-	lines := strings.Split(string(data), "\n")
-	var out strings.Builder
-	initialCapacity := len(data)
-	if int64(initialCapacity) > outputLimit {
-		initialCapacity = int(outputLimit)
-	}
-	out.Grow(initialCapacity)
-	var outputSize int64
-	firstOutputLine := true
-	appendLine := func(line string, sourceLine int) error {
-		contribution := int64(len(line))
-		if !firstOutputLine {
-			contribution++
-		}
-		if contribution < 0 || outputSize > outputLimit-contribution {
-			return fmt.Errorf("%s:%d: legacy normalization exceeded its %d-byte expansion limit", source, sourceLine, outputLimit)
-		}
-		if !firstOutputLine {
-			out.WriteByte('\n')
-		}
-		out.WriteString(line)
-		firstOutputLine = false
-		outputSize += contribution
-		return nil
-	}
-	var markdownLines, colonLines, whitespaceLines []int
-	changed := false
-	literalIndent := -1
-	jobFieldIndent := -1
-
-	for i := 0; i < len(lines); i++ {
-		line := lines[i]
-		if literalIndent >= 0 {
-			if strings.TrimSpace(line) == "" || leadingSpaces(line) >= literalIndent {
-				if err := appendLine(line, i+1); err != nil {
-					return nil, nil, false, err
-				}
-				continue
-			}
-			literalIndent = -1
-		}
-		if strings.ContainsRune(line, '\t') {
-			trimmed := strings.TrimSpace(line)
-			if trimmed == "" {
-				line = ""
-				changed = true
-				whitespaceLines = append(whitespaceLines, i+1)
-			} else if strings.HasPrefix(trimmed, "#") {
-				line = trimmed
-				changed = true
-				whitespaceLines = append(whitespaceLines, i+1)
-			} else {
-				return nil, nil, false, fmt.Errorf("line %d uses a tab in YAML content; only blank or comment-only tab lines are supported", i+1)
-			}
-		}
-
-		field, ok := legacyField(line)
-		if ok && field.list {
-			if normalized, did := normalizeLegacySequenceMarker(line, field.indent); did {
-				line = normalized
-				field, _ = legacyField(line)
-				changed = true
-			}
-		}
-		if ok && !field.list && field.key == "step_markdown" && strings.TrimSpace(field.value) == "|" {
-			if !legacyMarkdownNeedsIndent(lines, i+1, field.indent) {
-				if err := appendLine(line, i+1); err != nil {
-					return nil, nil, false, err
-				}
-				literalIndent = literalContentIndent(lines, i+1, field.indent)
-				continue
-			}
-			headerLine := i + 1
-			if err := appendLine(line, i+1); err != nil {
-				return nil, nil, false, err
-			}
-			headerIndent := field.indent
-			for i++; i < len(lines); i++ {
-				content := lines[i]
-				if strings.ContainsRune(content, '\t') {
-					// Markdown is literal content; a tab here is not YAML
-					// indentation and is intentionally preserved.
-				}
-				if boundary, ambiguous := legacyMarkdownBoundary(content, headerIndent, jobFieldIndent); boundary {
-					i-- // let normal field processing retain the boundary line.
-					break
-				} else if ambiguous {
-					return nil, nil, false, fmt.Errorf("line %d is an ambiguous unindented Markdown boundary", i+1)
-				}
-				prefixLength := headerIndent + 2
-				if prefixLength < 0 || len(content) > math.MaxInt-prefixLength {
-					return nil, nil, false, fmt.Errorf("%s:%d: legacy normalization exceeded its %d-byte expansion limit", source, i+1, outputLimit)
-				}
-				lineSize := int64(prefixLength)
-				if int64(len(content)) > math.MaxInt64-lineSize-1 {
-					return nil, nil, false, fmt.Errorf("%s:%d: legacy normalization exceeded its %d-byte expansion limit", source, i+1, outputLimit)
-				}
-				lineSize += int64(len(content)) + 1
-				if lineSize > outputLimit-outputSize {
-					return nil, nil, false, fmt.Errorf("%s:%d: legacy normalization exceeded its %d-byte expansion limit", source, i+1, outputLimit)
-				}
-				if err := appendLine(strings.Repeat(" ", prefixLength)+content, i+1); err != nil {
-					return nil, nil, false, err
-				}
-			}
-			changed = true
-			markdownLines = append(markdownLines, headerLine)
-			continue
-		}
-
-		if ok && legacyFreeTextField[field.key] {
-			if text, did := legacyFreeText(field); did {
-				rewrittenLength, lengthErr := text.rewrittenLength()
-				proposed := int64(rewrittenLength)
-				if !firstOutputLine {
-					proposed++
-				}
-				if lengthErr != nil || proposed < 0 || proposed > outputLimit-outputSize {
-					return nil, nil, false, fmt.Errorf("%s:%d: legacy normalization exceeded its %d-byte expansion limit", source, i+1, outputLimit)
-				}
-				line = text.rewrite()
-				changed = true
-				colonLines = append(colonLines, i+1)
-			}
-		}
-		if ok && !field.list && field.key == "job_steps" {
-			jobFieldIndent = field.indent
-		}
-		if ok && !field.list && isLiteralHeader(field.value) {
-			literalIndent = literalContentIndent(lines, i+1, field.indent)
-		}
-		if err := appendLine(line, i+1); err != nil {
-			return nil, nil, false, err
-		}
-	}
-	if !changed {
+	if !result.Changed {
 		return nil, nil, false, nil
 	}
-	warnings := []Diagnostic{{Path: source, Message: "legacy manifest formatting was accepted"}}
-	if len(markdownLines) != 0 {
-		warnings = append(warnings, Diagnostic{Path: source, Field: fmt.Sprintf("line %d", markdownLines[0]), Message: "accepted legacy unindented Markdown block"})
-	}
-	if len(colonLines) != 0 {
-		warnings = append(warnings, Diagnostic{Path: source, Field: fmt.Sprintf("line %d", colonLines[0]), Message: "accepted unquoted free-text value containing a colon"})
-	}
-	if len(whitespaceLines) != 0 {
-		warnings = append(warnings, Diagnostic{Path: source, Field: fmt.Sprintf("line %d", whitespaceLines[0]), Message: "accepted tabs on blank or comment-only lines"})
-	}
-	return []byte(out.String()), warnings, true, nil
+	return result.YAML, result.Diagnostics, true, nil
 }
 
 // legacyCompatibilityOutputLimit bounds the normalized in-memory buffer to
@@ -184,10 +417,10 @@ func leadingSpaces(line string) int {
 	return count
 }
 
-func literalContentIndent(lines []string, start, headerIndent int) int {
+func literalContentIndent(lines []legacyManifestLine, start, headerIndent int) int {
 	for i := start; i < len(lines); i++ {
-		if strings.TrimSpace(lines[i]) != "" {
-			return leadingSpaces(lines[i])
+		if !lines[i].Blank {
+			return lines[i].LeadingSpaces
 		}
 	}
 	return headerIndent + 1
@@ -202,16 +435,12 @@ func isLiteralHeader(value string) bool {
 // body from a normal YAML literal block. A fallback triggered by some other
 // legacy convention must leave correctly indented Markdown byte-for-byte in
 // its YAML representation.
-func legacyMarkdownNeedsIndent(lines []string, start, headerIndent int) bool {
+func legacyMarkdownNeedsIndent(lines []legacyManifestLine, start, headerIndent int) bool {
 	for i := start; i < len(lines); i++ {
-		if strings.TrimSpace(lines[i]) == "" {
+		if lines[i].Blank {
 			continue
 		}
-		indent := 0
-		for indent < len(lines[i]) && lines[i][indent] == ' ' {
-			indent++
-		}
-		return indent < headerIndent+2
+		return lines[i].LeadingSpaces < headerIndent+2
 	}
 	return false
 }

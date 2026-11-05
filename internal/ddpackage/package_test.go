@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 type zipEntry struct {
@@ -258,6 +260,79 @@ func TestLoadStrictManifestDoesNotEmitCompatibilityWarning(t *testing.T) {
 	}
 	if len(pkg.Warnings) != 0 || pkg.Jobs[0].Steps[0].Markdown != "First paragraph.\n\nSecond paragraph.\n" || pkg.Jobs[0].Text != "Note: quoted" {
 		t.Fatalf("strict manifest changed or warned: %+v / %+v", pkg, pkg.Warnings)
+	}
+}
+
+func TestLegacyNormalizerLeavesStrictYAMLUnchanged(t *testing.T) {
+	manifest := []byte(`- job_name: "Strict: package"
+  job_steps:
+    - step_name: Instructions
+      step_markdown: |
+        step_text: Markdown, not metadata.
+      step_text: "Note: quoted text"
+`)
+	result, err := normalizeLegacyManifest(manifest, "strict.yml", DefaultLimits().MaxManifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Changed || len(result.Diagnostics) != 0 || string(result.YAML) != string(manifest) {
+		t.Fatalf("strict normalization = %+v, YAML %q", result, result.YAML)
+	}
+	root, warnings, err := decodeYAML(manifest, "strict.yml", DefaultLimits().MaxManifestBytes)
+	if err != nil || root.Kind != yaml.SequenceNode || len(warnings) != 0 {
+		t.Fatalf("decodeYAML(strict) = root=%v warnings=%+v err=%v", root, warnings, err)
+	}
+}
+
+func TestLegacyNormalizerIsDeterministicAndIdempotent(t *testing.T) {
+	manifest := []byte("- job_name: Legacy package\n" +
+		"  job_steps:\n" +
+		"    -  step_name: Instructions\n" +
+		"      step_markdown: |\n" +
+		"First paragraph.\n\n" +
+		"Second paragraph.\n" +
+		"      future_step_field: retained\n" +
+		"      step_text: Note: continue carefully.\n")
+	limit := DefaultLimits().MaxManifestBytes
+	first, err := normalizeLegacyManifest(manifest, "legacy.yml", limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Changed || len(first.Diagnostics) < 3 {
+		t.Fatalf("first normalization = %+v", first)
+	}
+	if first.Diagnostics[0].Path != "legacy.yml" || first.Diagnostics[1].Field != "line 4" || first.Diagnostics[2].Field != "line 9" {
+		t.Fatalf("normalization diagnostics lost source locations: %+v", first.Diagnostics)
+	}
+	if _, err := decodeYAMLStrict(first.YAML, "legacy.yml"); err != nil {
+		t.Fatalf("normalized YAML is invalid: %v\n%s", err, first.YAML)
+	}
+	second, err := normalizeLegacyManifest(first.YAML, "legacy.yml", limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Changed || len(second.Diagnostics) != 0 || string(second.YAML) != string(first.YAML) {
+		t.Fatalf("normalization was not idempotent: first=%q second=%q result=%+v", first.YAML, second.YAML, second)
+	}
+	again, err := normalizeLegacyManifest(manifest, "legacy.yml", limit)
+	if err != nil || string(again.YAML) != string(first.YAML) || len(again.Diagnostics) != len(first.Diagnostics) {
+		t.Fatalf("normalization was not deterministic: result=%+v err=%v", again, err)
+	}
+}
+
+func TestLegacyManifestScanRetainsSourceLines(t *testing.T) {
+	lines := scanLegacyManifest([]byte("\t # separator\n\t \n  -  step_name: Instructions\n"))
+	if len(lines) != 4 {
+		t.Fatalf("line count = %d, want 4", len(lines))
+	}
+	if lines[0].Number != 1 || lines[0].Original != "\t # separator" || !lines[0].Comment {
+		t.Fatalf("comment line = %+v", lines[0])
+	}
+	if lines[1].Number != 2 || !lines[1].Blank {
+		t.Fatalf("blank line = %+v", lines[1])
+	}
+	if lines[2].Number != 3 || lines[2].Kind != legacyLineSequenceMapping || !lines[2].HasCandidateMap || lines[2].Field.key != "step_name" || lines[2].Field.indent != 2 {
+		t.Fatalf("sequence mapping line = %+v", lines[2])
 	}
 }
 

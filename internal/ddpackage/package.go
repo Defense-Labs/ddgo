@@ -322,18 +322,18 @@ func decodeYAML(data []byte, source string, manifestLimit int64) (*yaml.Node, []
 	if err == nil {
 		return root, nil, nil
 	}
-	normalized, warnings, changed, compatibilityErr := legacyManifestCompatibility(data, source, manifestLimit)
+	normalization, compatibilityErr := normalizeLegacyManifest(data, source, manifestLimit)
 	if compatibilityErr != nil {
 		return nil, nil, fmt.Errorf("%v; legacy compatibility in %q failed: %w", err, source, compatibilityErr)
 	}
-	if !changed {
+	if !normalization.Changed {
 		return nil, nil, err
 	}
-	root, fallbackErr := decodeYAMLStrict(normalized, source)
+	root, fallbackErr := decodeYAMLStrict(normalization.YAML, source)
 	if fallbackErr != nil {
 		return nil, nil, fmt.Errorf("%v; legacy compatibility in %q did not produce valid YAML: %w", err, source, fallbackErr)
 	}
-	return root, warnings, nil
+	return root, normalization.Diagnostics, nil
 }
 
 func decodeYAMLStrict(data []byte, source string) (*yaml.Node, error) {
