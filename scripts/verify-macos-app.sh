@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$script_dir/macos-macho-deps.sh"
+
 if [[ $# -ne 3 ]]; then
   echo "usage: $0 <app-path> <expected-arch> <max-minos>" >&2
   exit 1
@@ -39,28 +42,16 @@ mark_fail() {
   fail=$((fail + 1))
 }
 
-list_loaded_dylibs() {
-  local f="$1"
-  otool -l "$f" | awk '
-    /cmd LC_LOAD_DYLIB|cmd LC_LOAD_WEAK_DYLIB|cmd LC_REEXPORT_DYLIB|cmd LC_LOAD_UPWARD_DYLIB/ {
-      in_load = 1
-      next
-    }
-    in_load && /name / {
-      print $2
-      in_load = 0
-      next
-    }
-    /cmd LC_/ {
-      in_load = 0
-    }
-  '
-}
-
 if [[ ! -d "$app" ]]; then
   echo "app bundle not found: $app" >&2
   exit 1
 fi
+
+while IFS= read -r -d '' link; do
+  if [[ ! -e "$link" ]]; then
+    mark_fail "dangling bundled symlink: $link"
+  fi
+done < <(find "$app/Contents" -type l -print0)
 if [[ ! -f "$plist" ]]; then
   mark_fail "missing Info.plist: $plist"
 fi
@@ -156,20 +147,27 @@ while IFS= read -r -d '' f; do
     fi
   fi
 
-  while IFS= read -r dep_path; do
+  while IFS='|' read -r load_command dep_path; do
     [[ -z "$dep_path" ]] && continue
-    case "$dep_path" in
-      @executable_path/*|@loader_path/*|@rpath/*|/System/Library/*|/usr/lib/*) ;;
-      /usr/local/*|/opt/homebrew/*)
-        status="fail"
-        mark_fail "unbundled Homebrew loaded dependency path in $f: $dep_path"
-        ;;
-      *)
-        status="fail"
-        mark_fail "disallowed loaded dependency path in $f: $dep_path"
-        ;;
-    esac
-  done < <(list_loaded_dylibs "$f")
+    if macos_is_system_dependency "$dep_path"; then
+      continue
+    fi
+    if macos_is_homebrew_dependency "$dep_path"; then
+      status="fail"
+      mark_fail "unbundled Homebrew loaded dependency path in $f: $dep_path"
+      continue
+    fi
+    if resolved_path="$(macos_resolve_dependency "$app" "$exe" "$f" "$dep_path")"; then
+      echo "resolved $load_command dependency: $dep_path -> $resolved_path"
+      continue
+    fi
+    if macos_is_weak_load_command "$load_command"; then
+      echo "WARN: unresolved weak dependency in $f: $dep_path"
+      continue
+    fi
+    status="fail"
+    mark_fail "unresolved required dependency in $f ($load_command): $dep_path"
+  done < <(macos_list_load_commands "$f")
 
   dep_str="${dep_targets[*]:-none}"
   dep_str="${dep_str// /,}"

@@ -86,6 +86,9 @@ while IFS= read -r rel; do
       exit 1
     fi
 
+    # -arch extracts the requested slice before creating the output, so this
+    # remains correct when official Qt supplies an already-universal framework
+    # binary. x86_64h is intentionally not substituted for x86_64.
     lipo -create -arch arm64 "$arm_file" -arch x86_64 "$amd_file" -output "$out_file"
     mode="$(stat -f '%Lp' "$arm_file")"
     chmod "$mode" "$out_file"

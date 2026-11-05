@@ -109,6 +109,8 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - name: Run macOS toolchain static regressions
+        run: bash scripts/test-macos-toolchain.sh
       - name: Diagnose macOS runner
         run: |
           set -euo pipefail
@@ -160,6 +162,7 @@ jobs:
             framework_binary="$qt_root/lib/$framework.framework/$framework"
             test -e "$framework_binary"
             framework_archs="$(lipo -archs "$framework_binary")"
+            echo "$framework_binary architectures: $framework_archs"
             if [[ " $framework_archs " != *" ${{ matrix.lipo_arch }} "* ]]; then
               echo "$framework_binary does not contain ${{ matrix.lipo_arch }}: $framework_archs" >&2
               exit 1
@@ -261,7 +264,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ steps.cache-context.outputs.go_build_cache }}
-          key: ddgo-macos-build-v2-${{ matrix.os }}-${{ matrix.arch }}-macos-${{ matrix.macos_min }}-go-${{ steps.setup-go.outputs.go-version }}-qt-${{ env.QT_VERSION }}-${{ env.QT_DISTRIBUTION }}-aqt-${{ env.AQTINSTALL_VERSION }}-sdk-${{ steps.cache-context.outputs.sdk_build }}-clang-${{ steps.cache-context.outputs.clang_identity }}-${{ hashFiles('go.mod', 'go.sum', '**/*.go', 'scripts/configure-macos-qt.sh') }}
+          key: ddgo-macos-build-v2-${{ matrix.os }}-${{ matrix.arch }}-macos-${{ matrix.macos_min }}-go-${{ steps.setup-go.outputs.go-version }}-qt-${{ env.QT_VERSION }}-${{ env.QT_DISTRIBUTION }}-aqt-${{ env.AQTINSTALL_VERSION }}-sdk-${{ steps.cache-context.outputs.sdk_build }}-clang-${{ steps.cache-context.outputs.clang_identity }}-${{ hashFiles('go.mod', 'go.sum', 'scripts/configure-macos-qt.sh') }}
       - name: Build macOS app binary
         run: |
           set -euxo pipefail

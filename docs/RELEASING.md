@@ -115,8 +115,13 @@ job environment in `.github/workflows/cd.yml`. Change them together, then run
 the macOS CD job: do not update either slice independently and do not add a
 Homebrew Qt fallback. The Go build-cache key includes the pinned distribution,
 installer version, deployment target, SDK build, compiler identity, and Go
-dependency/configuration hashes. Qt itself is deliberately not cached until
-the pinned installation path has proven reliable.
+dependency/configuration hashes. It intentionally does not include changing
+application source files: Go's build cache already validates source and build
+inputs within a compatible cache, while including every `*.go` file in an
+immutable Actions cache key would force an unnecessary cold CGO build for each
+ordinary edit. Packaging and verification scripts are likewise excluded unless
+they configure Qt compilation; Qt itself is deliberately not cached until the
+pinned installation path has proven reliable.
 
 1. Build `dist/macos-arm64/DDGo.app` on `macos-15`.
 2. Build `dist/macos-amd64/DDGo.app` on `macos-15-intel`.
@@ -137,6 +142,25 @@ verification scripts deliberately reject mismatched dependency inventories,
 missing Mach-O slices, external Homebrew load paths, unresolved non-system
 dependencies, or signing failures; matching version labels alone are not
 sufficient.
+
+Final-app verification statically resolves each required non-system Mach-O load
+command using the referencing binary's `@loader_path`, `@executable_path`, and
+the applicable direct `LC_RPATH` entries from that binary and the main
+executable. The resolved target must be a real file inside the bundle; dangling
+framework symlinks also fail verification. Legitimate system libraries remain
+permitted, and unresolved weak-linked dependencies are reported as warnings.
+This is intentionally not a complete dyld emulator: it does not prove
+runtime-only `dlopen` calls or every loader-chain search case.
+The normal `macdeployqt` layout is covered, including framework version
+directories and symlinks. The universal merger explicitly extracts arm64 from
+the Apple Silicon input and x86_64 from the Intel input, so universal Qt
+framework inputs are supported; `x86_64h` is not accepted as a substitute for
+the required `x86_64` slice.
+
+`scripts/test-macos-toolchain.sh` provides platform-independent regression
+coverage for cache-key composition and representative bundled dependency-path
+resolution. It complements, but does not replace, the real macOS CD build,
+packaging, dependency, signing, merge, and DMG verification.
 
 ## Windows (MSYS2 / MinGW)
 

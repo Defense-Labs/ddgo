@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$script_dir/macos-macho-deps.sh"
+
 if [[ $# -ne 3 ]]; then
   echo "usage: $0 <arm64-app> <amd64-app> <expected-qt-version>" >&2
   exit 1
@@ -39,31 +42,6 @@ list_macho_files() {
       fi
     done < <(find . -type f -print0)
   ) | sort
-}
-
-list_macho_dependency_inventory() {
-  local file="$1"
-  otool -l "$file" | awk '
-    /cmd LC_ID_DYLIB|cmd LC_LOAD_DYLIB|cmd LC_LOAD_WEAK_DYLIB|cmd LC_REEXPORT_DYLIB|cmd LC_LOAD_UPWARD_DYLIB/ {
-      in_load = 1
-      next
-    }
-    in_load && /name / {
-      print $2
-      in_load = 0
-      next
-    }
-    /cmd LC_/ { in_load = 0 }
-  ' | sort -u
-}
-
-list_rpaths() {
-  local file="$1"
-  otool -l "$file" | awk '
-    /cmd LC_RPATH/ { in_rpath = 1; next }
-    in_rpath && /path / { print $2; in_rpath = 0; next }
-    /cmd LC_/ { in_rpath = 0 }
-  ' | sort -u
 }
 
 for app in "$arm_app" "$amd_app"; do
@@ -123,11 +101,11 @@ while IFS= read -r rel; do
 
   arm_archs="$(lipo -archs "$arm_file")"
   amd_archs="$(lipo -archs "$amd_file")"
-  [[ " $arm_archs " == *" arm64 "* ]] || report "arm64 slice lacks arm64: $rel ($arm_archs)"
-  [[ " $amd_archs " == *" x86_64 "* ]] || report "amd64 slice lacks x86_64: $rel ($amd_archs)"
+  macos_has_arch "$arm_archs" arm64 || report "arm64 slice lacks arm64: $rel ($arm_archs)"
+  macos_has_arch "$amd_archs" x86_64 || report "amd64 slice lacks x86_64: $rel ($amd_archs)"
 
-  list_macho_dependency_inventory "$arm_file" > "$tmpdir/arm-deps.txt"
-  list_macho_dependency_inventory "$amd_file" > "$tmpdir/amd-deps.txt"
+  macos_list_dependency_inventory "$arm_file" > "$tmpdir/arm-deps.txt"
+  macos_list_dependency_inventory "$amd_file" > "$tmpdir/amd-deps.txt"
   if ! cmp -s "$tmpdir/arm-deps.txt" "$tmpdir/amd-deps.txt"; then
     report "Mach-O install-name/dependency inventory differs: $rel"
     if [[ $reported -le $max_reported ]]; then
@@ -135,8 +113,8 @@ while IFS= read -r rel; do
     fi
   fi
 
-  list_rpaths "$arm_file" > "$tmpdir/arm-rpaths.txt"
-  list_rpaths "$amd_file" > "$tmpdir/amd-rpaths.txt"
+  macos_list_rpaths "$arm_file" > "$tmpdir/arm-rpaths.txt"
+  macos_list_rpaths "$amd_file" > "$tmpdir/amd-rpaths.txt"
   if ! cmp -s "$tmpdir/arm-rpaths.txt" "$tmpdir/amd-rpaths.txt"; then
     report "runtime-search-path inventory differs: $rel"
     if [[ $reported -le $max_reported ]]; then
