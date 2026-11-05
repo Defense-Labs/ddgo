@@ -17,6 +17,13 @@ concurrency:
 permissions:
   contents: read
 
+# One shared macOS Qt toolchain identity for both matrix slices and the merge
+# job. Update these values together after validating a complete universal build.
+env:
+  QT_VERSION: "6.12.0"
+  AQTINSTALL_VERSION: "3.3.0"
+  QT_DISTRIBUTION: "qt-online-installer-via-aqtinstall"
+
 jobs:
   build-linux:
     runs-on: ubuntu-24.04
@@ -88,6 +95,8 @@ jobs:
             slice: amd64
             macos_min: "15.0"
     runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
     steps:
       - uses: actions/checkout@v6
       - name: Set up Go
@@ -96,6 +105,10 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+      - name: Set up pinned Qt installer Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
       - name: Diagnose macOS runner
         run: |
           set -euo pipefail
@@ -107,28 +120,109 @@ jobs:
           uname -m
           xcode-select -p
           clang --version
-          brew --version
-      - name: Install macOS dependencies
+      - name: Install macOS build utility
         run: |
           set -euo pipefail
-          brew install qt pkg-config
+          brew install pkgconf
+      - name: Install pinned Qt distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -m pip install --disable-pip-version-check "aqtinstall==${AQTINSTALL_VERSION}"
+          test "$(python -c 'import importlib.metadata; print(importlib.metadata.version("aqtinstall"))')" = "$AQTINSTALL_VERSION"
+
+          qt_download_root="$RUNNER_TEMP/qt"
+          rm -rf "$qt_download_root"
+          aqt install-qt -O "$qt_download_root" mac desktop "$QT_VERSION" clang_64
+
+          qmake_candidates=()
+          while IFS= read -r candidate; do
+            qmake_candidates+=("$candidate")
+          done < <(find "$qt_download_root/$QT_VERSION" -path '*/bin/qmake' -print | sort)
+          if [[ ${#qmake_candidates[@]} -ne 1 ]]; then
+            echo "expected exactly one qmake below $qt_download_root/$QT_VERSION, found ${#qmake_candidates[@]}" >&2
+            printf '%s\n' "${qmake_candidates[@]:-}" >&2
+            exit 1
+          fi
+          qt_root="$(cd "$(dirname "$(dirname "${qmake_candidates[0]}")")" && pwd -P)"
+          case "$qt_root" in
+            /opt/homebrew/*|/usr/local/*)
+              echo "pinned Qt unexpectedly resolved to Homebrew: $qt_root" >&2
+              exit 1
+              ;;
+          esac
+
+          test -x "$qt_root/bin/qmake"
+          test -x "$qt_root/bin/macdeployqt"
+          test "$("$qt_root/bin/qmake" -query QT_VERSION)" = "$QT_VERSION"
+          for framework in QtCore QtGui QtWidgets; do
+            framework_binary="$qt_root/lib/$framework.framework/$framework"
+            test -e "$framework_binary"
+            framework_archs="$(lipo -archs "$framework_binary")"
+            if [[ " $framework_archs " != *" ${{ matrix.lipo_arch }} "* ]]; then
+              echo "$framework_binary does not contain ${{ matrix.lipo_arch }}: $framework_archs" >&2
+              exit 1
+            fi
+          done
+
+          qt_pkgconfig_dir="$RUNNER_TEMP/ddgo-qt-pkgconfig"
+          qt_environment="$RUNNER_TEMP/ddgo-qt-environment"
+          bash scripts/configure-macos-qt.sh "$qt_root" "$QT_VERSION" "$qt_pkgconfig_dir" > "$qt_environment"
+          # The helper emits only KEY=VALUE entries after validating qmake and
+          # pkg-config provenance. Persist one environment for every later step.
+          source "$qt_environment"
+          export PKG_CONFIG_PATH="$QT_PKG_CONFIG_DIR"
+          export PKG_CONFIG_LIBDIR="$QT_PKG_CONFIG_DIR"
+          qt_cflags="$(pkg-config --cflags Qt6Widgets)"
+          qt_libs="$(pkg-config --libs Qt6Widgets)"
+          {
+            echo "QT_ROOT=$qt_root"
+            echo "QT_PKG_CONFIG_DIR=$QT_PKG_CONFIG_DIR"
+            echo "QT_PKG_CONFIG_SOURCE=$QT_PKG_CONFIG_SOURCE"
+            echo "PATH=$qt_root/bin:$PATH"
+            echo "PKG_CONFIG_PATH=$QT_PKG_CONFIG_DIR"
+            echo "PKG_CONFIG_LIBDIR=$QT_PKG_CONFIG_DIR"
+            echo "CMAKE_PREFIX_PATH=$qt_root"
+            echo "CGO_CFLAGS=$qt_cflags"
+            echo "CGO_CXXFLAGS=-std=c++17 $qt_cflags"
+            echo "CGO_LDFLAGS=$qt_libs"
+          } >> "$GITHUB_ENV"
+      - name: Verify pinned Qt toolchain
+        run: |
+          set -euo pipefail
+          test -n "$QT_ROOT"
+          test -x "$QT_ROOT/bin/qmake"
+          test -x "$QT_ROOT/bin/macdeployqt"
+          test "$("$QT_ROOT/bin/qmake" -query QT_VERSION)" = "$QT_VERSION"
+          for module in Qt6Core Qt6Gui Qt6Widgets; do
+            test "$(pkg-config --modversion "$module")" = "$QT_VERSION"
+            test "$(pkg-config --variable=prefix "$module")" = "$QT_ROOT"
+          done
+          pkg-config --cflags Qt6Widgets
+          pkg-config --libs Qt6Widgets
+          case "$(pkg-config --cflags --libs Qt6Widgets)" in
+            *"$QT_ROOT"*) ;;
+            *) echo "pkg-config did not resolve Qt from QT_ROOT" >&2; exit 1 ;;
+          esac
+          case "$PKG_CONFIG_LIBDIR" in
+            "$QT_ROOT"/*|"$RUNNER_TEMP"/*) ;;
+            *) echo "PKG_CONFIG_LIBDIR is outside pinned Qt metadata: $PKG_CONFIG_LIBDIR" >&2; exit 1 ;;
+          esac
       - name: Determine macOS cache context
         id: cache-context
         shell: bash
         run: |
           set -euo pipefail
 
-          qt_prefix="$(brew --prefix qt)"
-          export PATH="${qt_prefix}/bin:$PATH"
-          export PKG_CONFIG_PATH="${qt_prefix}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-
-          test -x "${qt_prefix}/bin/macdeployqt"
+          test -x "$QT_ROOT/bin/macdeployqt"
           pkg-config --exists Qt6Core Qt6Widgets
 
           go_mod_cache="$(go env GOMODCACHE)"
           go_build_cache="$(go env GOCACHE)"
-          qt_formula_version="$(brew list --versions qt | awk 'NR == 1 { print $2 }')"
           qt_pkg_version="$(pkg-config --modversion Qt6Core)"
+          sdk_build="$(xcrun --show-sdk-build-version)"
+          clang_identity="$(clang --version | shasum -a 256 | awk '{ print $1 }')"
 
           if [[ -z "$go_mod_cache" ]]; then
             echo "Unable to determine GOMODCACHE" >&2
@@ -140,25 +234,22 @@ jobs:
             exit 1
           fi
 
-          if [[ -z "$qt_formula_version" ]]; then
-            echo "Unable to determine Homebrew qt version" >&2
-            exit 1
-          fi
-
-          if [[ -z "$qt_pkg_version" ]]; then
-            echo "Unable to determine Qt6Core version" >&2
+          if [[ "$qt_pkg_version" != "$QT_VERSION" ]]; then
+            echo "Qt6Core version $qt_pkg_version does not match pinned $QT_VERSION" >&2
             exit 1
           fi
 
           echo "go_mod_cache=$go_mod_cache" >> "$GITHUB_OUTPUT"
           echo "go_build_cache=$go_build_cache" >> "$GITHUB_OUTPUT"
-          echo "qt_formula_version=$qt_formula_version" >> "$GITHUB_OUTPUT"
           echo "qt_pkg_version=$qt_pkg_version" >> "$GITHUB_OUTPUT"
+          echo "sdk_build=$sdk_build" >> "$GITHUB_OUTPUT"
+          echo "clang_identity=$clang_identity" >> "$GITHUB_OUTPUT"
 
           echo "GOMODCACHE=$go_mod_cache"
           echo "GOCACHE=$go_build_cache"
-          echo "Homebrew qt version=$qt_formula_version"
-          echo "Qt6Core pkg-config version=$qt_pkg_version"
+          echo "pinned Qt version=$qt_pkg_version ($QT_DISTRIBUTION, $QT_PKG_CONFIG_SOURCE metadata)"
+          echo "macOS SDK build=$sdk_build"
+          echo "clang identity=$clang_identity"
       - name: Restore macOS Go module cache
         id: go-mod-cache
         uses: actions/cache/restore@v6
@@ -170,46 +261,11 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ steps.cache-context.outputs.go_build_cache }}
-          key: ddgo-macos-build-v1-${{ matrix.os }}-${{ matrix.arch }}-macos-${{ matrix.macos_min }}-go-${{ steps.setup-go.outputs.go-version }}-qt6-${{ steps.cache-context.outputs.qt_formula_version }}-${{ steps.cache-context.outputs.qt_pkg_version }}-${{ hashFiles('go.mod', 'go.sum') }}
-      - name: Configure macOS build environment
-        run: |
-          set -euxo pipefail
-          export MACOSX_DEPLOYMENT_TARGET="${{ matrix.macos_min }}"
-          qt_prefix="$(brew --prefix qt)"
-          export PATH="${qt_prefix}/bin:$PATH"
-          export PKG_CONFIG_PATH="${qt_prefix}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-          export CGO_CFLAGS="-I${qt_prefix}/include ${CGO_CFLAGS:-}"
-          export CGO_CXXFLAGS="-std=c++17 -I${qt_prefix}/include ${CGO_CXXFLAGS:-}"
-          export CGO_LDFLAGS="-F${qt_prefix}/lib -L${qt_prefix}/lib ${CGO_LDFLAGS:-}"
-
-          echo "RUNNER_OS=$RUNNER_OS"
-          echo "RUNNER_ARCH=$RUNNER_ARCH"
-          uname -m
-          sw_vers
-          go version
-          clang --version
-          brew --prefix
-          brew --prefix qt
-          echo "CGO_CFLAGS=$CGO_CFLAGS"
-          echo "CGO_CXXFLAGS=$CGO_CXXFLAGS"
-          echo "CGO_LDFLAGS=$CGO_LDFLAGS"
-          pkg-config --modversion Qt6Core
-          pkg-config --modversion Qt6Widgets
-          test -x "$qt_prefix/bin/macdeployqt"
-          "$qt_prefix/bin/qmake" -query
-          qt_plugins_dir="$("$qt_prefix/bin/qmake" -query QT_INSTALL_PLUGINS)"
-          ls -la "$qt_plugins_dir/platforms" || true
+          key: ddgo-macos-build-v2-${{ matrix.os }}-${{ matrix.arch }}-macos-${{ matrix.macos_min }}-go-${{ steps.setup-go.outputs.go-version }}-qt-${{ env.QT_VERSION }}-${{ env.QT_DISTRIBUTION }}-aqt-${{ env.AQTINSTALL_VERSION }}-sdk-${{ steps.cache-context.outputs.sdk_build }}-clang-${{ steps.cache-context.outputs.clang_identity }}-${{ hashFiles('go.mod', 'go.sum', '**/*.go', 'scripts/configure-macos-qt.sh') }}
       - name: Build macOS app binary
         run: |
           set -euxo pipefail
           mkdir -p dist
-          export MACOSX_DEPLOYMENT_TARGET="${{ matrix.macos_min }}"
-          qt_prefix="$(brew --prefix qt)"
-          export PATH="${qt_prefix}/bin:$PATH"
-          export PKG_CONFIG_PATH="${qt_prefix}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-          export CGO_CFLAGS="-I${qt_prefix}/include ${CGO_CFLAGS:-}"
-          export CGO_CXXFLAGS="-std=c++17 -I${qt_prefix}/include ${CGO_CXXFLAGS:-}"
-          export CGO_LDFLAGS="-F${qt_prefix}/lib -L${qt_prefix}/lib ${CGO_LDFLAGS:-}"
 
           GOOS=darwin GOARCH=${{ matrix.arch }} CGO_ENABLED=1 \
             go build -x -tags "miqt serial" -trimpath -ldflags="-s -w" \
@@ -230,9 +286,6 @@ jobs:
       - name: Inspect macOS app binary
         run: |
           set -euxo pipefail
-          export MACOSX_DEPLOYMENT_TARGET="${{ matrix.macos_min }}"
-          export PATH="$(brew --prefix qt)/bin:$PATH"
-          export PKG_CONFIG_PATH="$(brew --prefix qt)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
           file dist/ddgo-darwin-${{ matrix.slice }}
           lipo -archs dist/ddgo-darwin-${{ matrix.slice }}
@@ -240,9 +293,6 @@ jobs:
       - name: Package macOS app slice
         run: |
           set -euxo pipefail
-          export MACOSX_DEPLOYMENT_TARGET="${{ matrix.macos_min }}"
-          export PATH="$(brew --prefix qt)/bin:$PATH"
-          export PKG_CONFIG_PATH="$(brew --prefix qt)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
           rm -rf dist/macos-${{ matrix.slice }}
           mkdir -p dist/macos-${{ matrix.slice }}
@@ -255,10 +305,6 @@ jobs:
       - name: Verify macOS app slice
         run: |
           set -euo pipefail
-          export MACOSX_DEPLOYMENT_TARGET="${{ matrix.macos_min }}"
-          export PATH="$(brew --prefix qt)/bin:$PATH"
-          export PKG_CONFIG_PATH="$(brew --prefix qt)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-
           bash scripts/verify-macos-app.sh dist/macos-${{ matrix.slice }}/DDGo.app ${{ matrix.lipo_arch }} 15.0
       - name: Archive macOS app slice
         run: |
@@ -301,6 +347,13 @@ jobs:
 
           echo "Extracted app layout:"
           find slices/extracted -maxdepth 5 -print | sort | sed -n '1,200p'
+      - name: Check macOS slice compatibility before merge
+        run: |
+          set -euo pipefail
+          bash scripts/verify-macos-slice-compatibility.sh \
+            slices/extracted/arm64/DDGo.app \
+            slices/extracted/amd64/DDGo.app \
+            "$QT_VERSION"
       - name: Merge universal macOS app
         run: |
           set -euo pipefail

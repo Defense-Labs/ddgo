@@ -21,10 +21,28 @@ if [[ ! -f "$bin_path" ]]; then
   exit 1
 fi
 
-qt_prefix="$(brew --prefix qt)"
+qt_prefix="${QT_ROOT:?QT_ROOT must name the pinned Qt distribution}"
+qt_prefix="$(cd "$qt_prefix" && pwd -P)"
+case "$qt_prefix" in
+  /opt/homebrew/*|/usr/local/*)
+    echo "QT_ROOT must not resolve to Homebrew: $qt_prefix" >&2
+    exit 1
+    ;;
+esac
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 export PATH="$qt_prefix/bin:$PATH"
-export PKG_CONFIG_PATH="$qt_prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+export PKG_CONFIG_PATH="${QT_PKG_CONFIG_DIR:?QT_PKG_CONFIG_DIR must describe QT_ROOT}"
+export PKG_CONFIG_LIBDIR="$PKG_CONFIG_PATH"
+qt_version="${QT_VERSION:?QT_VERSION must identify the pinned Qt distribution}"
+qt_distribution="${QT_DISTRIBUTION:?QT_DISTRIBUTION must identify the pinned Qt distribution}"
+aqtinstall_version="${AQTINSTALL_VERSION:?AQTINSTALL_VERSION must identify the installer}"
+
+test -x "$qt_prefix/bin/qmake"
+test -x "$qt_prefix/bin/macdeployqt"
+if [[ "$("$qt_prefix/bin/qmake" -query QT_VERSION)" != "$qt_version" ]]; then
+  echo "QT_ROOT version does not match QT_VERSION: $qt_prefix" >&2
+  exit 1
+fi
 
 if [[ "$version" == "master" ]]; then
   bundle_version="0.0.0"
@@ -59,6 +77,12 @@ PLIST
 ditto "$bin_path" "$app_dir/Contents/MacOS/ddgo"
 chmod +x "$app_dir/Contents/MacOS/ddgo"
 
+cat > "$app_dir/Contents/Resources/ddgo-qt-build-metadata.txt" <<EOF
+distribution=$qt_distribution
+aqtinstall_version=$aqtinstall_version
+qt_version=$qt_version
+EOF
+
 test -f "$app_dir/Contents/Info.plist"
 test -x "$app_dir/Contents/MacOS/ddgo"
 /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_dir/Contents/Info.plist"
@@ -67,6 +91,8 @@ lipo -archs "$app_dir/Contents/MacOS/ddgo"
 otool -L "$app_dir/Contents/MacOS/ddgo"
 
 echo "qt_prefix=$qt_prefix"
+echo "qt_version=$qt_version"
+echo "qt_distribution=$qt_distribution"
 echo "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
 echo "PATH=$PATH"
 echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"

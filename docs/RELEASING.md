@@ -88,13 +88,55 @@ tar -C dist -czf dist/DDGo-linux-amd64.tar.gz DDGo-linux-amd64
 
 The universal macOS app is built by packaging separate `arm64` and `x86_64` app bundles, then merging every Mach-O file with `lipo`. It is not sufficient to merge only `Contents/MacOS/ddgo`.
 
+Both slices use the same pinned Qt distribution: Qt `6.12.0` desktop
+`clang_64`, downloaded from Qt's distribution infrastructure with
+`aqtinstall==3.3.0`. CD installs it below the runner temporary directory with:
+
+```bash
+aqt install-qt -O "$RUNNER_TEMP/qt" mac desktop 6.12.0 clang_64
+```
+
+The workflow locates the resulting `qmake` rather than assuming the final
+architecture-directory name, verifies the queried Qt version, required
+frameworks (`QtCore`, `QtGui`, and `QtWidgets`), `macdeployqt`, and the slice
+architecture. Homebrew supplies only `pkgconf` as a build utility; Homebrew Qt
+headers, frameworks, plugins, and pkg-config metadata are not used.
+
+MIQT v0.15.0 discovers Qt through `pkg-config`. The
+`scripts/configure-macos-qt.sh` helper first uses suitable Qt-provided
+`Qt6Core`, `Qt6Gui`, and `Qt6Widgets` metadata when available. Official macOS
+Qt packages do not guarantee those files, so the helper otherwise generates
+minimal metadata from `qmake`'s installed paths and version, including only the
+base framework modules MIQT requires. `PKG_CONFIG_LIBDIR` is set to that one
+validated directory, preventing accidental resolution of a Homebrew Qt.
+
+The Qt and installer versions are intentionally centralized in the macOS slice
+job environment in `.github/workflows/cd.yml`. Change them together, then run
+the macOS CD job: do not update either slice independently and do not add a
+Homebrew Qt fallback. The Go build-cache key includes the pinned distribution,
+installer version, deployment target, SDK build, compiler identity, and Go
+dependency/configuration hashes. Qt itself is deliberately not cached until
+the pinned installation path has proven reliable.
+
 1. Build `dist/macos-arm64/DDGo.app` on `macos-15`.
 2. Build `dist/macos-amd64/DDGo.app` on `macos-15-intel`.
-3. Merge them with `scripts/merge-macos-universal.sh` into `dist/macos-universal/DDGo.app`.
-4. Verify universality and deployment target checks with `scripts/verify-macos-universal-app.sh dist/macos-universal/DDGo.app 15.0`.
-5. Build the final DMG with `scripts/create-macos-dmg.sh dist/macos-universal/DDGo.app dist/DDGo-macos-universal.dmg`.
+3. Check pinned Qt metadata, required Mach-O file sets, architecture slices,
+   framework install names, loaded-library inventories, and runtime search paths with
+   `scripts/verify-macos-slice-compatibility.sh`.
+4. Merge them with `scripts/merge-macos-universal.sh` into `dist/macos-universal/DDGo.app`.
+5. Verify universality, macOS `15.0` deployment targets, bundled dependency
+   paths, and codesigning with
+   `scripts/verify-macos-universal-app.sh dist/macos-universal/DDGo.app 15.0`.
+6. Build the final DMG with `scripts/create-macos-dmg.sh dist/macos-universal/DDGo.app dist/DDGo-macos-universal.dmg`.
 
-`package-macos.sh` sets `CFBundleExecutable=ddgo`, sets `LSMinimumSystemVersion` in `Info.plist`, bundles Qt frameworks/plugins with `macdeployqt`, and signs the app.
+`package-macos-app.sh` requires the validated `QT_ROOT` environment, records
+the pinned Qt toolchain metadata in the bundle, sets `CFBundleExecutable=ddgo`
+and `LSMinimumSystemVersion`, bundles Qt frameworks/plugins with that
+distribution's `macdeployqt`, and signs the app. The pre-merge and final
+verification scripts deliberately reject mismatched dependency inventories,
+missing Mach-O slices, external Homebrew load paths, unresolved non-system
+dependencies, or signing failures; matching version labels alone are not
+sufficient.
 
 ## Windows (MSYS2 / MinGW)
 

@@ -26,9 +26,9 @@ PY
 app="$1"
 expected="$2"
 max_minos="$3"
-homebrew_qt_formula="qt"
 plist="$app/Contents/Info.plist"
 exe="$app/Contents/MacOS/ddgo"
+qt_metadata="$app/Contents/Resources/ddgo-qt-build-metadata.txt"
 
 fail=0
 summary=()
@@ -66,6 +66,15 @@ if [[ ! -f "$plist" ]]; then
 fi
 if [[ ! -x "$exe" ]]; then
   mark_fail "missing executable: $exe"
+fi
+if [[ ! -f "$qt_metadata" ]]; then
+  mark_fail "missing pinned Qt build metadata: $qt_metadata"
+else
+  for key in distribution aqtinstall_version qt_version; do
+    if ! grep -q "^${key}=." "$qt_metadata"; then
+      mark_fail "missing $key in pinned Qt build metadata: $qt_metadata"
+    fi
+  done
 fi
 
 plugin_path=""
@@ -151,9 +160,9 @@ while IFS= read -r -d '' f; do
     [[ -z "$dep_path" ]] && continue
     case "$dep_path" in
       @executable_path/*|@loader_path/*|@rpath/*|/System/Library/*|/usr/lib/*) ;;
-      /usr/local/opt/qt/*|/opt/homebrew/opt/qt/*|/usr/local/Cellar/${homebrew_qt_formula}/*|/opt/homebrew/Cellar/${homebrew_qt_formula}/*)
+      /usr/local/*|/opt/homebrew/*)
         status="fail"
-        mark_fail "unbundled Homebrew Qt loaded dependency path in $f: $dep_path"
+        mark_fail "unbundled Homebrew loaded dependency path in $f: $dep_path"
         ;;
       *)
         status="fail"
