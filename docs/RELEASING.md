@@ -134,7 +134,9 @@ pinned installation path has proven reliable.
 3. Check pinned Qt metadata, required Mach-O file sets, architecture slices,
    framework install names, loaded-library inventories, and runtime search paths with
    `scripts/verify-macos-slice-compatibility.sh`.
-4. Merge them with `scripts/merge-macos-universal.sh` into `dist/macos-universal/DDGo.app`.
+4. Run `scripts/test-macos-universal-merge.sh` on the macOS merge runner, then
+   merge them with `scripts/merge-macos-universal.sh` into
+   `dist/macos-universal/DDGo.app`.
 5. Verify universality, macOS `15.0` deployment targets, bundled dependency
    paths, and codesigning with
    `scripts/verify-macos-universal-app.sh dist/macos-universal/DDGo.app 15.0`.
@@ -162,12 +164,16 @@ permitted, and unresolved weak-linked dependencies are reported as warnings.
 This is intentionally not a complete dyld emulator: it does not prove
 runtime-only `dlopen` calls or every loader-chain search case.
 The normal `macdeployqt` layout is covered, including framework version
-directories and symlinks. The universal merger explicitly extracts arm64 from
-the Apple Silicon input and x86_64 from the Intel input, so universal Qt
-framework inputs are supported; `x86_64h` is not accepted as a substitute for
-the required `x86_64` slice. Load-command, rpath, and dependency comparisons
-select the intended architecture explicitly, including both architectures in
-the final universal verification.
+directories and symlinks. Qt framework and plugin inputs may already be
+universal, while DDGo itself is built as separate slices. The merger therefore
+uses `lipo -thin` to prepare exactly arm64 from the Apple Silicon input and
+x86_64 from the Intel input before using `lipo -create`; the merged output must
+contain exactly those two architectures. `x86_64h` is not accepted as a
+substitute for the required `x86_64` slice. The macOS-only merge regression
+uses real Apple `clang` and `lipo` to cover thin and universal input pairs.
+Load-command, rpath, and dependency comparisons select the intended
+architecture explicitly, including both architectures in the final universal
+verification.
 
 `scripts/test-macos-toolchain.sh` provides platform-independent regression
 coverage for cache-key composition and representative bundled dependency-path

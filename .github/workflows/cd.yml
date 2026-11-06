@@ -371,6 +371,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v6
+      - name: Test universal Mach-O merging
+        run: bash scripts/test-macos-universal-merge.sh
       - uses: actions/download-artifact@v4
         with:
           name: DDGo-app-arm64
