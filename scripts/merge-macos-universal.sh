@@ -99,7 +99,7 @@ merge_macho_slices() {
   rm -f "$thin_arm" "$thin_amd"
 }
 
-merge_universal_app() {
+merge_universal_app() (
   if [[ $# -ne 3 ]]; then
     echo "usage: $0 <arm64-app> <amd64-app> <out-app>" >&2
     return 1
@@ -143,7 +143,12 @@ merge_universal_app() {
 
   tmpdir="$(mktemp -d)"
   cleanup() {
-    rm -rf "$tmpdir"
+    local status=$?
+    if ! rm -rf "$tmpdir"; then
+      echo "failed to remove universal merge temporary directory: $tmpdir" >&2
+      return 1
+    fi
+    return "$status"
   }
   trap cleanup EXIT
 
@@ -212,7 +217,7 @@ merge_universal_app() {
   echo "merged Mach-O files: $merged"
   echo "skipped non-Mach-O files: $skipped"
   echo "warnings: $warnings"
-}
+)
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   merge_universal_app "$@"
