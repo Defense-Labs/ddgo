@@ -111,8 +111,8 @@ while IFS= read -r -d '' f; do
     mark_fail "missing arch $expected: $f ($archs)"
   fi
 
-  build_minos="$(otool -l "$f" | awk '/LC_BUILD_VERSION/{inb=1; next} inb && /minos/{print $2; inb=0}')"
-  version_min="$(otool -l "$f" | awk '/LC_VERSION_MIN_MACOSX/{inv=1; next} inv && /version/{print $2; inv=0}')"
+  build_minos="$(macos_otool_load_commands "$f" "$expected" | awk '/LC_BUILD_VERSION/{inb=1; next} inb && /minos/{print $2; inb=0}')"
+  version_min="$(macos_otool_load_commands "$f" "$expected" | awk '/LC_VERSION_MIN_MACOSX/{inv=1; next} inv && /version/{print $2; inv=0}')"
 
   while IFS= read -r d; do
     [[ -z "$d" ]] && continue
@@ -157,7 +157,7 @@ while IFS= read -r -d '' f; do
       mark_fail "unbundled Homebrew loaded dependency path in $f: $dep_path"
       continue
     fi
-    if resolved_path="$(macos_resolve_dependency "$app" "$exe" "$f" "$dep_path")"; then
+    if resolved_path="$(macos_resolve_dependency "$app" "$exe" "$f" "$dep_path" "$expected")"; then
       echo "resolved $load_command dependency: $dep_path -> $resolved_path"
       continue
     fi
@@ -167,7 +167,7 @@ while IFS= read -r -d '' f; do
     fi
     status="fail"
     mark_fail "unresolved required dependency in $f ($load_command): $dep_path"
-  done < <(macos_list_load_commands "$f")
+  done < <(macos_list_load_commands "$f" "$expected")
 
   dep_str="${dep_targets[*]:-none}"
   dep_str="${dep_str// /,}"

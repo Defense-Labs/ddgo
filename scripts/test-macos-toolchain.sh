@@ -81,6 +81,10 @@ validate_qt_environment() {
 # Exercise the shared load-command and rpath parsers without requiring macOS
 # tools. Real bundle verification still uses the runner's otool output.
 otool() {
+  if [[ "$1" == "-arch" ]]; then
+    [[ "$2" == "arm64" || "$2" == "x86_64" ]] || exit 2
+    shift 2
+  fi
   cat <<'EOF'
 Load command 1
           cmd LC_LOAD_DYLIB
@@ -106,6 +110,7 @@ load_commands="$(macos_list_load_commands ignored)"
 [[ "$load_commands" == *'LC_LOAD_WEAK_DYLIB|@rpath/Optional.framework/Optional'* ]] || fail "LC_LOAD_WEAK_DYLIB was not parsed"
 [[ "$load_commands" == *'LC_REEXPORT_DYLIB|@loader_path/libShared.dylib'* ]] || fail "LC_REEXPORT_DYLIB was not parsed"
 [[ "$(macos_list_rpaths ignored)" == '@executable_path/../Frameworks' ]] || fail "LC_RPATH was not parsed"
+[[ "$(macos_list_rpaths ignored arm64)" == '@executable_path/../Frameworks' ]] || fail "architecture-selected LC_RPATH was not parsed"
 macos_is_weak_load_command LC_LOAD_WEAK_DYLIB || fail "weak load command was not recognized"
 if macos_is_weak_load_command LC_LOAD_DYLIB; then
   fail "required load command was treated as weak"
@@ -144,6 +149,23 @@ macos_list_rpaths() {
 expect_resolves "$app" "$exe" "$plugin" '@loader_path/../../Frameworks/QtCore.framework/QtCore'
 expect_resolves "$app" "$exe" "$plugin" '@executable_path/../Frameworks/QtCore.framework/QtCore'
 expect_resolves "$app" "$exe" "$plugin" '@rpath/QtCore.framework/QtCore'
+expect_resolves "$app" "$exe" "$plugin" '@rpath/QtCore.framework/Versions/A/QtCore'
+macos_has_rpath "$exe" '@executable_path/../Frameworks' arm64 || fail "executable runtime path was not recognized"
+if macos_has_rpath "$plugin" '@loader_path/../../Frameworks' arm64; then
+  fail "plugin unexpectedly had a loader-relative runtime path"
+fi
+
+install_name_tool() {
+  fail "duplicate runtime-path repair invoked install_name_tool"
+}
+macos_add_rpath_if_missing "$exe" '@executable_path/../Frameworks' arm64
+install_name_tool() {
+  installed_rpath_args="$*"
+}
+macos_add_rpath_if_missing "$plugin" '@loader_path/../../Frameworks' arm64
+[[ "$installed_rpath_args" == "-add_rpath @loader_path/../../Frameworks $plugin" ]] ||
+  fail "missing plugin runtime path was not added with the expected arguments"
+unset -f install_name_tool
 
 outside="$tmpdir/outside.dylib"
 : > "$outside"
@@ -165,6 +187,7 @@ ln -s Versions/Current/Missing "$framework/Dangling"
 if macos_resolve_dependency "$app" "$exe" "$plugin" '@loader_path/../../Frameworks/QtCore.framework/Dangling' >/dev/null; then
   fail "dangling framework symlink resolved"
 fi
+rm "$framework/Dangling"
 
 macos_is_system_dependency '/usr/lib/libSystem.B.dylib' || fail "system library was rejected"
 macos_is_system_dependency '/System/Library/Frameworks/AppKit.framework/AppKit' || fail "system framework was rejected"
@@ -181,6 +204,47 @@ macos_has_arch 'arm64 x86_64' x86_64 || fail "x86_64 was not detected"
 if macos_has_arch 'arm64 x86_64h' x86_64; then
   fail "x86_64h was accepted as x86_64"
 fi
+
+# The packaging preflight keeps unresolved required dependencies fatal and
+# unresolved weak dependencies as warnings. Use the real fixture filesystem
+# with lightweight load-command and Mach-O probes.
+file() {
+  printf '%s\n' 'Mach-O 64-bit dynamically linked shared library'
+}
+macos_list_rpaths() {
+  return 0
+}
+macos_resolve_dependency() {
+  return 1
+}
+macos_list_load_commands() {
+  if [[ "$1" == "$exe" ]]; then
+    printf '%s\n' 'LC_LOAD_DYLIB|@rpath/Missing.framework/Missing'
+  fi
+}
+if macos_verify_app_dependencies "$app" "$exe" arm64 > "$tmpdir/preflight-required.out" 2> "$tmpdir/preflight-required.err"; then
+  fail "runtime preflight accepted an unresolved required dependency"
+fi
+grep -Fq 'unresolved required dependency' "$tmpdir/preflight-required.err" ||
+  fail "runtime preflight did not report the unresolved required dependency"
+macos_list_load_commands() {
+  if [[ "$1" == "$exe" ]]; then
+    printf '%s\n' 'LC_LOAD_WEAK_DYLIB|@rpath/Optional.framework/Optional'
+  fi
+}
+if ! macos_verify_app_dependencies "$app" "$exe" arm64 > "$tmpdir/preflight-weak.out" 2> "$tmpdir/preflight-weak.err"; then
+  fail "runtime preflight rejected an unresolved weak dependency"
+fi
+grep -Fq 'unresolved weak dependency' "$tmpdir/preflight-weak.err" ||
+  fail "runtime preflight did not warn about the unresolved weak dependency"
+ln -s Versions/Current/Missing "$framework/Dangling"
+if macos_verify_app_dependencies "$app" "$exe" arm64 > "$tmpdir/preflight-symlink.out" 2> "$tmpdir/preflight-symlink.err"; then
+  fail "runtime preflight accepted a dangling framework symlink"
+fi
+grep -Fq 'dangling bundled symlink' "$tmpdir/preflight-symlink.err" ||
+  fail "runtime preflight did not report the dangling framework symlink"
+rm "$framework/Dangling"
+unset -f file
 
 cache_line="$(grep 'key: ddgo-macos-build-v2-' "$repo_root/.github/workflows/cd.yml")"
 for excluded in "**/*.go" "macos-macho-deps.sh" "test-macos-toolchain.sh"; do

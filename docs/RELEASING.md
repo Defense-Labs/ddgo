@@ -143,7 +143,11 @@ pinned installation path has proven reliable.
 `package-macos-app.sh` requires the validated `QT_ROOT` environment, records
 the pinned Qt toolchain metadata in the bundle, sets `CFBundleExecutable=ddgo`
 and `LSMinimumSystemVersion`, bundles Qt frameworks/plugins with that
-distribution's `macdeployqt`, and signs the app. The pre-merge and final
+distribution's `macdeployqt`, then inspects its rpaths. Before signing, it
+ensures the executable has `@executable_path/../Frameworks` and adds a
+plugin-relative Frameworks rpath only when a required dependency remains
+unresolved. The packaged layout is preflighted for the slice architecture
+before final signing. The pre-merge and final
 verification scripts deliberately reject mismatched dependency inventories,
 missing Mach-O slices, external Homebrew load paths, unresolved non-system
 dependencies, or signing failures; matching version labels alone are not
@@ -161,7 +165,9 @@ The normal `macdeployqt` layout is covered, including framework version
 directories and symlinks. The universal merger explicitly extracts arm64 from
 the Apple Silicon input and x86_64 from the Intel input, so universal Qt
 framework inputs are supported; `x86_64h` is not accepted as a substitute for
-the required `x86_64` slice.
+the required `x86_64` slice. Load-command, rpath, and dependency comparisons
+select the intended architecture explicitly, including both architectures in
+the final universal verification.
 
 `scripts/test-macos-toolchain.sh` provides platform-independent regression
 coverage for cache-key composition and representative bundled dependency-path

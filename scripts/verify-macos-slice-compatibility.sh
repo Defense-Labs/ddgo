@@ -104,8 +104,8 @@ while IFS= read -r rel; do
   macos_has_arch "$arm_archs" arm64 || report "arm64 slice lacks arm64: $rel ($arm_archs)"
   macos_has_arch "$amd_archs" x86_64 || report "amd64 slice lacks x86_64: $rel ($amd_archs)"
 
-  macos_list_dependency_inventory "$arm_file" > "$tmpdir/arm-deps.txt"
-  macos_list_dependency_inventory "$amd_file" > "$tmpdir/amd-deps.txt"
+  macos_list_dependency_inventory "$arm_file" arm64 > "$tmpdir/arm-deps.txt"
+  macos_list_dependency_inventory "$amd_file" x86_64 > "$tmpdir/amd-deps.txt"
   if ! cmp -s "$tmpdir/arm-deps.txt" "$tmpdir/amd-deps.txt"; then
     report "Mach-O install-name/dependency inventory differs: $rel"
     if [[ $reported -le $max_reported ]]; then
@@ -113,8 +113,8 @@ while IFS= read -r rel; do
     fi
   fi
 
-  macos_list_rpaths "$arm_file" > "$tmpdir/arm-rpaths.txt"
-  macos_list_rpaths "$amd_file" > "$tmpdir/amd-rpaths.txt"
+  macos_list_rpaths "$arm_file" arm64 > "$tmpdir/arm-rpaths.txt"
+  macos_list_rpaths "$amd_file" x86_64 > "$tmpdir/amd-rpaths.txt"
   if ! cmp -s "$tmpdir/arm-rpaths.txt" "$tmpdir/amd-rpaths.txt"; then
     report "runtime-search-path inventory differs: $rel"
     if [[ $reported -le $max_reported ]]; then

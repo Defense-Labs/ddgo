@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euxo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$script_dir/macos-macho-deps.sh"
+
 if [[ $# -lt 3 ]]; then
   echo "usage: $0 <arm64|amd64> <input-binary> <output-app> [version]" >&2
   exit 1
@@ -12,7 +15,8 @@ app_dir="$3"
 version="${4:-0.0.0}"
 
 case "$arch" in
-  arm64|amd64) ;;
+  arm64) macho_arch=arm64 ;;
+  amd64) macho_arch=x86_64 ;;
   *) echo "unsupported arch: $arch" >&2; exit 1 ;;
 esac
 
@@ -106,6 +110,44 @@ find "$app_dir/Contents" -maxdepth 5 -print | sort
 find "$app_dir/Contents" -type f -name "*.dylib" -print | sort
 find "$app_dir/Contents" -type f -name "libqcocoa.dylib" -print
 test -f "$app_dir/Contents/PlugIns/platforms/libqcocoa.dylib"
+
+# macdeployqt deploys the frameworks but does not consistently provide a
+# run-path for MIQT's @rpath framework references in this official-Qt layout.
+# Inspect first, repair the executable, then touch a plugin only if it still
+# has an unresolved required @rpath dependency in the final bundle.
+app_executable="$app_dir/Contents/MacOS/ddgo"
+echo "runtime paths before correction for $app_executable ($macho_arch):"
+macos_list_rpaths "$app_executable" "$macho_arch"
+macos_add_rpath_if_missing "$app_executable" '@executable_path/../Frameworks' "$macho_arch"
+
+plugin_has_unresolved_rpath() {
+  local plugin="$1"
+  local load_command
+  local dependency
+  while IFS='|' read -r load_command dependency; do
+    [[ "$dependency" == @rpath/* ]] || continue
+    macos_is_weak_load_command "$load_command" && continue
+    if ! macos_resolve_dependency "$app_dir" "$app_executable" "$plugin" "$dependency" "$macho_arch" >/dev/null; then
+      return 0
+    fi
+  done < <(macos_list_load_commands "$plugin" "$macho_arch")
+  return 1
+}
+
+for plugin_dir in "$app_dir/Contents/PlugIns" "$app_dir/Contents/Plugins"; do
+  [[ -d "$plugin_dir" ]] || continue
+  while IFS= read -r -d '' plugin; do
+    file "$plugin" | grep -q 'Mach-O' || continue
+    if plugin_has_unresolved_rpath "$plugin"; then
+      echo "runtime paths before correction for plugin $plugin ($macho_arch):"
+      macos_list_rpaths "$plugin" "$macho_arch"
+      macos_add_rpath_if_missing "$plugin" '@loader_path/../../Frameworks' "$macho_arch"
+    fi
+  done < <(find "$plugin_dir" -type f -print0)
+done
+
+echo "verifying packaged runtime dependencies before signing ($macho_arch)"
+macos_verify_app_dependencies "$app_dir" "$app_executable" "$macho_arch"
 
 codesign --force --deep --sign - "$app_dir"
 codesign --verify --deep --strict --verbose=2 "$app_dir"
