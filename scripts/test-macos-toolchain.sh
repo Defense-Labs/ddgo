@@ -254,6 +254,49 @@ for required in "go.mod" "go.sum" "configure-macos-qt.sh" 'steps.setup-go.output
   [[ "$cache_line" == *"$required"* ]] || fail "macOS build-cache key is missing $required"
 done
 
+qt_cache_line="$(grep 'key: ddgo-macos-qt-v1-' "$repo_root/.github/workflows/cd.yml")"
+for required in 'matrix.os' 'matrix.arch' 'env.QT_VERSION' 'env.QT_DISTRIBUTION' 'env.AQTINSTALL_VERSION' 'clang_64'; do
+  [[ "$qt_cache_line" == *"$required"* ]] || fail "macOS Qt cache key is missing $required"
+done
+for excluded in "**/*.go" 'go.mod' 'go.sum' 'package-macos-app.sh' 'merge-macos-universal.sh' 'test-macos-toolchain.sh'; do
+  [[ "$qt_cache_line" != *"$excluded"* ]] || fail "Qt installation cache key includes unrelated input: $excluded"
+done
+
+line_number() {
+  local text="$1"
+  grep -n -m 1 -- "$text" "$repo_root/.github/workflows/cd.yml" | cut -d: -f1
+}
+
+restore_qt_line="$(line_number 'name: Restore pinned Qt installation cache')"
+install_qt_line="$(line_number 'name: Install and validate pinned Qt distribution')"
+save_qt_line="$(line_number 'name: Save validated Qt installation cache')"
+configure_qt_line="$(line_number 'name: Configure pinned Qt distribution')"
+header_preflight_line="$(line_number 'name: Verify Qt framework header compilation')"
+go_cache_line="$(line_number 'name: Restore macOS Go module cache')"
+[[ "$restore_qt_line" -lt "$install_qt_line" ]] || fail "Qt cache restore does not precede Qt installation"
+[[ "$install_qt_line" -lt "$save_qt_line" ]] || fail "Qt cache save does not follow installation validation"
+[[ "$save_qt_line" -lt "$configure_qt_line" ]] || fail "Qt overlay is configured before validated Qt is cached"
+[[ "$configure_qt_line" -lt "$header_preflight_line" ]] || fail "Qt header preflight does not follow overlay configuration"
+[[ "$header_preflight_line" -lt "$go_cache_line" ]] || fail "Go caches are restored before Qt header preflight"
+
+workflow_file="$repo_root/.github/workflows/cd.yml"
+grep -Fq 'if [[ "$QT_CACHE_HIT" == "true" ]]; then' "$workflow_file" ||
+  fail "Qt cache-hit path is missing"
+grep -Fq 'for attempt in 1 2 3; do' "$workflow_file" ||
+  fail "Qt download retry policy is not bounded to three attempts"
+grep -Fq 'rm -rf "$qt_download_root"' "$workflow_file" ||
+  fail "Qt download retry does not remove partial installation contents"
+grep -Fq 'bash scripts/validate-macos-qt-install.sh' "$workflow_file" ||
+  fail "Qt installation is not validated before use"
+grep -Fq 'steps.qt-install-cache.outputs.cache-hit !=' "$workflow_file" ||
+  fail "Qt cache save is not guarded against immutable cache hits"
+
+qt_validator="$repo_root/scripts/validate-macos-qt-install.sh"
+[[ -x "$qt_validator" ]] || fail "macOS Qt cache validator is not executable"
+for required in 'QT_INSTALL_PREFIX' 'QT_INSTALL_LIBS' 'QT_INSTALL_HEADERS' 'QT_INSTALL_ARCHDATA' 'lipo -archs' 'dangling framework symlink' 'pkg-config prefix' 'CMake package metadata'; do
+  grep -Fq "$required" "$qt_validator" || fail "macOS Qt cache validator is missing $required validation"
+done
+
 # Run the actual Qt configuration helper against a lightweight fake qmake
 # installation. This validates framework naming and generated metadata without
 # claiming to validate real macOS linking.

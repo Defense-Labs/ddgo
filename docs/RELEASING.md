@@ -155,6 +155,21 @@ missing Mach-O slices, external Homebrew load paths, unresolved non-system
 dependencies, or signing failures; matching version labels alone are not
 sufficient.
 
+The installed official Qt tree is cached separately from Go modules and Go's
+build cache. Its `ddgo-macos-qt-v1` key includes the runner/architecture,
+Qt version and distribution, `aqtinstall` version, and `clang_64` package
+identifier, but deliberately excludes application source and packaging logic.
+The cache is restored at `$RUNNER_TEMP/qt`, the same path used by `aqtinstall`,
+because Qt metadata records its installation prefix. Each hit is validated with
+`qmake`, framework headers and binaries, framework symlinks, architecture
+checks, pkg-config/CMake package metadata, and relocation/Homebrew-path checks
+before it can reach MIQT. An
+invalid immutable cache fails safely; increment the cache schema prefix to
+replace it. On a miss, the pinned install is attempted at most three times,
+with partial contents removed between attempts, and is saved only after that
+validation succeeds. The local pkg-config overlay is intentionally regenerated
+after either path and is not cached.
+
 Final-app verification statically resolves each required non-system Mach-O load
 command using the referencing binary's `@loader_path`, `@executable_path`, and
 the applicable direct `LC_RPATH` entries from that binary and the main

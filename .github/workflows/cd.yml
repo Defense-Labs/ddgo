@@ -126,8 +126,17 @@ jobs:
           brew install pkgconf
       - name: Run macOS toolchain static regressions
         run: bash scripts/test-macos-toolchain.sh
-      - name: Install pinned Qt distribution
+      - name: Restore pinned Qt installation cache
+        id: qt-install-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/qt
+          key: ddgo-macos-qt-v1-${{ matrix.os }}-${{ matrix.arch }}-qt-${{ env.QT_VERSION }}-${{ env.QT_DISTRIBUTION }}-aqt-${{ env.AQTINSTALL_VERSION }}-clang_64
+      - name: Install and validate pinned Qt distribution
+        id: qt-install
         shell: bash
+        env:
+          QT_CACHE_HIT: ${{ steps.qt-install-cache.outputs.cache-hit }}
         run: |
           set -euo pipefail
 
@@ -135,39 +144,58 @@ jobs:
           test "$(python -c 'import importlib.metadata; print(importlib.metadata.version("aqtinstall"))')" = "$AQTINSTALL_VERSION"
 
           qt_download_root="$RUNNER_TEMP/qt"
-          rm -rf "$qt_download_root"
-          aqt install-qt -O "$qt_download_root" mac desktop "$QT_VERSION" clang_64
-
-          qmake_candidates=()
-          while IFS= read -r candidate; do
-            qmake_candidates+=("$candidate")
-          done < <(find "$qt_download_root/$QT_VERSION" -path '*/bin/qmake' -print | sort)
-          if [[ ${#qmake_candidates[@]} -ne 1 ]]; then
-            echo "expected exactly one qmake below $qt_download_root/$QT_VERSION, found ${#qmake_candidates[@]}" >&2
-            printf '%s\n' "${qmake_candidates[@]:-}" >&2
-            exit 1
-          fi
-          qt_root="$(cd "$(dirname "$(dirname "${qmake_candidates[0]}")")" && pwd -P)"
-          case "$qt_root" in
-            /opt/homebrew/*|/usr/local/*)
-              echo "pinned Qt unexpectedly resolved to Homebrew: $qt_root" >&2
-              exit 1
-              ;;
-          esac
-
-          test -x "$qt_root/bin/qmake"
-          test -x "$qt_root/bin/macdeployqt"
-          test "$("$qt_root/bin/qmake" -query QT_VERSION)" = "$QT_VERSION"
-          for framework in QtCore QtGui QtWidgets; do
-            framework_binary="$qt_root/lib/$framework.framework/$framework"
-            test -e "$framework_binary"
-            framework_archs="$(lipo -archs "$framework_binary")"
-            echo "$framework_binary architectures: $framework_archs"
-            if [[ " $framework_archs " != *" ${{ matrix.lipo_arch }} "* ]]; then
-              echo "$framework_binary does not contain ${{ matrix.lipo_arch }}: $framework_archs" >&2
+          if [[ "$QT_CACHE_HIT" == "true" ]]; then
+            echo "restored pinned Qt installation cache; validating before use"
+          else
+            rm -rf "$qt_download_root"
+            installed=0
+            for attempt in 1 2 3; do
+              echo "installing pinned Qt $QT_VERSION (attempt $attempt of 3)"
+              if aqt install-qt -O "$qt_download_root" mac desktop "$QT_VERSION" clang_64; then
+                installed=1
+                break
+              fi
+              rm -rf "$qt_download_root"
+              if [[ $attempt -lt 3 ]]; then
+                echo "Qt installation attempt $attempt failed; retrying after 10 seconds" >&2
+                sleep 10
+              fi
+            done
+            if [[ $installed -ne 1 ]]; then
+              echo "failed to install pinned Qt after 3 attempts" >&2
               exit 1
             fi
-          done
+          fi
+
+          qt_validation="$RUNNER_TEMP/ddgo-qt-install-validation"
+          if ! bash scripts/validate-macos-qt-install.sh \
+            "$qt_download_root" "$QT_VERSION" "${{ matrix.lipo_arch }}" > "$qt_validation"; then
+            if [[ "$QT_CACHE_HIT" == "true" ]]; then
+              echo "restored Qt cache is invalid; it is immutable and must be invalidated by changing the Qt cache schema" >&2
+            fi
+            exit 1
+          fi
+          source "$qt_validation"
+          test -n "$QT_ROOT"
+          echo "qt_root=$QT_ROOT" >> "$GITHUB_OUTPUT"
+          if [[ "$QT_CACHE_HIT" == "true" ]]; then
+            echo "new_install=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new_install=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save validated Qt installation cache
+        if: steps.qt-install-cache.outputs.cache-hit != 'true' && steps.qt-install.outputs.new_install == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/qt
+          key: ${{ steps.qt-install-cache.outputs.cache-primary-key }}
+      - name: Configure pinned Qt distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          qt_root="${{ steps.qt-install.outputs.qt_root }}"
+          test -n "$qt_root"
 
           qt_pkgconfig_dir="$RUNNER_TEMP/ddgo-qt-pkgconfig"
           qt_environment="$RUNNER_TEMP/ddgo-qt-environment"
