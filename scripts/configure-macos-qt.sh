@@ -128,20 +128,63 @@ if [[ $use_official -eq 1 ]]; then
   done
 fi
 
-if [[ $use_official -eq 1 ]]; then
-  selected_pc_dir="$official_pc_dir"
-  pc_source="official"
-else
-  echo "Qt pkg-config metadata is unavailable or incomplete: $official_failure; generating fallback metadata" >&2
+prepare_generated_pc_dir() {
   if ! rm -rf "$pkgconfig_dir"; then
-    fail "cannot remove fallback pkg-config directory: $pkgconfig_dir"
+    fail "cannot remove generated pkg-config directory: $pkgconfig_dir"
   fi
   if ! mkdir -p "$pkgconfig_dir"; then
-    fail "cannot create fallback pkg-config directory: $pkgconfig_dir"
+    fail "cannot create generated pkg-config directory: $pkgconfig_dir"
   fi
   if ! selected_pc_dir="$(cd "$pkgconfig_dir" && pwd -P)"; then
-    fail "cannot resolve fallback pkg-config directory: $pkgconfig_dir"
+    fail "cannot resolve generated pkg-config directory: $pkgconfig_dir"
   fi
+}
+
+augment_official_framework_pc() {
+  local module="$1"
+  local framework
+  local source_pc="$official_pc_dir/$module.pc"
+  local output_pc="$selected_pc_dir/$module.pc"
+  local temporary_pc="$output_pc.tmp"
+  local extra_cflags
+
+  framework="$(qt_framework_name "$module")" || return 1
+  extra_cflags="-I$qt_lib_dir/$framework.framework/Headers -I$qt_lib_dir/$framework.framework -F$qt_lib_dir"
+  if ! awk -v extra_cflags="$extra_cflags" '
+    /^Cflags:[[:space:]]*/ {
+      print "Cflags: " extra_cflags " " substr($0, index($0, ":") + 1)
+      found_cflags = 1
+      next
+    }
+    { print }
+    END { if (!found_cflags) exit 1 }
+  ' "$source_pc" > "$temporary_pc"; then
+    rm -f "$temporary_pc"
+    echo "ERROR: official pkg-config metadata has no usable Cflags entry for $module: $source_pc" >&2
+    return 1
+  fi
+  if ! mv "$temporary_pc" "$output_pc"; then
+    rm -f "$temporary_pc"
+    echo "ERROR: cannot write Qt framework header overlay for $module: $output_pc" >&2
+    return 1
+  fi
+}
+
+if [[ $use_official -eq 1 ]]; then
+  # Keep Qt's supplied module records and transitive dependency/linker flags.
+  # The overlay puts framework headers before module-local forwarding paths so
+  # MIQT can resolve both <qfoo.h> and <QtCore/qfoo.h> forms.
+  prepare_generated_pc_dir
+  if ! cp "$official_pc_dir"/*.pc "$selected_pc_dir/"; then
+    fail "cannot copy official Qt pkg-config metadata into overlay: $official_pc_dir"
+  fi
+  for module in "${required_framework_modules[@]}"; do
+    augment_official_framework_pc "$module" || fail "cannot add framework header paths to official metadata for $module"
+  done
+  pc_source="official-overlay"
+else
+  echo "Qt pkg-config metadata is unavailable or incomplete: $official_failure; generating fallback metadata" >&2
+  prepare_generated_pc_dir
   pc_source="generated"
 
   if ! (
@@ -154,7 +197,7 @@ mkspecsdir=$qt_archdata_dir/mkspecs
 Name: Qt6 Platform
 Description: Qt 6 macOS platform settings derived from qmake
 Version: $qt_version
-Cflags: -I\${mkspecsdir}/macx-clang -I\${includedir}
+Cflags: -I\${mkspecsdir}/macx-clang
 EOF
   ); then
     fail "failed to generate fallback pkg-config metadata: $selected_pc_dir/Qt6Platform.pc"
@@ -177,7 +220,7 @@ Name: $module
 Description: Qt 6 $framework framework derived from qmake
 Version: $qt_version
 Libs: -F\${libdir} -framework $framework
-Cflags: -I\${libdir}/$framework.framework/Headers -I\${libdir}/$framework.framework -D$define
+Cflags: -I\${libdir}/$framework.framework/Headers -I\${libdir}/$framework.framework -F\${libdir} -D$define
 Requires: $requires
 EOF
     ); then

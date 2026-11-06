@@ -196,8 +196,11 @@ done
 command -v pkg-config >/dev/null || fail "pkg-config is required for Qt configuration regression coverage"
 qt_fixture="$tmpdir/qt"
 for framework_name in QtCore QtGui QtWidgets; do
-  mkdir -p "$qt_fixture/lib/$framework_name.framework/Headers"
-  : > "$qt_fixture/lib/$framework_name.framework/$framework_name"
+  framework_dir="$qt_fixture/lib/$framework_name.framework"
+  mkdir -p "$framework_dir/Versions/A/Headers"
+  : > "$framework_dir/Versions/A/$framework_name"
+  ln -s Versions/A/Headers "$framework_dir/Headers"
+  ln -s Versions/A/$framework_name "$framework_dir/$framework_name"
 done
 mkdir -p "$qt_fixture/bin" "$qt_fixture/include" "$qt_fixture/archdata/mkspecs" "$tmpdir/fake-bin"
 cat > "$qt_fixture/bin/qmake" <<'EOF'
@@ -240,6 +243,8 @@ for framework_name in QtCore QtGui QtWidgets; do
   module="Qt6${framework_name#Qt}"
   pc_file="$generated_pc_dir/$module.pc"
   grep -Fq "$framework_name.framework/Headers" "$pc_file" || fail "$module metadata used the wrong framework headers"
+  grep -Fq 'Cflags: -I${libdir}/' "$pc_file" || fail "$module metadata did not put framework headers first"
+  grep -Fq -- '-F${libdir}' "$pc_file" || fail "$module metadata omitted the framework search path"
   grep -Fq -- "-framework $framework_name" "$pc_file" || fail "$module metadata used the wrong framework linker flag"
 done
 
@@ -254,6 +259,67 @@ if ! PATH="$tmpdir/fake-bin:$PATH" bash "$repo_root/scripts/configure-macos-qt.s
   fail "Qt configuration helper rejected a symlinked valid Qt fixture"
 fi
 validate_qt_environment "$symlinked_environment" "$tmpdir/symlinked-generated-pc" generated 6.12.0
+
+# Official metadata is preserved in a local overlay. The fixture deliberately
+# models the module-local include order that fails MIQT's <QtCore/...> headers.
+official_pc_dir="$qt_fixture/lib/pkgconfig"
+mkdir -p "$official_pc_dir"
+cat > "$official_pc_dir/Qt6Platform.pc" <<EOF
+prefix=$qt_fixture
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
+
+Name: Qt6 Platform
+Description: fixture platform metadata
+Version: 6.12.0
+Cflags: -I\${includedir}
+EOF
+for framework_name in QtCore QtGui QtWidgets; do
+  module="Qt6${framework_name#Qt}"
+  case "$framework_name" in
+    QtCore) requires=Qt6Platform ;;
+    QtGui) requires=Qt6Core ;;
+    QtWidgets) requires="Qt6Core Qt6Gui" ;;
+  esac
+  cat > "$official_pc_dir/$module.pc" <<EOF
+prefix=$qt_fixture
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
+
+Name: $module
+Description: fixture official metadata
+Version: 6.12.0
+Libs: -F\${libdir} -framework $framework_name -lpreserved${framework_name#Qt}
+Cflags: -I\${includedir}/$framework_name -I\${libdir}/$framework_name.framework -DOFFICIAL_${framework_name#Qt}
+Requires: $requires
+EOF
+done
+
+official_overlay_environment="$tmpdir/official-overlay-environment"
+official_overlay_pc_dir="$tmpdir/official-overlay-pc"
+if ! PATH="$tmpdir/fake-bin:$PATH" bash "$repo_root/scripts/configure-macos-qt.sh" "$qt_fixture" 6.12.0 "$official_overlay_pc_dir" > "$official_overlay_environment" 2> "$tmpdir/official-overlay-diagnostics"; then
+  cat "$tmpdir/official-overlay-diagnostics" >&2
+  fail "Qt configuration helper rejected valid official metadata fixture"
+fi
+validate_qt_environment "$official_overlay_environment" "$official_overlay_pc_dir" official-overlay 6.12.0
+core_cflags="$(PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$official_overlay_pc_dir" pkg-config --cflags Qt6Core)"
+case "$core_cflags" in
+  *"-I$qt_fixture/lib/QtCore.framework/Headers"*"-I$qt_fixture/include/QtCore"*) ;;
+  *) fail "official overlay did not prepend QtCore framework headers and search path: $core_cflags" ;;
+esac
+[[ "$core_cflags" == *"-F$qt_fixture/lib"* ]] ||
+  fail "official overlay omitted QtCore framework search path: $core_cflags"
+[[ "$core_cflags" == *'-DOFFICIAL_Core'* ]] ||
+  fail "official Qt compiler flags were not preserved"
+widget_cflags="$(PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$official_overlay_pc_dir" pkg-config --cflags Qt6Widgets)"
+for framework_name in QtCore QtGui QtWidgets; do
+  [[ "$widget_cflags" == *"$qt_fixture/lib/$framework_name.framework/Headers"* ]] ||
+    fail "Qt6Widgets flags omitted $framework_name framework headers"
+done
+[[ "$widget_cflags" != *"/opt/homebrew/"* && "$widget_cflags" != *"/usr/local/"* ]] ||
+  fail "official overlay introduced Homebrew Qt include paths"
+official_widget_libs="$(PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$official_overlay_pc_dir" pkg-config --libs Qt6Widgets)"
+[[ "$official_widget_libs" == *"-lpreservedCore"* ]] || fail "official Qt linker flags were not preserved"
 
 if PATH="$tmpdir/fake-bin:$PATH" bash "$repo_root/scripts/configure-macos-qt.sh" "$tmpdir/missing-qt" 6.12.0 "$tmpdir/missing-pc" > "$tmpdir/missing-environment" 2> "$tmpdir/missing-diagnostics"; then
   fail "Qt configuration accepted a nonexistent Qt root"

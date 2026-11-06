@@ -212,6 +212,52 @@ jobs:
             "$QT_ROOT"/*|"$RUNNER_TEMP"/*) ;;
             *) echo "PKG_CONFIG_LIBDIR is outside pinned Qt metadata: $PKG_CONFIG_LIBDIR" >&2; exit 1 ;;
           esac
+      - name: Verify Qt framework header compilation
+        run: |
+          set -euo pipefail
+
+          source_file="$RUNNER_TEMP/ddgo-qt-header-preflight.cpp"
+          cat > "$source_file" <<'EOF'
+          #include <QAbstractAnimation>
+          #include <qabstractanimation.h>
+          #include <QtCore/qabstractanimation.h>
+          #include <QtCore/QObject>
+          #include <QtGui/QWindow>
+          #include <QtWidgets/QWidget>
+
+          int main() {
+              return 0;
+          }
+          EOF
+
+          cxx="$(go env CXX)"
+          echo "QT_ROOT=$QT_ROOT"
+          echo "QT_VERSION=$QT_VERSION"
+          echo "QT_PKG_CONFIG_SOURCE=$QT_PKG_CONFIG_SOURCE"
+          echo "target architecture=${{ matrix.lipo_arch }}"
+          echo "compiler=$cxx"
+          "$cxx" --version
+          for module in Qt6Core Qt6Gui Qt6Widgets; do
+            echo "$module cflags: $(pkg-config --cflags "$module")"
+          done
+          echo "effective CGO_CXXFLAGS=$CGO_CXXFLAGS"
+          for framework in QtCore QtGui QtWidgets; do
+            headers="$QT_ROOT/lib/$framework.framework/Headers"
+            echo "$framework framework headers: $headers"
+            test -d "$headers"
+          done
+          required_headers=(
+            "$QT_ROOT/include/QtCore/qabstractanimation.h"
+            "$QT_ROOT/include/QtCore/QObject"
+            "$QT_ROOT/include/QtGui/QWindow"
+            "$QT_ROOT/include/QtWidgets/QWidget"
+          )
+          for header in "${required_headers[@]}"; do
+            echo "expected header: $header"
+            test -e "$header"
+          done
+
+          "$cxx" -arch "${{ matrix.lipo_arch }}" -fsyntax-only $CGO_CXXFLAGS "$source_file"
       - name: Determine macOS cache context
         id: cache-context
         shell: bash

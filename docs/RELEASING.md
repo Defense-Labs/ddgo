@@ -104,11 +104,17 @@ headers, frameworks, plugins, and pkg-config metadata are not used.
 
 MIQT v0.15.0 discovers Qt through `pkg-config`. The
 `scripts/configure-macos-qt.sh` helper first uses suitable Qt-provided
-`Qt6Core`, `Qt6Gui`, and `Qt6Widgets` metadata when available. Official macOS
-Qt packages do not guarantee those files, so the helper otherwise generates
-minimal metadata from `qmake`'s installed paths and version, including only the
-base framework modules MIQT requires. `PKG_CONFIG_LIBDIR` is set to that one
-validated directory, preventing accidental resolution of a Homebrew Qt.
+`Qt6Core`, `Qt6Gui`, and `Qt6Widgets` metadata when available, copied into a
+local overlay that prepends each framework's real `Headers` directory and Qt
+framework search path. This preserves Qt's supplied linker flags and
+dependencies while allowing MIQT's short and module-qualified header forms to
+resolve without selecting a module-local forwarding header first. Official
+macOS Qt packages do not guarantee those files, so the helper otherwise
+generates minimal metadata from `qmake`'s installed paths and version,
+including only the base framework modules MIQT requires. `PKG_CONFIG_LIBDIR` is
+set to that one validated directory, preventing accidental resolution of a
+Homebrew Qt. Before the Go build, each macOS slice syntax-checks representative
+Qt headers with the same `CGO_CXXFLAGS` and target architecture used for MIQT.
 
 The Qt and installer versions are intentionally centralized in the macOS slice
 job environment in `.github/workflows/cd.yml`. Change them together, then run
