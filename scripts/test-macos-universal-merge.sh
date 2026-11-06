@@ -14,7 +14,7 @@ fail() {
   exit 1
 }
 
-for tool in clang lipo cmp stat codesign ditto; do
+for tool in clang lipo cmp stat codesign ditto dwarfdump; do
   command -v "$tool" >/dev/null || fail "required tool is unavailable: $tool"
 done
 [[ -x /usr/libexec/PlistBuddy ]] || fail "required tool is unavailable: /usr/libexec/PlistBuddy"
@@ -54,6 +54,41 @@ assert_slice_matches() {
   local extracted="$tmpdir/extracted-${arch}-$(basename "$universal_file")"
   lipo -thin "$arch" "$universal_file" -output "$extracted"
   cmp -s "$extracted" "$expected" || fail "$arch slice does not match its source: $universal_file"
+}
+
+uuid_for_arch() {
+  local file="$1"
+  local arch="$2"
+  local matches
+  local count
+
+  matches="$(dwarfdump --uuid "$file" | awk -v wanted_arch="$arch" '
+    $1 == "UUID:" {
+      reported_arch = $3
+      gsub(/[()]/, "", reported_arch)
+      if (reported_arch == wanted_arch) print $2
+    }
+  ')"
+  count="$(printf '%s\n' "$matches" | awk 'NF { count++ } END { print count + 0 }')"
+  if [[ "$count" -ne 1 ]]; then
+    echo "dwarfdump UUID output for $file:" >&2
+    dwarfdump --uuid "$file" >&2
+    fail "expected exactly one $arch UUID in $file, found $count"
+  fi
+  printf '%s\n' "$matches"
+}
+
+assert_uuid_matches() {
+  local universal_file="$1"
+  local arch="$2"
+  local expected_file="$3"
+  local expected_uuid
+  local actual_uuid
+
+  expected_uuid="$(uuid_for_arch "$expected_file" "$arch")"
+  actual_uuid="$(uuid_for_arch "$universal_file" "$arch")"
+  [[ "$actual_uuid" == "$expected_uuid" ]] ||
+    fail "$arch UUID changed after complete signed merge: expected $expected_uuid, got $actual_uuid"
 }
 
 assert_no_temporary_files() {
@@ -152,8 +187,11 @@ if ! TMPDIR="$full_merge_tmp" bash "$script_dir/merge-macos-universal.sh" \
 fi
 [[ -x "$full_output/Contents/MacOS/ddgo" ]] || fail "complete merger did not create an executable"
 assert_exact_universal "$full_output/Contents/MacOS/ddgo"
-assert_slice_matches "$full_output/Contents/MacOS/ddgo" arm64 "$arm_executable"
-assert_slice_matches "$full_output/Contents/MacOS/ddgo" x86_64 "$amd_executable"
+# codesign adds signature data to the complete bundle, so final slices are not
+# byte-identical to their unsigned inputs. LC_UUID remains run-identity data
+# from the selected architecture and is independent of dwarfdump output order.
+assert_uuid_matches "$full_output/Contents/MacOS/ddgo" arm64 "$arm_executable"
+assert_uuid_matches "$full_output/Contents/MacOS/ddgo" x86_64 "$amd_executable"
 codesign --verify --deep --strict --verbose=2 "$full_output"
 if grep -Fq 'tmpdir: unbound variable' "$tmpdir/full-merge-success.log"; then
   fail "complete merger reported an unbound cleanup variable"
