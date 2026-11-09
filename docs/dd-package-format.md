@@ -87,8 +87,8 @@ line-aware fallback for a small set of observed historic DDCut conventions:
   `job_text`, `step_name`, `step_text`, popup text/title, and the WCS failure
   message); and
 - an extra space after a sequence marker on a mapping item; and
-- one excess leading space on root-manifest step mapping siblings when a
-  `job_steps` sequence item's actual indentation establishes the intended
+- one excess leading space on step mapping siblings when a root `job_steps`
+  sequence item or a top-level submanifest step item establishes the intended
   sibling alignment.
 
 The fallback is not a permissive YAML replacement. It rejects tabs used for
@@ -108,8 +108,16 @@ buffer is capped at twice the configured per-manifest byte limit; each expanded
 line is checked before indentation, quoting, or output construction. Root
 manifests and submanifests use the same policy and remain subject to the
 existing manifest, resource, archive, inclusion-depth, and expanded-step
-limits, except that the observed step-sibling indentation adjustment is
-currently restricted to a root `job_steps` context.
+limits. The observed step-sibling adjustment applies only to root `job_steps`
+items and top-level included-submanifest step items; it is not a generalized
+indentation repair.
+
+Markdown boundary recognition treats a colon as a mapping separator only when
+it has YAML separation (whitespace or end-of-line) after it. This preserves
+ordinary Markdown such as `https://example.org`, `12:30`, and
+`image:example.png`, while a sibling such as `step_text: Continue` still ends
+a recovered unindented Markdown block. A line whose structure remains genuinely
+ambiguous is rejected rather than silently reassigned.
 
 Internally, all compatibility adjustments use one normalization pipeline: a
 line scanner retains original source lines, a small structural context tracks

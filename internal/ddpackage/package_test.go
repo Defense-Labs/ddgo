@@ -628,6 +628,117 @@ func TestLegacyStepFieldIndentationRejectsUnsupportedLayout(t *testing.T) {
 	}
 }
 
+func TestLegacySubmanifestStepIndentationMatchesStrictSemantics(t *testing.T) {
+	root := `- job_name: Example
+  job_steps:
+    - manifest_file: intro.yml
+`
+	strict := `- step_name: Welcome
+  step_markdown: |
+    Welcome to the Optic Cut Library!
+
+    This library's version is: **2.0**
+    [https://optic.ghostgunner.net](https://optic.ghostgunner.net).
+
+    - Universal clamp
+    - Threadmill for the correct holes, either:
+       - M3 / 4-40: Tool description
+  step_image: Images/welcome.png
+  popup_title: Did you check?
+  popup_text: Continue carefully.
+  future_step_field: retained
+- step_name: Cut
+  step_gcode: Code/cut.nc
+  timeout: 120
+`
+	legacy := `- step_name: Welcome
+   step_markdown: |
+Welcome to the Optic Cut Library!
+
+This library's version is: **2.0**
+[https://optic.ghostgunner.net](https://optic.ghostgunner.net).
+
+- Universal clamp
+- Threadmill for the correct holes, either:
+   - M3 / 4-40: Tool description
+   step_image: Images/welcome.png
+   popup_title: Did you check?
+   popup_text: Continue carefully.
+   future_step_field: retained
+- step_name: Cut
+   step_gcode: Code/cut.nc
+   timeout: 120
+`
+	resources := []zipEntry{
+		{name: manifestName, data: root},
+		{name: "Images/welcome.png", data: "image"},
+		{name: "Code/cut.nc", data: "G0 X1\n"},
+	}
+	strictPkg, err := Load(writePackage(t, append(resources, zipEntry{name: "intro.yml", data: strict})...))
+	if err != nil {
+		t.Fatalf("Load(strict) error: %v", err)
+	}
+	legacyPkg, err := Load(writePackage(t, append(resources, zipEntry{name: "intro.yml", data: legacy})...))
+	if err != nil {
+		t.Fatalf("Load(legacy) error: %v", err)
+	}
+	if !reflect.DeepEqual(legacyPkg.Jobs, strictPkg.Jobs) {
+		t.Fatalf("legacy semantics differ:\nlegacy=%+v\nstrict=%+v", legacyPkg.Jobs, strictPkg.Jobs)
+	}
+	steps := legacyPkg.Jobs[0].Steps
+	if len(steps) != 2 || steps[0].Markdown != "Welcome to the Optic Cut Library!\n\nThis library's version is: **2.0**\n[https://optic.ghostgunner.net](https://optic.ghostgunner.net).\n\n- Universal clamp\n- Threadmill for the correct holes, either:\n   - M3 / 4-40: Tool description\n" ||
+		steps[0].ImagePath != "Images/welcome.png" || steps[0].PopupTitle != "Did you check?" || steps[0].Metadata["future_step_field"] != "retained" ||
+		steps[1].GCodePath != "Code/cut.nc" || steps[1].Timeout == nil || *steps[1].Timeout != 120 {
+		t.Fatalf("legacy submanifest steps = %+v", steps)
+	}
+	foundIndentWarning := false
+	for _, warning := range legacyPkg.Warnings {
+		if warning.Path == "intro.yml" && warning.Field == "line 2" && warning.Message == "normalized legacy step-field indentation" {
+			foundIndentWarning = true
+		}
+	}
+	if !foundIndentWarning {
+		t.Fatalf("missing submanifest indentation warning: %+v", legacyPkg.Warnings)
+	}
+}
+
+func TestLegacySubmanifestStepIndentationRejectsUnsupportedLayout(t *testing.T) {
+	root := `- job_name: Example
+  job_steps:
+    - manifest_file: intro.yml
+`
+	child := `- step_name: Instructions
+    step_text: two excess spaces are not supported
+`
+	pkg, err := Load(writePackage(t, zipEntry{name: manifestName, data: root}, zipEntry{name: "intro.yml", data: child}))
+	if pkg != nil || err == nil {
+		t.Fatalf("Load() = pkg=%v err=%v, want unsupported submanifest indentation rejection", pkg, err)
+	}
+}
+
+func TestLegacyMappingColonRequiresYAMLSeparation(t *testing.T) {
+	for _, line := range []string{
+		"https://optic.ghostgunner.net",
+		"[https://optic.ghostgunner.net](https://optic.ghostgunner.net).",
+		"12:30",
+		"image:example.png",
+	} {
+		if _, ok := legacyField(line); ok {
+			t.Fatalf("legacyField(%q) unexpectedly recognized scalar text as a mapping", line)
+		}
+	}
+	for _, line := range []string{
+		"step_name: Example",
+		"step_image:",
+		"future_step_field: retained",
+		`"future:key": retained`,
+	} {
+		if _, ok := legacyField(line); !ok {
+			t.Fatalf("legacyField(%q) did not recognize a mapping", line)
+		}
+	}
+}
+
 func TestLegacyCompatibilityOutputLimit(t *testing.T) {
 	input := strings.Repeat(" ", 24) + "step_markdown: |\n" + "x\n" + "x\n" + "x\n" + "x\n"
 	if len(input) >= 64 {

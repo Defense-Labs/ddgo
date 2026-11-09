@@ -103,9 +103,13 @@ type legacyNormalizationContext struct {
 	jobFieldIndent  int
 	stepListIndent  int
 	stepFieldIndent int
+	// topLevelStepSequence identifies the sequence shape used by included
+	// submanifests. It permits the same narrowly-scoped sibling adjustment as
+	// job_steps without treating arbitrary root mappings as step fields.
+	topLevelStepSequence bool
 	// legacyStepSiblingIndent records the original one-space-excess position
-	// for the active root-manifest step. Markdown recovery uses it to identify
-	// an unnormalized following sibling as a structural boundary.
+	// for the active compatible step. Markdown recovery uses it to identify an
+	// unnormalized following sibling as a structural boundary.
 	legacyStepSiblingIndent int
 	stepNestedMappingIndent int
 	literalIndent           int
@@ -311,6 +315,7 @@ func (context *legacyNormalizationContext) observe(line legacyManifestLine) {
 		context.stepFieldIndent = -1
 		context.legacyStepSiblingIndent = -1
 		context.stepNestedMappingIndent = -1
+		context.topLevelStepSequence = false
 		return
 	}
 	if !field.list && field.key == "job_steps" {
@@ -319,6 +324,7 @@ func (context *legacyNormalizationContext) observe(line legacyManifestLine) {
 		context.stepFieldIndent = -1
 		context.legacyStepSiblingIndent = -1
 		context.stepNestedMappingIndent = -1
+		context.topLevelStepSequence = false
 		return
 	}
 	if field.list && context.jobFieldIndent >= 0 && field.indent > context.jobFieldIndent {
@@ -335,6 +341,7 @@ func (context *legacyNormalizationContext) observe(line legacyManifestLine) {
 	if field.list && field.key == "step_name" && context.jobFieldIndent < 0 {
 		context.stepListIndent = field.indent
 		context.stepFieldIndent = field.indent + 2
+		context.topLevelStepSequence = true
 		context.legacyStepSiblingIndent = -1
 		context.stepNestedMappingIndent = -1
 		return
@@ -347,12 +354,14 @@ func (context *legacyNormalizationContext) observe(line legacyManifestLine) {
 	}
 }
 
-// normalizeStepSiblingIndent accepts only the observed root-manifest form:
-// a field one space deeper than the mapping key introduced by a job_steps
-// sequence item. The actual sequence indentation defines the expected sibling
-// indentation, and a pending nested mapping makes the situation ambiguous.
+// normalizeStepSiblingIndent accepts only the observed root job_steps and
+// included-submanifest forms: a field one space deeper than the mapping key
+// introduced by a step sequence item. The actual sequence indentation defines
+// the expected sibling indentation, and a pending nested mapping makes the
+// situation ambiguous.
 func (n *legacyManifestNormalizer) normalizeStepSiblingIndent(line legacyManifestLine) legacyManifestLine {
-	if !line.HasCandidateMap || line.Field.list || n.context.jobFieldIndent < 0 || n.context.stepFieldIndent < 0 {
+	if !line.HasCandidateMap || line.Field.list || n.context.stepFieldIndent < 0 ||
+		(n.context.jobFieldIndent < 0 && !n.context.topLevelStepSequence) {
 		return line
 	}
 	if line.Field.indent != n.context.stepFieldIndent+1 || n.context.stepNestedMappingIndent >= 0 {
@@ -574,18 +583,31 @@ func legacyMappingColon(line string, start int) int {
 			for i++; i < len(line) && line[i] == ' '; i++ {
 			}
 			if i < len(line) && line[i] == ':' {
-				return i
+				if i+1 == len(line) || legacyYAMLSeparation(line[i+1]) {
+					return i
+				}
 			}
 			return -1
 		}
 		return -1
 	}
 	for i := start; i < len(line); i++ {
-		if line[i] == ':' {
+		if line[i] != ':' {
+			continue
+		}
+		// A colon inside a plain scalar (for example https:// or 12:30)
+		// cannot introduce a YAML mapping key. Do not scan past it: a later
+		// colon-space belongs to that same scalar rather than a new key.
+		if i+1 == len(line) || legacyYAMLSeparation(line[i+1]) {
 			return i
 		}
+		return -1
 	}
 	return -1
+}
+
+func legacyYAMLSeparation(character byte) bool {
+	return character == ' ' || character == '\t'
 }
 
 func legacyQuotedKey(key string) bool {
