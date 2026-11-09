@@ -86,12 +86,18 @@ line-aware fallback for a small set of observed historic DDCut conventions:
 - unquoted colon-space text in the documented human-text fields (`job_name`,
   `job_text`, `step_name`, `step_text`, popup text/title, and the WCS failure
   message); and
-- an extra space after a sequence marker on a mapping item.
+- an extra space after a sequence marker on a mapping item; and
+- one excess leading space on root-manifest step mapping siblings when a
+  `job_steps` sequence item's actual indentation establishes the intended
+  sibling alignment.
 
 The fallback is not a permissive YAML replacement. It rejects tabs used for
 actual YAML indentation, leaves resource paths and numeric fields alone, and
 returns an error when it cannot produce one strict YAML document or safely
-classify a legacy Markdown boundary. Correctly indented literal and folded
+classify a legacy Markdown boundary. The step-sibling adjustment shares its
+effective alignment with unindented Markdown recovery, so an overindented
+`step_text`, `step_image`, `step_gcode`, or unambiguous unknown sibling ends a
+legacy Markdown block rather than becoming Markdown. Correctly indented literal and folded
 block scalars are preserved without line-level compatibility rewriting, even
 when another field elsewhere requires fallback. Unknown job and step metadata
 continues to be retained rather than becoming Markdown content. Recovered
@@ -102,7 +108,8 @@ buffer is capped at twice the configured per-manifest byte limit; each expanded
 line is checked before indentation, quoting, or output construction. Root
 manifests and submanifests use the same policy and remain subject to the
 existing manifest, resource, archive, inclusion-depth, and expanded-step
-limits.
+limits, except that the observed step-sibling indentation adjustment is
+currently restricted to a root `job_steps` context.
 
 Internally, all compatibility adjustments use one normalization pipeline: a
 line scanner retains original source lines, a small structural context tracks
@@ -110,7 +117,8 @@ job, step, metadata, and scalar relationships, rule handlers make only the
 documented adjustments, and one bounded emitter creates the temporary YAML.
 This keeps diagnostics tied to original source lines and ensures a fallback
 result still requires YAML v3 validation. Generalized recovery of inconsistent
-YAML indentation is not implemented yet; ambiguous indentation remains an
+YAML indentation is not implemented: the documented one-space step-sibling
+case is the only indentation repair, and ambiguous indentation remains an
 error rather than being guessed.
 
 Initial loader development had no real-world fixtures and therefore used only

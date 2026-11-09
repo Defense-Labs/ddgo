@@ -98,28 +98,36 @@ func (line legacyManifestLine) withContent(content string) legacyManifestLine {
 // current rules. It intentionally retains parent indentation instead of a
 // global width so a future indentation rule can reason about actual parents.
 type legacyNormalizationContext struct {
-	rootJobIndent  int
-	jobIndent      int
-	jobFieldIndent int
-	stepListIndent int
-	stepIndent     int
-	literalIndent  int
-	markdown       *legacyMarkdownRecovery
+	rootJobIndent   int
+	jobIndent       int
+	jobFieldIndent  int
+	stepListIndent  int
+	stepFieldIndent int
+	// legacyStepSiblingIndent records the original one-space-excess position
+	// for the active root-manifest step. Markdown recovery uses it to identify
+	// an unnormalized following sibling as a structural boundary.
+	legacyStepSiblingIndent int
+	stepNestedMappingIndent int
+	literalIndent           int
+	markdown                *legacyMarkdownRecovery
 }
 
 type legacyMarkdownRecovery struct {
-	headerIndent   int
-	jobFieldIndent int
+	headerIndent        int
+	jobFieldIndent      int
+	legacySiblingIndent int
 }
 
 func newLegacyNormalizationContext() legacyNormalizationContext {
 	return legacyNormalizationContext{
-		rootJobIndent:  -1,
-		jobIndent:      -1,
-		jobFieldIndent: -1,
-		stepListIndent: -1,
-		stepIndent:     -1,
-		literalIndent:  -1,
+		rootJobIndent:           -1,
+		jobIndent:               -1,
+		jobFieldIndent:          -1,
+		stepListIndent:          -1,
+		stepFieldIndent:         -1,
+		legacyStepSiblingIndent: -1,
+		stepNestedMappingIndent: -1,
+		literalIndent:           -1,
 	}
 }
 
@@ -127,6 +135,7 @@ type legacyNormalizationActions struct {
 	markdownLines   []int
 	colonLines      []int
 	whitespaceLines []int
+	stepIndentLines []int
 }
 
 // legacyOutputEmitter is the sole normalized-buffer constructor. It enforces
@@ -221,7 +230,7 @@ func (n *legacyManifestNormalizer) normalize() error {
 	for index := 0; index < len(n.lines); {
 		line := n.lines[index]
 		if n.context.markdown != nil {
-			boundary, ambiguous := legacyMarkdownBoundary(line.Content, n.context.markdown.headerIndent, n.context.markdown.jobFieldIndent)
+			boundary, ambiguous := legacyMarkdownBoundary(line.Content, n.context.markdown.headerIndent, n.context.markdown.jobFieldIndent, n.context.markdown.legacySiblingIndent)
 			if ambiguous {
 				return fmt.Errorf("line %d is an ambiguous unindented Markdown boundary", line.Number)
 			}
@@ -251,12 +260,13 @@ func (n *legacyManifestNormalizer) normalize() error {
 			return err
 		}
 		line = n.normalizeSequenceMarker(line)
+		line = n.normalizeStepSiblingIndent(line)
 		if line.HasCandidateMap && !line.Field.list && line.Field.key == "step_markdown" && strings.TrimSpace(line.Field.value) == "|" {
 			if legacyMarkdownNeedsIndent(n.lines, index+1, line.Field.indent) {
 				if err := n.emitter.emit(line, line.Content); err != nil {
 					return err
 				}
-				n.context.markdown = &legacyMarkdownRecovery{headerIndent: line.Field.indent, jobFieldIndent: n.context.jobFieldIndent}
+				n.context.markdown = &legacyMarkdownRecovery{headerIndent: line.Field.indent, jobFieldIndent: n.context.jobFieldIndent, legacySiblingIndent: n.context.legacyStepSiblingIndent}
 				n.changed = true
 				n.actions.markdownLines = append(n.actions.markdownLines, line.Number)
 				index++
@@ -285,9 +295,10 @@ func (n *legacyManifestNormalizer) normalize() error {
 }
 
 // observe centralizes the small amount of parent/child structure this phase
-// needs. It records observed indentation only; it deliberately does not try
-// to repair inconsistent indentation. A later rule can use these parent
-// relationships without adding another preprocessing pass.
+// needs. It records the actual job_steps sequence indentation so the one
+// documented root-manifest sibling adjustment can avoid global widths. A
+// later rule can use these parent relationships without another preprocessing
+// pass.
 func (context *legacyNormalizationContext) observe(line legacyManifestLine) {
 	if !line.HasCandidateMap {
 		return
@@ -297,26 +308,62 @@ func (context *legacyNormalizationContext) observe(line legacyManifestLine) {
 		context.rootJobIndent = field.indent
 		context.jobIndent = field.indent
 		context.stepListIndent = -1
-		context.stepIndent = -1
+		context.stepFieldIndent = -1
+		context.legacyStepSiblingIndent = -1
+		context.stepNestedMappingIndent = -1
 		return
 	}
 	if !field.list && field.key == "job_steps" {
 		context.jobFieldIndent = field.indent
 		context.stepListIndent = -1
-		context.stepIndent = -1
+		context.stepFieldIndent = -1
+		context.legacyStepSiblingIndent = -1
+		context.stepNestedMappingIndent = -1
 		return
 	}
 	if field.list && context.jobFieldIndent >= 0 && field.indent > context.jobFieldIndent {
-		context.stepListIndent = field.indent
-		context.stepIndent = field.indent
+		if context.stepListIndent < 0 || field.indent == context.stepListIndent {
+			context.stepListIndent = field.indent
+			context.stepFieldIndent = field.indent + 2
+			context.legacyStepSiblingIndent = -1
+			context.stepNestedMappingIndent = -1
+		}
 		return
 	}
 	// Included manifests are root step sequences, so they have no enclosing
 	// job_steps field from which to infer their parent.
 	if field.list && field.key == "step_name" && context.jobFieldIndent < 0 {
 		context.stepListIndent = field.indent
-		context.stepIndent = field.indent
+		context.stepFieldIndent = field.indent + 2
+		context.legacyStepSiblingIndent = -1
+		context.stepNestedMappingIndent = -1
+		return
 	}
+	if !field.list && context.stepFieldIndent >= 0 && field.indent == context.stepFieldIndent {
+		context.stepNestedMappingIndent = -1
+		if strings.TrimSpace(field.value) == "" {
+			context.stepNestedMappingIndent = field.indent
+		}
+	}
+}
+
+// normalizeStepSiblingIndent accepts only the observed root-manifest form:
+// a field one space deeper than the mapping key introduced by a job_steps
+// sequence item. The actual sequence indentation defines the expected sibling
+// indentation, and a pending nested mapping makes the situation ambiguous.
+func (n *legacyManifestNormalizer) normalizeStepSiblingIndent(line legacyManifestLine) legacyManifestLine {
+	if !line.HasCandidateMap || line.Field.list || n.context.jobFieldIndent < 0 || n.context.stepFieldIndent < 0 {
+		return line
+	}
+	if line.Field.indent != n.context.stepFieldIndent+1 || n.context.stepNestedMappingIndent >= 0 {
+		return line
+	}
+	// Remove precisely the one excess leading space. The original line is
+	// otherwise retained, including unknown keys, values, and inline comments.
+	n.changed = true
+	n.actions.stepIndentLines = append(n.actions.stepIndentLines, line.Number)
+	n.context.legacyStepSiblingIndent = line.Field.indent
+	return line.withContent(line.Content[:line.Field.indent-1] + line.Content[line.Field.indent:])
 }
 
 func (n *legacyManifestNormalizer) normalizeWhitespace(line legacyManifestLine) (legacyManifestLine, error) {
@@ -381,6 +428,9 @@ func (n *legacyManifestNormalizer) diagnostics(source string) []Diagnostic {
 	}
 	if len(n.actions.whitespaceLines) != 0 {
 		warnings = append(warnings, Diagnostic{Path: source, Field: fmt.Sprintf("line %d", n.actions.whitespaceLines[0]), Message: "accepted tabs on blank or comment-only lines"})
+	}
+	if len(n.actions.stepIndentLines) != 0 {
+		warnings = append(warnings, Diagnostic{Path: source, Field: fmt.Sprintf("line %d", n.actions.stepIndentLines[0]), Message: "normalized legacy step-field indentation"})
 	}
 	return warnings
 }
@@ -545,7 +595,7 @@ func legacyQuotedKey(key string) bool {
 	return (key[0] == '\'' && key[len(key)-1] == '\'') || (key[0] == '"' && key[len(key)-1] == '"')
 }
 
-func legacyMarkdownBoundary(line string, headerIndent, jobFieldIndent int) (boundary, ambiguous bool) {
+func legacyMarkdownBoundary(line string, headerIndent, jobFieldIndent, legacySiblingIndent int) (boundary, ambiguous bool) {
 	field, ok := legacyField(line)
 	if !ok {
 		return false, false
@@ -553,6 +603,12 @@ func legacyMarkdownBoundary(line string, headerIndent, jobFieldIndent int) (boun
 	// Any mapping key aligned with the Markdown field belongs to the same
 	// step, including unknown metadata retained by DDGo.
 	if !field.list && field.indent == headerIndent {
+		return true, false
+	}
+	// The step header was normalized from the one-space-excess root legacy
+	// layout. Following raw siblings have not yet reached the indentation rule,
+	// but they are still structural boundaries rather than Markdown content.
+	if !field.list && legacySiblingIndent >= 0 && field.indent == legacySiblingIndent {
 		return true, false
 	}
 	// A new item at the enclosing step-list indentation is a later step.

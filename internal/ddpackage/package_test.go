@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -464,6 +465,166 @@ Last paragraph in the step.
 	job := pkg.Jobs[0]
 	if job.Steps[0].Markdown != "Last paragraph in the step.\n" || job.Metadata["future_job_field"] != "retained" {
 		t.Fatalf("legacy Markdown absorbed unknown job field: %+v", job)
+	}
+}
+
+func TestLegacyStepFieldIndentationMatchesStrictSemantics(t *testing.T) {
+	strict := `- job_name: First
+  job_steps:
+   - step_name: Instructions
+     step_markdown: |
+       # Heading
+
+       This Markdown has punctuation: preserved.
+       - list item
+         code block
+     future_step_field: retained
+     step_text: "Continue: carefully."
+   - step_name: Image step
+     step_image: Images/example.png
+- job_name: Second
+  job_steps:
+   - step_name: G-code step
+     step_gcode: Code/example.nc
+`
+	legacy := `- job_name: First
+  job_steps:
+   - step_name: Instructions
+      step_markdown: |
+# Heading
+
+This Markdown has punctuation: preserved.
+- list item
+  code block
+      future_step_field: retained
+      step_text: Continue: carefully.
+   - step_name: Image step
+      step_image: Images/example.png
+- job_name: Second
+  job_steps:
+   - step_name: G-code step
+     step_gcode: Code/example.nc
+`
+	entries := []zipEntry{
+		{name: "Images/example.png", data: "image"},
+		{name: "Code/example.nc", data: "G0 X1\n"},
+	}
+	normalized, err := normalizeLegacyManifest([]byte(legacy), manifestName, DefaultLimits().MaxManifestBytes)
+	if err != nil || !normalized.Changed {
+		t.Fatalf("normalizeLegacyManifest() = changed %v err %v", normalized.Changed, err)
+	}
+	if _, err := decodeYAMLStrict(normalized.YAML, manifestName); err != nil {
+		t.Fatalf("normalized legacy YAML is invalid: %v\n%s", err, normalized.YAML)
+	}
+	again, err := normalizeLegacyManifest(normalized.YAML, manifestName, DefaultLimits().MaxManifestBytes)
+	if err != nil || again.Changed || string(again.YAML) != string(normalized.YAML) {
+		t.Fatalf("step-indentation normalization is not idempotent: changed=%v err=%v", again.Changed, err)
+	}
+	strictEntries := append([]zipEntry{{name: manifestName, data: strict}}, entries...)
+	legacyEntries := append([]zipEntry{{name: manifestName, data: legacy}}, entries...)
+	strictPkg, err := Load(writePackage(t, strictEntries...))
+	if err != nil {
+		t.Fatalf("Load(strict) error: %v", err)
+	}
+	legacyPkg, err := Load(writePackage(t, legacyEntries...))
+	if err != nil {
+		t.Fatalf("Load(legacy) error: %v", err)
+	}
+	if !reflect.DeepEqual(legacyPkg.Jobs, strictPkg.Jobs) {
+		t.Fatalf("legacy semantics differ:\nlegacy=%+v\nstrict=%+v", legacyPkg.Jobs, strictPkg.Jobs)
+	}
+	foundIndentWarning := false
+	for _, warning := range legacyPkg.Warnings {
+		if warning.Field == "line 4" && warning.Message == "normalized legacy step-field indentation" {
+			foundIndentWarning = true
+		}
+	}
+	if !foundIndentWarning {
+		t.Fatalf("missing step-indentation compatibility warning: %+v", legacyPkg.Warnings)
+	}
+}
+
+func TestLegacyStepFieldIndentationMarkdownBoundaries(t *testing.T) {
+	tests := []struct {
+		name     string
+		field    string
+		value    string
+		resource *zipEntry
+		check    func(t *testing.T, step Step)
+	}{
+		{
+			name:  "text",
+			field: "step_text",
+			value: "Continue carefully.",
+			check: func(t *testing.T, step Step) {
+				t.Helper()
+				if step.Text != "Continue carefully." {
+					t.Fatalf("step text = %q", step.Text)
+				}
+			},
+		},
+		{
+			name:     "image",
+			field:    "step_image",
+			value:    "Images/example.png",
+			resource: &zipEntry{name: "Images/example.png", data: "image"},
+			check: func(t *testing.T, step Step) {
+				t.Helper()
+				if step.ImagePath != "Images/example.png" {
+					t.Fatalf("step image = %q", step.ImagePath)
+				}
+			},
+		},
+		{
+			name:     "gcode",
+			field:    "step_gcode",
+			value:    "Code/example.nc",
+			resource: &zipEntry{name: "Code/example.nc", data: "G0 X1\n"},
+			check: func(t *testing.T, step Step) {
+				t.Helper()
+				if step.GCodePath != "Code/example.nc" {
+					t.Fatalf("step G-code = %q", step.GCodePath)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manifest := "- job_name: Example\n" +
+				"  job_steps:\n" +
+				"   - step_name: Instructions\n" +
+				"      step_markdown: |\n" +
+				"First paragraph.\n\n" +
+				"Second paragraph: with punctuation.\n" +
+				"      " + tt.field + ": " + tt.value + "\n" +
+				"   - step_name: Following\n" +
+				"     step_text: Ready.\n"
+			entries := []zipEntry{{name: manifestName, data: manifest}}
+			if tt.resource != nil {
+				entries = append(entries, *tt.resource)
+			}
+			pkg, err := Load(writePackage(t, entries...))
+			if err != nil {
+				t.Fatal(err)
+			}
+			steps := pkg.Jobs[0].Steps
+			if len(steps) != 2 || steps[0].Markdown != "First paragraph.\n\nSecond paragraph: with punctuation.\n" || steps[1].Name != "Following" {
+				t.Fatalf("Markdown boundary structure = %+v", steps)
+			}
+			tt.check(t, steps[0])
+		})
+	}
+}
+
+func TestLegacyStepFieldIndentationRejectsUnsupportedLayout(t *testing.T) {
+	manifest := `- job_name: Example
+  job_steps:
+   - step_name: Instructions
+       step_text: four spaces beyond the sequence marker is not supported
+`
+	pkg, err := Load(writePackage(t, zipEntry{name: manifestName, data: manifest}))
+	if pkg != nil || err == nil {
+		t.Fatalf("Load() = pkg=%v err=%v, want unsupported indentation rejection", pkg, err)
 	}
 }
 
