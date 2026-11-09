@@ -136,10 +136,11 @@ func newLegacyNormalizationContext() legacyNormalizationContext {
 }
 
 type legacyNormalizationActions struct {
-	markdownLines   []int
-	colonLines      []int
-	whitespaceLines []int
-	stepIndentLines []int
+	markdownLines    []int
+	colonLines       []int
+	whitespaceLines  []int
+	trailingTabLines []int
+	stepIndentLines  []int
 }
 
 // legacyOutputEmitter is the sole normalized-buffer constructor. It enforces
@@ -390,7 +391,46 @@ func (n *legacyManifestNormalizer) normalizeWhitespace(line legacyManifestLine) 
 		n.actions.whitespaceLines = append(n.actions.whitespaceLines, line.Number)
 		return line.withContent(trimmed), nil
 	}
+	if normalized, ok := legacyTrailingTabWhitespace(line); ok {
+		n.changed = true
+		n.actions.trailingTabLines = append(n.actions.trailingTabLines, line.Number)
+		return normalized, nil
+	}
 	return legacyManifestLine{}, fmt.Errorf("line %d uses a tab in YAML content; only blank or comment-only tab lines are supported", line.Number)
+}
+
+// legacyTrailingTabWhitespace removes tabs only when they occur after an
+// ordinary, unquoted mapping scalar. Tabs in indentation, mapping keys,
+// scalar content, comments, and block/flow forms remain unsupported because
+// removing them could change YAML meaning.
+func legacyTrailingTabWhitespace(line legacyManifestLine) (legacyManifestLine, bool) {
+	if !line.HasCandidateMap || line.BlockHeader {
+		return legacyManifestLine{}, false
+	}
+	content := line.Content
+	lineEnding := ""
+	if strings.HasSuffix(content, "\r") {
+		content = content[:len(content)-1]
+		lineEnding = "\r"
+	}
+	end := len(content)
+	for end > 0 && (content[end-1] == ' ' || content[end-1] == '\t') {
+		end--
+	}
+	if end == len(content) || !strings.ContainsRune(content[end:], '\t') || strings.ContainsRune(content[:end], '\t') {
+		return legacyManifestLine{}, false
+	}
+	valueStart := len(line.Field.head) + 1
+	if valueStart >= end {
+		return legacyManifestLine{}, false
+	}
+	value := strings.TrimSpace(content[valueStart:end])
+	if value == "" || strings.HasPrefix(value, "#") || strings.HasPrefix(value, "\"") || strings.HasPrefix(value, "'") ||
+		strings.HasPrefix(value, "|") || strings.HasPrefix(value, ">") || strings.HasPrefix(value, "[") || strings.HasPrefix(value, "{") ||
+		strings.Contains(value, " #") {
+		return legacyManifestLine{}, false
+	}
+	return line.withContent(content[:end] + lineEnding), true
 }
 
 func (n *legacyManifestNormalizer) normalizeSequenceMarker(line legacyManifestLine) legacyManifestLine {
@@ -437,6 +477,9 @@ func (n *legacyManifestNormalizer) diagnostics(source string) []Diagnostic {
 	}
 	if len(n.actions.whitespaceLines) != 0 {
 		warnings = append(warnings, Diagnostic{Path: source, Field: fmt.Sprintf("line %d", n.actions.whitespaceLines[0]), Message: "accepted tabs on blank or comment-only lines"})
+	}
+	if len(n.actions.trailingTabLines) != 0 {
+		warnings = append(warnings, Diagnostic{Path: source, Field: fmt.Sprintf("line %d", n.actions.trailingTabLines[0]), Message: "removed legacy trailing tab whitespace"})
 	}
 	if len(n.actions.stepIndentLines) != 0 {
 		warnings = append(warnings, Diagnostic{Path: source, Field: fmt.Sprintf("line %d", n.actions.stepIndentLines[0]), Message: "normalized legacy step-field indentation"})

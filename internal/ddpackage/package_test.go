@@ -739,6 +739,105 @@ func TestLegacyMappingColonRequiresYAMLSeparation(t *testing.T) {
 	}
 }
 
+func TestLegacyTrailingTabWhitespaceMatchesStrictSubmanifest(t *testing.T) {
+	root := `- job_name: Example
+  job_steps:
+    - manifest_file: notes.yml
+`
+	strict := `- step_name: Instructions
+  step_markdown: |
+    Read https://example.org before continuing.
+  step_text: Continue.
+  step_image: Images/example.png
+  popup_title: Confirm
+  future_step_field: retained
+- step_name: Cut
+  step_gcode: Code/cut.nc
+  timeout: 120
+- step_name: Following
+  step_text: Ready.
+`
+	legacy := "- step_name: Instructions\t  \n" +
+		"   step_markdown: |\n" +
+		"Read https://example.org before continuing.\n" +
+		"   step_text: Continue. \t\n" +
+		"   step_image: Images/example.png\t\t\n" +
+		"   popup_title: Confirm\t  \n" +
+		"   future_step_field: retained\t\n" +
+		"- step_name: Cut\n" +
+		"   step_gcode: Code/cut.nc\t\n" +
+		"   timeout: 120\t  \t\n" +
+		"- step_name: Following\n" +
+		"   step_text: Ready.\n"
+	resources := []zipEntry{
+		{name: manifestName, data: root},
+		{name: "Images/example.png", data: "image"},
+		{name: "Code/cut.nc", data: "G0 X1\n"},
+	}
+	strictPkg, err := Load(writePackage(t, append(resources, zipEntry{name: "notes.yml", data: strict})...))
+	if err != nil {
+		t.Fatalf("Load(strict) error: %v", err)
+	}
+	legacyPkg, err := Load(writePackage(t, append(resources, zipEntry{name: "notes.yml", data: legacy})...))
+	if err != nil {
+		t.Fatalf("Load(legacy) error: %v", err)
+	}
+	if !reflect.DeepEqual(legacyPkg.Jobs, strictPkg.Jobs) {
+		t.Fatalf("legacy semantics differ:\nlegacy=%+v\nstrict=%+v", legacyPkg.Jobs, strictPkg.Jobs)
+	}
+	foundTrailingTabWarning := false
+	for _, warning := range legacyPkg.Warnings {
+		if warning.Path == "notes.yml" && warning.Field == "line 1" && warning.Message == "removed legacy trailing tab whitespace" {
+			foundTrailingTabWarning = true
+		}
+	}
+	if !foundTrailingTabWarning {
+		t.Fatalf("missing trailing-tab compatibility warning: %+v", legacyPkg.Warnings)
+	}
+}
+
+func TestLegacyTrailingTabWhitespaceRejectsMeaningfulTabs(t *testing.T) {
+	root := `- job_name: Example
+  job_steps:
+    - manifest_file: notes.yml
+`
+	tests := map[string]string{
+		"tab indentation":           "\tstep_text: invalid\n",
+		"tab between indent spaces": " \t step_text: invalid\n",
+		"tab in mapping key":        "   step\ttext: invalid\n",
+		"tab in scalar":             "   step_text: inva\tlid\n",
+		"tab after separator":       "   step_text:\tinvalid\n",
+		"tab after block header":    "   step_markdown: |\t\n",
+		"tab after quoted scalar":   "   step_text: \"quoted\"\t\n",
+		"tab after inline comment":  "   timeout: 120 # comment\t\n",
+	}
+	for name, badLine := range tests {
+		t.Run(name, func(t *testing.T) {
+			child := "- step_name: Instructions\n" + badLine
+			pkg, err := Load(writePackage(t, zipEntry{name: manifestName, data: root}, zipEntry{name: "notes.yml", data: child}))
+			if pkg != nil || err == nil || !strings.Contains(err.Error(), "uses a tab in YAML content") {
+				t.Fatalf("Load() = pkg=%v err=%v, want meaningful-tab rejection", pkg, err)
+			}
+		})
+	}
+}
+
+func TestLegacyTrailingTabsPreserveLiteralContent(t *testing.T) {
+	manifest := "- job_name: Example\n" +
+		"  job_steps:\n" +
+		"    - step_name: Instructions\n" +
+		"      step_markdown: |\n" +
+		"        literal\tMarkdown content\n" +
+		"      step_text: Note: trigger fallback.\n"
+	pkg, err := Load(writePackage(t, zipEntry{name: manifestName, data: manifest}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pkg.Jobs[0].Steps[0].Markdown; got != "literal\tMarkdown content\n" {
+		t.Fatalf("Markdown = %q, want literal tab preserved", got)
+	}
+}
+
 func TestLegacyCompatibilityOutputLimit(t *testing.T) {
 	input := strings.Repeat(" ", 24) + "step_markdown: |\n" + "x\n" + "x\n" + "x\n" + "x\n"
 	if len(input) >= 64 {

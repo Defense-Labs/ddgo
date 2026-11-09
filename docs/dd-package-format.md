@@ -83,6 +83,8 @@ line-aware fallback for a small set of observed historic DDCut conventions:
   structural boundary in its containing step/job (including an unknown mapping
   field, a later step, or a later job);
 - tabs on otherwise blank or comment-only lines;
+- trailing tab whitespace on an unambiguously recognized ordinary mapping
+  scalar (the tabs are removed only after the scalar value); and
 - unquoted colon-space text in the documented human-text fields (`job_name`,
   `job_text`, `step_name`, `step_text`, popup text/title, and the WCS failure
   message); and
@@ -92,13 +94,16 @@ line-aware fallback for a small set of observed historic DDCut conventions:
   sibling alignment.
 
 The fallback is not a permissive YAML replacement. It rejects tabs used for
-actual YAML indentation, leaves resource paths and numeric fields alone, and
+actual YAML indentation, mapping keys, scalar content, quoted or complex
+values, and inline comments; it leaves resource paths and numeric fields alone
+apart from the permitted trailing-whitespace removal, and
 returns an error when it cannot produce one strict YAML document or safely
 classify a legacy Markdown boundary. The step-sibling adjustment shares its
 effective alignment with unindented Markdown recovery, so an overindented
 `step_text`, `step_image`, `step_gcode`, or unambiguous unknown sibling ends a
 legacy Markdown block rather than becoming Markdown. Correctly indented literal and folded
-block scalars are preserved without line-level compatibility rewriting, even
+block scalars (including their tabs) are preserved without line-level
+compatibility rewriting, even
 when another field elsewhere requires fallback. Unknown job and step metadata
 continues to be retained rather than becoming Markdown content. Recovered
 manifests receive concise nonfatal compatibility diagnostics. The archive's
