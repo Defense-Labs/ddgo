@@ -27,7 +27,7 @@ type DDPackageWindow struct {
 	jobCombo          *qt.QComboBox
 	steps             *qt.QListWidget
 	detail            *qt.QTextEdit
-	image             *qt.QLabel
+	imageGallery      *qt.QScrollArea
 	openGCode         *qt.QPushButton
 	runStep           *qt.QPushButton
 	selectedStatus    *qt.QLabel
@@ -92,9 +92,11 @@ func newDDPackageWindow(id app.DocumentID, pkg *ddpackage.Package, openStep func
 	w.detail = qt.NewQTextEdit(nil)
 	w.detail.SetReadOnly(true)
 	rightLayout.AddWidget(w.detail.QWidget)
-	w.image = qt.NewQLabel(nil)
-	w.image.SetWordWrap(true)
-	rightLayout.AddWidget(w.image.QWidget)
+	w.imageGallery = qt.NewQScrollArea(nil)
+	w.imageGallery.SetWidgetResizable(true)
+	w.imageGallery.SetMaximumHeight(520)
+	w.imageGallery.SetVisible(false)
+	rightLayout.AddWidget(w.imageGallery.QWidget)
 	w.openGCode = qt.NewQPushButton(nil)
 	w.openGCode.SetText("Open G-code View")
 	rightLayout.AddWidget(w.openGCode.QWidget)
@@ -247,7 +249,7 @@ func (w *DDPackageWindow) renderStep() {
 	step, ok := w.selectedStep()
 	if !ok {
 		w.detail.SetPlainText(jobText + "\n\nNo steps are declared for this job.")
-		w.image.Clear()
+		w.clearImageGallery()
 		w.openGCode.SetEnabled(false)
 		w.applySelectedFeedback(frontend.PackageStepExecutionFeedback(false, nil, nil))
 		return
@@ -278,33 +280,87 @@ func (w *DDPackageWindow) renderStep() {
 	w.detail.SetPlainText(text) // Plain text deliberately avoids untrusted HTML/network resources.
 	w.openGCode.SetEnabled(step.GCodePath != "")
 	w.renderSelectedControls()
-	w.image.Clear()
-	if step.ImagePath != "" {
-		data, err := w.pkg.ReadResource(step.ImagePath)
+	w.renderImageGallery(step.ImagePaths)
+}
+
+const (
+	maxPackageImageBytes    = 16 << 20
+	maxPackageImageWidth    = 4096
+	maxPackageImageHeight   = 4096
+	maxPackageImagePixels   = 16 << 20
+	maxGalleryImageCount    = 16
+	maxGalleryImageBytes    = 32 << 20
+	maxGalleryImagePixels   = 32 << 20
+	maxGalleryDisplayWidth  = 800
+	maxGalleryDisplayHeight = 500
+)
+
+func (w *DDPackageWindow) clearImageGallery() {
+	if old := w.imageGallery.TakeWidget(); old != nil {
+		old.DeleteLater()
+	}
+	w.imageGallery.SetVisible(false)
+}
+
+func (w *DDPackageWindow) renderImageGallery(paths []string) {
+	w.clearImageGallery()
+	if len(paths) == 0 {
+		return
+	}
+	w.imageGallery.SetVisible(true)
+	content := qt.NewQWidget(nil)
+	layout := qt.NewQVBoxLayout(nil)
+	content.SetLayout(layout.QLayout)
+	var displayedBytes, displayedPixels int64
+	displayCount := len(paths)
+	if displayCount > maxGalleryImageCount {
+		displayCount = maxGalleryImageCount
+	}
+	for index, resourcePath := range paths[:displayCount] {
+		caption := qt.NewQLabel(nil)
+		caption.SetWordWrap(true)
+		caption.SetText(fmt.Sprintf("Image %d of %d\n%s", index+1, len(paths), resourcePath))
+		layout.AddWidget(caption.QWidget)
+		imageLabel := qt.NewQLabel(nil)
+		imageLabel.SetWordWrap(true)
+		imageLabel.SetAlignment(qt.AlignHCenter)
+		layout.AddWidget(imageLabel.QWidget)
+		data, err := w.pkg.ReadResource(resourcePath)
 		if err != nil {
-			w.image.SetText("Image unavailable: " + err.Error())
-			return
+			imageLabel.SetText("Image unavailable: " + err.Error())
+			continue
 		}
-		if len(data) > 16<<20 {
-			w.image.SetText("Image omitted: resource is too large to display.")
-			return
+		if len(data) > maxPackageImageBytes || displayedBytes+int64(len(data)) > maxGalleryImageBytes {
+			imageLabel.SetText("Image omitted: resource or gallery byte limit exceeded.")
+			continue
 		}
 		config, _, err := image.DecodeConfig(bytes.NewReader(data))
-		if err != nil || config.Width <= 0 || config.Height <= 0 || config.Width > 4096 || config.Height > 4096 || int64(config.Width)*int64(config.Height) > 16<<20 {
-			w.image.SetText("Image unavailable: unsupported, malformed, or too large to display safely.")
-			return
+		pixels := int64(config.Width) * int64(config.Height)
+		if err != nil || config.Width <= 0 || config.Height <= 0 || config.Width > maxPackageImageWidth || config.Height > maxPackageImageHeight || pixels > maxPackageImagePixels || displayedPixels+pixels > maxGalleryImagePixels {
+			imageLabel.SetText("Image unavailable: unsupported, malformed, or too large to display safely.")
+			continue
 		}
 		pixmap := qt.NewQPixmap()
 		if !pixmap.LoadFromDataWithData(data) {
-			w.image.SetText("Image unavailable: unsupported or malformed image.")
-			return
+			imageLabel.SetText("Image unavailable: unsupported or malformed image.")
+			continue
 		}
 		if pixmap.Width() != config.Width || pixmap.Height() != config.Height {
-			w.image.SetText("Image unavailable: decoded image dimensions were inconsistent.")
-			return
+			imageLabel.SetText("Image unavailable: decoded image dimensions were inconsistent.")
+			continue
 		}
-		w.image.SetPixmap(pixmap.Scaled2(800, 500, qt.KeepAspectRatio))
+		displayedBytes += int64(len(data))
+		displayedPixels += pixels
+		imageLabel.SetPixmap(pixmap.Scaled2(maxGalleryDisplayWidth, maxGalleryDisplayHeight, qt.KeepAspectRatio))
 	}
+	if len(paths) > displayCount {
+		omitted := qt.NewQLabel(nil)
+		omitted.SetWordWrap(true)
+		omitted.SetText(fmt.Sprintf("%d additional images omitted: gallery image-count limit reached.", len(paths)-displayCount))
+		layout.AddWidget(omitted.QWidget)
+	}
+	layout.AddStretch()
+	w.imageGallery.SetWidget(content)
 }
 
 // SetExecutionCallbacks is called only after the package document has been

@@ -1259,6 +1259,127 @@ func TestLoadCaseInsensitiveRootStillUsesManifestLimit(t *testing.T) {
 	}
 }
 
+func TestLoadPreservesOrderedRepeatedStepImages(t *testing.T) {
+	manifest := `- job_name: Example
+  job_steps:
+    - step_name: No image
+    - step_name: One image
+      step_image: Images/one.png
+    - step_name: Several images
+      step_image: Images/one.png
+      step_image: images/TWO.PNG
+      step_image: Images/one.png
+      step_image: Images/three.png
+`
+	pkg, err := Load(writePackage(t,
+		zipEntry{name: manifestName, data: manifest},
+		zipEntry{name: "Images/one.png", data: "one"},
+		zipEntry{name: "Images/Two.png", data: "two"},
+		zipEntry{name: "Images/three.png", data: "three"},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps := pkg.Jobs[0].Steps
+	if len(steps[0].ImagePaths) != 0 || steps[0].ImagePath != "" {
+		t.Fatalf("no-image step = %+v", steps[0])
+	}
+	if got := steps[1].ImagePaths; !reflect.DeepEqual(got, []string{"Images/one.png"}) || steps[1].ImagePath != "Images/one.png" {
+		t.Fatalf("single-image step = %+v", steps[1])
+	}
+	if got, ok := steps[1].Metadata["step_image"].(string); !ok || got != "Images/one.png" {
+		t.Fatalf("single-image metadata = %#v", steps[1].Metadata["step_image"])
+	}
+	want := []string{"Images/one.png", "Images/Two.png", "Images/one.png", "Images/three.png"}
+	if !reflect.DeepEqual(steps[2].ImagePaths, want) || steps[2].ImagePath != want[0] {
+		t.Fatalf("multi-image paths = %+v", steps[2])
+	}
+	if got, ok := steps[2].Metadata["step_image"].([]string); !ok || !reflect.DeepEqual(got, []string{"Images/one.png", "images/TWO.PNG", "Images/one.png", "Images/three.png"}) {
+		t.Fatalf("multi-image metadata = %#v", steps[2].Metadata["step_image"])
+	}
+	foundFallbackWarning := false
+	for _, warning := range pkg.Warnings {
+		if warning.Field == "step_image" && strings.Contains(warning.Message, `requested "images/TWO.PNG" resolved "Images/Two.png"`) {
+			foundFallbackWarning = true
+		}
+	}
+	if !foundFallbackWarning {
+		t.Fatalf("missing case-insensitive image warning: %+v", pkg.Warnings)
+	}
+}
+
+func TestLoadRepeatedStepImagesInIncludedManifest(t *testing.T) {
+	root := `- job_name: Example
+  job_steps:
+    - manifest_file: images.yml
+`
+	child := `- step_name: Included
+  step_image: Images/one.png
+  step_image: Images/two.png
+`
+	pkg, err := Load(writePackage(t,
+		zipEntry{name: manifestName, data: root},
+		zipEntry{name: "images.yml", data: child},
+		zipEntry{name: "Images/one.png", data: "one"},
+		zipEntry{name: "Images/two.png", data: "two"},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := pkg.Jobs[0].Steps[0]
+	if step.ManifestPath != "images.yml" || !reflect.DeepEqual(step.ImagePaths, []string{"Images/one.png", "Images/two.png"}) {
+		t.Fatalf("included multi-image step = %+v", step)
+	}
+}
+
+func TestLoadRejectsInvalidRepeatedStepFieldsAndImages(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest string
+		entries  []zipEntry
+		want     string
+	}{
+		{
+			name:     "duplicate G-code",
+			manifest: "- job_name: Example\n  job_steps:\n    - step_name: Cut\n      step_gcode: Code/one.nc\n      step_gcode: Code/two.nc\n",
+			entries:  []zipEntry{{name: "Code/one.nc", data: "one"}, {name: "Code/two.nc", data: "two"}},
+			want:     `repeats field "step_gcode"`,
+		},
+		{
+			name:     "duplicate name",
+			manifest: "- job_name: Example\n  job_steps:\n    - step_name: First\n      step_name: Second\n",
+			want:     `repeats field "step_name"`,
+		},
+		{
+			name:     "job image duplicates remain invalid",
+			manifest: "- job_name: Example\n  step_image: Images/one.png\n  step_image: Images/two.png\n  job_steps: []\n",
+			entries:  []zipEntry{{name: "Images/one.png", data: "one"}, {name: "Images/two.png", data: "two"}},
+			want:     `repeats field "step_image"`,
+		},
+		{
+			name:     "missing second image",
+			manifest: "- job_name: Example\n  job_steps:\n    - step_name: Images\n      step_image: Images/one.png\n      step_image: Images/missing.png\n",
+			entries:  []zipEntry{{name: "Images/one.png", data: "one"}},
+			want:     "missing resource",
+		},
+		{
+			name:     "ambiguous second image",
+			manifest: "- job_name: Example\n  job_steps:\n    - step_name: Images\n      step_image: Images/one.png\n      step_image: IMAGES/TWO.PNG\n",
+			entries:  []zipEntry{{name: "Images/one.png", data: "one"}, {name: "Images/Two.png", data: "two"}, {name: "images/two.PNG", data: "other"}},
+			want:     "ambiguous resource",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entries := append([]zipEntry{{name: manifestName, data: tt.manifest}}, tt.entries...)
+			pkg, err := Load(writePackage(t, entries...))
+			if pkg != nil || err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Load() = pkg=%v err=%v, want %q", pkg, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsCircularSubmanifest(t *testing.T) {
 	pkg, err := Load(writePackage(t,
 		zipEntry{name: manifestName, data: "- job_name: x\n  job_steps:\n    - manifest_file: a.yml\n"},

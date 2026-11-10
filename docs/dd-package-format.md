@@ -7,8 +7,8 @@ run on a machine.
 
 ## Confirmed structure
 
-A package must have one root-level, case-sensitive `manifest.yml` entry. Paths
-in manifests are exact archive paths and use forward slashes. DDGo does not
+A package must have one root-level `manifest.yml` entry. Paths
+in manifests use forward slashes. DDGo does not
 infer file type from an extension: a `step_gcode` reference may name any
 regular archive file. `Additional Files/` entries are separately discoverable,
 but otherwise remain ordinary read-only resources.
@@ -20,7 +20,13 @@ recognizes `job_name`, `job_text`, `job_steps`, `guide_files`, `model_files`,
 `wcs_check_failed_message`. Steps recognize `step_name`, `step_text`,
 `step_markdown`, `step_image`, `step_gcode`, `pause`, `reset`, `timeout`,
 `if`, `unskippable`, `step_goto`, `popup_text`, `popup_title`,
-`popup_wait_time`, `popup_yes_step`, and `popup_no_step`.
+`popup_wait_time`, `popup_yes_step`, and `popup_no_step`. A step may contain
+multiple `step_image` fields. Their source order, including repeated paths, is
+preserved in `Step.ImagePaths`; `Step.ImagePath` is a compatibility alias for
+the first image only. `Step.Metadata["step_image"]` remains a string for a
+single image and is a `[]string` of original manifest values for repeated
+images; consumers should use the resolved `ImagePaths` collection. Other
+repeated mapping fields remain invalid.
 
 Known operational metadata is retained only for a future guided UI. DDGo does
 not execute timeout, reset, pause, condition, jump, or popup behavior in this
@@ -49,7 +55,7 @@ Archive entries are checked before parsing. DDGo rejects duplicate paths,
 absolute/traversal/drive/UNC paths, **any single backslash**, NUL names,
 symbolic links, and special files. It permits harmless directory entries.
 Referenced G-code,
-images, guides, models, and submanifests must exist with exact case.
+images, guides, models, and submanifests must resolve to archive resources.
 
 Default limits are centralized in `ddpackage.DefaultLimits()`:
 
@@ -168,7 +174,8 @@ standard-YAML document with an explicit sequence root.
 
 DDGo now presents a loaded package as one first-class package
 document. It browses manifest-order jobs and steps, preserves text/Markdown,
-shows bounded in-memory images when Qt can decode them, lists resource
+shows each step's images in manifest order in a bounded, vertically scrollable
+gallery when Qt can decode them, lists resource
 references and complete path/field/message loader diagnostics, and can open a
 supplementary G-code view for any `step_gcode`. These views use the retained
 archive snapshot without extracting resources, provide read-only source

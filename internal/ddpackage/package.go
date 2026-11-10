@@ -95,10 +95,13 @@ type Job struct {
 // Step is a data-only operation. Its future execution semantics are preserved
 // as metadata and are deliberately not acted upon by this package.
 type Step struct {
-	ID             string
-	Name           string
-	Text           string
-	Markdown       string
+	ID       string
+	Name     string
+	Text     string
+	Markdown string
+	// ImagePaths is the authoritative ordered list of step_image resources.
+	// ImagePath remains the first-image compatibility alias for older callers.
+	ImagePaths     []string
 	ImagePath      string
 	GCodePath      string
 	Timeout        *int
@@ -505,7 +508,14 @@ func parseStep(fields []yamlField, manifestPath string, resources map[string][]b
 		case "step_markdown":
 			step.Markdown, err = textValue(field.value, manifestPath, field.key)
 		case "step_image":
-			step.ImagePath, err = resourcePath(field.value, manifestPath, field.key, resources, warnings)
+			var imagePath string
+			imagePath, err = resourcePath(field.value, manifestPath, field.key, resources, warnings)
+			if err == nil {
+				step.ImagePaths = append(step.ImagePaths, imagePath)
+				if step.ImagePath == "" {
+					step.ImagePath = imagePath
+				}
+			}
 		case "step_gcode":
 			step.GCodePath, err = resourcePath(field.value, manifestPath, field.key, resources, warnings)
 		case "pause":
@@ -558,7 +568,7 @@ func mapping(node *yaml.Node, kind, source string) ([]yamlField, error) {
 		if key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
 			return nil, fmt.Errorf("%s in %q has a non-string field name", kind, source)
 		}
-		if seen[key.Value] {
+		if seen[key.Value] && !(kind == "step" && key.Value == "step_image") {
 			return nil, fmt.Errorf("%s in %q repeats field %q", kind, source, key.Value)
 		}
 		seen[key.Value] = true
@@ -581,7 +591,26 @@ func onlyManifestInclude(fields []yamlField) (*yaml.Node, bool) {
 func nodeMetadata(fields []yamlField) map[string]any {
 	metadata := make(map[string]any, len(fields))
 	for _, field := range fields {
-		metadata[field.key] = yamlValue(field.value)
+		value := yamlValue(field.value)
+		if field.key == "step_image" {
+			if previous, exists := metadata[field.key]; exists {
+				paths, ok := previous.([]string)
+				if ok {
+					if path, ok := value.(string); ok {
+						metadata[field.key] = append(paths, path)
+						continue
+					}
+				} else if previousPath, previousOK := previous.(string); previousOK {
+					if path, ok := value.(string); ok {
+						metadata[field.key] = []string{previousPath, path}
+						continue
+					}
+				}
+				metadata[field.key] = []any{previous, value}
+				continue
+			}
+		}
+		metadata[field.key] = value
 	}
 	return metadata
 }
