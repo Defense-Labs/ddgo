@@ -1069,7 +1069,6 @@ func TestLoadRejectsMissingAndMalformedRequiredStructure(t *testing.T) {
 		{"multiple YAML documents", []zipEntry{{name: manifestName, data: "- job_name: one\n---\n- job_name: two\n"}}, "must contain one document"},
 		{"wrong root kind", []zipEntry{{name: manifestName, data: "job_name: no-list"}}, "must be a YAML sequence"},
 		{"missing gcode", []zipEntry{{name: manifestName, data: "- job_name: x\n  job_steps:\n    - step_gcode: Code/missing\n"}}, "missing resource"},
-		{"case sensitive resource", []zipEntry{{name: manifestName, data: "- job_name: x\n  job_steps:\n    - step_gcode: code/a\n"}, {name: "Code/a", data: "G0"}}, "missing resource"},
 		{"missing submanifest", []zipEntry{{name: manifestName, data: "- job_name: x\n  job_steps:\n    - manifest_file: missing.yml\n"}}, "missing resource"},
 		{"malformed submanifest", []zipEntry{{name: manifestName, data: "- job_name: x\n  job_steps:\n    - manifest_file: child.yml\n"}, {name: "child.yml", data: "- step_name: ["}}, "child.yml"},
 		{"step mixes include", []zipEntry{{name: manifestName, data: "- job_name: x\n  job_steps:\n    - manifest_file: child.yml\n      step_name: invalid\n"}, {name: "child.yml", data: "- step_name: child\n"}}, "mixes manifest_file"},
@@ -1081,6 +1080,182 @@ func TestLoadRejectsMissingAndMalformedRequiredStructure(t *testing.T) {
 				t.Fatalf("Load() = pkg=%v err=%v, want error containing %q and no package", pkg, err, tt.want)
 			}
 		})
+	}
+}
+
+func TestLoadResolvesUniqueCaseInsensitiveResources(t *testing.T) {
+	manifest := `- job_name: Example
+  guide_files:
+    - guides/setup.pdf
+  model_files:
+    - models/fixture.stl
+  job_steps:
+    - step_name: Cut
+      step_image: images/fixture.png
+      step_gcode: code/cut.GCODE
+`
+	pkg, err := Load(writePackage(t,
+		zipEntry{name: manifestName, data: manifest},
+		zipEntry{name: "Guides/Setup.PDF", data: "guide"},
+		zipEntry{name: "Models/Fixture.STL", data: "model"},
+		zipEntry{name: "Images/Fixture.PNG", data: "image"},
+		zipEntry{name: "Code/Cut.gcode", data: "G0 X1\n"},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, step := pkg.Jobs[0], pkg.Jobs[0].Steps[0]
+	if got := job.GuideFiles; !reflect.DeepEqual(got, []string{"Guides/Setup.PDF"}) {
+		t.Fatalf("GuideFiles = %#v", got)
+	}
+	if got := job.ModelFiles; !reflect.DeepEqual(got, []string{"Models/Fixture.STL"}) {
+		t.Fatalf("ModelFiles = %#v", got)
+	}
+	if step.ImagePath != "Images/Fixture.PNG" || step.GCodePath != "Code/Cut.gcode" {
+		t.Fatalf("resolved step paths = %+v", step)
+	}
+	if !pkg.HasResource("code/cut.GCODE") || pkg.HasResource("missing") {
+		t.Fatalf("HasResource() fallback behavior is incorrect")
+	}
+	data, err := pkg.ReadResource("CODE/CUT.GCODE")
+	if err != nil || string(data) != "G0 X1\n" {
+		t.Fatalf("ReadResource() = %q, %v", data, err)
+	}
+	data[0] = 'X'
+	again, err := pkg.ReadResource("Code/Cut.gcode")
+	if err != nil || string(again) != "G0 X1\n" {
+		t.Fatalf("ReadResource() returned mutable bytes: %q, %v", again, err)
+	}
+	if len(pkg.Warnings) != 4 {
+		t.Fatalf("warnings = %+v, want four fallback warnings", pkg.Warnings)
+	}
+	for _, warning := range pkg.Warnings {
+		if !strings.Contains(warning.Message, "case-insensitive resource path match") {
+			t.Fatalf("unexpected warning: %+v", warning)
+		}
+	}
+}
+
+func TestLoadExactResourceMatchWinsOverCaseVariants(t *testing.T) {
+	manifest := `- job_name: Example
+  job_steps:
+    - step_gcode: Code/Test.gcode
+`
+	pkg, err := Load(writePackage(t,
+		zipEntry{name: manifestName, data: manifest},
+		zipEntry{name: "Code/Test.gcode", data: "exact"},
+		zipEntry{name: "code/test.GCODE", data: "variant"},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path := pkg.Jobs[0].Steps[0].GCodePath; path != "Code/Test.gcode" {
+		t.Fatalf("GCodePath = %q", path)
+	}
+	data, err := pkg.ReadResource("Code/Test.gcode")
+	if err != nil || string(data) != "exact" || len(pkg.Warnings) != 0 {
+		t.Fatalf("exact resource resolution = %q, %v, warnings=%+v", data, err, pkg.Warnings)
+	}
+}
+
+func TestLoadRejectsAmbiguousCaseInsensitiveResources(t *testing.T) {
+	manifest := `- job_name: Example
+  job_steps:
+    - step_gcode: CODE/TEST.GCODE
+`
+	pkg, err := Load(writePackage(t,
+		zipEntry{name: manifestName, data: manifest},
+		zipEntry{name: "Code/Test.gcode", data: "one"},
+		zipEntry{name: "code/test.GCODE", data: "two"},
+	))
+	if pkg != nil || err == nil || !strings.Contains(err.Error(), "ambiguous resource") {
+		t.Fatalf("Load() = pkg=%v err=%v, want ambiguous resource rejection", pkg, err)
+	}
+	pkg = &Package{resources: map[string][]byte{"Code/Test.gcode": []byte("one"), "code/test.GCODE": []byte("two")}}
+	if pkg.HasResource("CODE/TEST.GCODE") {
+		t.Fatal("HasResource() accepted an ambiguous resource")
+	}
+	if _, err := pkg.ReadResource("CODE/TEST.GCODE"); err == nil || !strings.Contains(err.Error(), "ambiguous resource") {
+		t.Fatalf("ReadResource() error = %v", err)
+	}
+}
+
+func TestLoadResolvesCaseInsensitiveRootAndSubmanifestPaths(t *testing.T) {
+	root := `- job_name: Example
+  job_steps:
+    - manifest_file: child.yml
+`
+	child := `- step_name: Included
+  step_gcode: code/included.nc
+`
+	pkg, err := Load(writePackage(t,
+		zipEntry{name: "Manifest.YML", data: root},
+		zipEntry{name: "CHILD.YML", data: child},
+		zipEntry{name: "Code/Included.NC", data: "G0 X1\n"},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := pkg.Jobs[0].Steps[0]
+	if step.ManifestPath != "CHILD.YML" || step.GCodePath != "Code/Included.NC" {
+		t.Fatalf("resolved submanifest step = %+v", step)
+	}
+	if len(pkg.Warnings) != 3 {
+		t.Fatalf("warnings = %+v, want root, include, and G-code fallback warnings", pkg.Warnings)
+	}
+}
+
+func TestLoadExactRootManifestWinsOverCaseVariant(t *testing.T) {
+	pkg, err := Load(writePackage(t,
+		zipEntry{name: manifestName, data: "- job_name: Exact\n  job_steps: []\n"},
+		zipEntry{name: "Manifest.YML", data: "not YAML: ["},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pkg.Jobs[0].Name != "Exact" || len(pkg.Warnings) != 0 {
+		t.Fatalf("exact root selection = jobs=%+v warnings=%+v", pkg.Jobs, pkg.Warnings)
+	}
+}
+
+func TestLoadRejectsAmbiguousCaseInsensitiveRootAndPreservesCaseFoldCycles(t *testing.T) {
+	if pkg, err := Load(writePackage(t,
+		zipEntry{name: "Manifest.YML", data: "- job_name: x\n  job_steps: []\n"},
+		zipEntry{name: "MANIFEST.YML", data: "- job_name: x\n  job_steps: []\n"},
+	)); pkg != nil || err == nil || !strings.Contains(err.Error(), "required root manifest.yml is ambiguous") {
+		t.Fatalf("ambiguous root Load() = pkg=%v err=%v", pkg, err)
+	}
+	root := `- job_name: Example
+  job_steps:
+    - manifest_file: a.yml
+`
+	pkg, err := Load(writePackage(t,
+		zipEntry{name: manifestName, data: root},
+		zipEntry{name: "A.YML", data: "- manifest_file: b.yml\n"},
+		zipEntry{name: "B.YML", data: "- manifest_file: a.yml\n"},
+	))
+	if pkg != nil || err == nil || !strings.Contains(err.Error(), "circular submanifest") {
+		t.Fatalf("case-fold cycle Load() = pkg=%v err=%v", pkg, err)
+	}
+	pkg, err = Load(writePackage(t,
+		zipEntry{name: manifestName, data: "- job_name: x\n  job_steps:\n    - manifest_file: CHILD.yml\n"},
+		zipEntry{name: "Child.yml", data: "- step_name: one\n"},
+		zipEntry{name: "child.YML", data: "- step_name: two\n"},
+	))
+	if pkg != nil || err == nil || !strings.Contains(err.Error(), "ambiguous resource") {
+		t.Fatalf("ambiguous submanifest Load() = pkg=%v err=%v", pkg, err)
+	}
+}
+
+func TestLoadCaseInsensitiveRootStillUsesManifestLimit(t *testing.T) {
+	limits := DefaultLimits()
+	limits.MaxManifestBytes = 32
+	limits.MaxResourceBytes = 128
+	pkg, err := LoadWithLimits(writePackage(t,
+		zipEntry{name: "Manifest.YML", data: strings.Repeat("x", 64)},
+	), limits)
+	if pkg != nil || err == nil || !strings.Contains(err.Error(), "manifest \"Manifest.YML\" declared size exceeds manifest limit") {
+		t.Fatalf("LoadWithLimits() = pkg=%v err=%v", pkg, err)
 	}
 }
 

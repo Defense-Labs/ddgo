@@ -132,6 +132,15 @@ unindented literal recovery applies narrowly to `step_manifest: |`; its value
 is retained under the original unknown metadata key rather than being treated
 as Markdown or an inclusion.
 
+Resource references use exact ZIP paths first. When no exact entry exists,
+DDGo accepts one unique Unicode case-insensitive match and records a
+compatibility warning naming both the requested and resolved paths. The actual
+archive path is then retained for images, G-code, guide/model files, and
+submanifests. Multiple case-insensitive candidates remain an error, while an
+exact path always wins. This behavior is deterministic across host operating
+systems and does not relax archive-path validation, traversal protection, or
+resource limits.
+
 Internally, all compatibility adjustments use one normalization pipeline: a
 line scanner retains original source lines, a small structural context tracks
 job, step, metadata, and scalar relationships, rule handlers make only the

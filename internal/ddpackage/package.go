@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -54,8 +55,7 @@ type Diagnostic struct {
 	Message string
 }
 
-// Asset describes a regular archive resource. Path lookup is exact and case
-// sensitive, even on case-insensitive host filesystems.
+// Asset describes a regular archive resource retained with its exact ZIP path.
 type Asset struct {
 	Path           string
 	Size           int64
@@ -116,17 +116,17 @@ type Step struct {
 	Metadata       map[string]any
 }
 
-// ReadResource returns an independent copy of an archived resource. Archive
-// paths are resolved exactly and are never passed to host filesystem APIs.
+// ReadResource returns an independent copy of an archived resource. Exact ZIP
+// paths win; otherwise a unique case-insensitive match is accepted.
 func (p *Package) ReadResource(name string) ([]byte, error) {
 	if p == nil {
 		return nil, errors.New("nil .dd package")
 	}
-	data, ok := p.resources[name]
-	if !ok {
-		return nil, fmt.Errorf("package resource %q not found", name)
+	resolved, _, err := resolveResourcePath(p.resources, name)
+	if err != nil {
+		return nil, fmt.Errorf("package resource %q: %w", name, err)
 	}
-	return bytes.Clone(data), nil
+	return bytes.Clone(p.resources[resolved]), nil
 }
 
 // ReadStepGCode returns the original, unmodified source referenced by a step.
@@ -137,13 +137,14 @@ func (p *Package) ReadStepGCode(step Step) ([]byte, error) {
 	return p.ReadResource(step.GCodePath)
 }
 
-// HasResource reports an exact archive-path match.
+// HasResource reports whether name has an exact or unique case-insensitive
+// archive-path match.
 func (p *Package) HasResource(name string) bool {
 	if p == nil {
 		return false
 	}
-	_, ok := p.resources[name]
-	return ok
+	_, _, err := resolveResourcePath(p.resources, name)
+	return err == nil
 }
 
 // Load opens a .dd ZIP archive using DefaultLimits.
@@ -174,7 +175,7 @@ func LoadWithLimits(sourcePath string, limits Limits) (*Package, error) {
 		resources:   make(map[string][]byte),
 	}
 	seenEntries := make(map[string]struct{}, len(zr.File))
-	var total int64
+	regularEntries := make([]string, 0, len(zr.File))
 	for _, file := range zr.File {
 		isDirectory, err := validateArchiveEntry(file)
 		if err != nil {
@@ -184,15 +185,32 @@ func LoadWithLimits(sourcePath string, limits Limits) (*Package, error) {
 			return nil, fmt.Errorf("duplicate archive path %q", file.Name)
 		}
 		seenEntries[file.Name] = struct{}{}
+		if !isDirectory {
+			regularEntries = append(regularEntries, file.Name)
+		}
+	}
+	rootManifestPath, rootExact, err := resolveResourceName(regularEntries, manifestName)
+	if err != nil {
+		if errors.Is(err, errResourceMissing) {
+			return nil, fmt.Errorf("required root %s is missing", manifestName)
+		}
+		return nil, fmt.Errorf("required root %s is ambiguous: %w", manifestName, err)
+	}
+	var total int64
+	for _, file := range zr.File {
+		isDirectory, err := validateArchiveEntry(file)
+		if err != nil {
+			return nil, err
+		}
 		if isDirectory {
 			continue
 		}
 		limit := limits.MaxResourceBytes
-		if file.Name == manifestName {
+		if file.Name == rootManifestPath {
 			limit = limits.MaxManifestBytes
 		}
 		if file.UncompressedSize64 > uint64(limit) {
-			if file.Name == manifestName {
+			if file.Name == rootManifestPath {
 				return nil, fmt.Errorf("manifest %q declared size exceeds manifest limit", file.Name)
 			}
 			return nil, fmt.Errorf("resource %q declared size exceeds per-resource limit", file.Name)
@@ -221,13 +239,17 @@ func LoadWithLimits(sourcePath string, limits Limits) (*Package, error) {
 			pkg.AdditionalFiles = append(pkg.AdditionalFiles, asset)
 		}
 	}
-	manifest, ok := pkg.resources[manifestName]
-	if !ok {
-		return nil, fmt.Errorf("required root %s is missing", manifestName)
-	}
-	jobs, warnings, err := parseManifest(manifest, manifestName, pkg.resources, limits)
+	manifest := pkg.resources[rootManifestPath]
+	jobs, warnings, err := parseManifest(manifest, rootManifestPath, pkg.resources, limits)
 	if err != nil {
 		return nil, err
+	}
+	if !rootExact {
+		warnings = append([]Diagnostic{{
+			Path:    rootManifestPath,
+			Field:   manifestName,
+			Message: caseInsensitiveResourceWarning(manifestName, rootManifestPath),
+		}}, warnings...)
 	}
 	pkg.Jobs = jobs
 	pkg.Warnings = warnings
@@ -370,9 +392,9 @@ func parseJob(node *yaml.Node, manifestPath string, resources map[string][]byte,
 		case "job_text":
 			job.Text, err = legacyText(field.value, manifestPath, field.key)
 		case "guide_files":
-			job.GuideFiles, err = resourceList(field.value, manifestPath, field.key, resources)
+			job.GuideFiles, err = resourceList(field.value, manifestPath, field.key, resources, &warnings)
 		case "model_files":
-			job.ModelFiles, err = resourceList(field.value, manifestPath, field.key, resources)
+			job.ModelFiles, err = resourceList(field.value, manifestPath, field.key, resources, &warnings)
 		case "min_fw_version":
 			job.MinFirmwareVersion, err = textValue(field.value, manifestPath, field.key)
 		case "min_ddcut_version":
@@ -389,7 +411,7 @@ func parseJob(node *yaml.Node, manifestPath string, resources map[string][]byte,
 			steps = append(steps, added...)
 		case "manifest_file":
 			var include string
-			include, err = resourcePath(field.value, manifestPath, field.key, resources)
+			include, err = resourcePath(field.value, manifestPath, field.key, resources, &warnings)
 			if err == nil {
 				var added []Step
 				added, err = expandSubmanifest(include, resources, limits, nil, 0, &warnings, expandedCount)
@@ -447,7 +469,7 @@ func expandStepList(node *yaml.Node, manifestPath string, resources map[string][
 			return nil, err
 		}
 		if include, ok := onlyManifestInclude(fields); ok {
-			name, err := resourcePath(include, manifestPath, "manifest_file", resources)
+			name, err := resourcePath(include, manifestPath, "manifest_file", resources, warnings)
 			if err != nil {
 				return nil, err
 			}
@@ -483,9 +505,9 @@ func parseStep(fields []yamlField, manifestPath string, resources map[string][]b
 		case "step_markdown":
 			step.Markdown, err = textValue(field.value, manifestPath, field.key)
 		case "step_image":
-			step.ImagePath, err = resourcePath(field.value, manifestPath, field.key, resources)
+			step.ImagePath, err = resourcePath(field.value, manifestPath, field.key, resources, warnings)
 		case "step_gcode":
-			step.GCodePath, err = resourcePath(field.value, manifestPath, field.key, resources)
+			step.GCodePath, err = resourcePath(field.value, manifestPath, field.key, resources, warnings)
 		case "pause":
 			step.Pause, err = boolValue(field.value, manifestPath, field.key)
 		case "reset":
@@ -625,24 +647,97 @@ func intValue(node *yaml.Node, source, field string) (*int, error) {
 	return &parsed, nil
 }
 
-func resourcePath(node *yaml.Node, source, field string, resources map[string][]byte) (string, error) {
+var (
+	errResourceMissing   = errors.New("missing resource")
+	errResourceAmbiguous = errors.New("ambiguous resource")
+)
+
+// resolveResourcePath uses exact ZIP path identity first. When no exact path
+// exists, it uses Go's Unicode-aware EqualFold comparison and accepts exactly
+// one candidate. Archive entries remain the canonical returned paths.
+func resolveResourcePath(resources map[string][]byte, requested string) (string, bool, error) {
+	if _, ok := resources[requested]; ok {
+		return requested, true, nil
+	}
+	candidates := make([]string, 0, 1)
+	for candidate := range resources {
+		if strings.EqualFold(candidate, requested) {
+			candidates = append(candidates, candidate)
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		return "", false, errResourceMissing
+	case 1:
+		return candidates[0], false, nil
+	default:
+		sort.Strings(candidates)
+		return "", false, fmt.Errorf("%w %q (%s)", errResourceAmbiguous, requested, strings.Join(candidates, ", "))
+	}
+}
+
+func resolveResourceName(resources []string, requested string) (string, bool, error) {
+	for _, candidate := range resources {
+		if candidate == requested {
+			return candidate, true, nil
+		}
+	}
+	candidates := make([]string, 0, 1)
+	for _, candidate := range resources {
+		if strings.EqualFold(candidate, requested) {
+			candidates = append(candidates, candidate)
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		return "", false, errResourceMissing
+	case 1:
+		return candidates[0], false, nil
+	default:
+		sort.Strings(candidates)
+		return "", false, fmt.Errorf("%w %q (%s)", errResourceAmbiguous, requested, strings.Join(candidates, ", "))
+	}
+}
+
+func caseInsensitiveResourceWarning(requested, resolved string) string {
+	return fmt.Sprintf("case-insensitive resource path match: requested %q resolved %q", requested, resolved)
+}
+
+func appendResourceFallbackWarning(warnings *[]Diagnostic, source, field, requested, resolved string) {
+	message := caseInsensitiveResourceWarning(requested, resolved)
+	for _, warning := range *warnings {
+		if warning.Path == source && warning.Field == field && warning.Message == message {
+			return
+		}
+	}
+	*warnings = append(*warnings, Diagnostic{Path: source, Field: field, Message: message})
+}
+
+func resourcePath(node *yaml.Node, source, field string, resources map[string][]byte, warnings *[]Diagnostic) (string, error) {
 	value, err := textValue(node, source, field)
 	if err != nil {
 		return "", err
 	}
-	if _, ok := resources[value]; !ok {
+	resolved, exact, err := resolveResourcePath(resources, value)
+	if errors.Is(err, errResourceMissing) {
 		return "", fmt.Errorf("field %q in %q references missing resource %q", field, source, value)
 	}
-	return value, nil
+	if err != nil {
+		return "", fmt.Errorf("field %q in %q references ambiguous resource %q: %w", field, source, value, err)
+	}
+	if !exact && warnings != nil {
+		appendResourceFallbackWarning(warnings, source, field, value, resolved)
+	}
+	return resolved, nil
 }
 
-func resourceList(node *yaml.Node, source, field string, resources map[string][]byte) ([]string, error) {
+func resourceList(node *yaml.Node, source, field string, resources map[string][]byte, warnings *[]Diagnostic) ([]string, error) {
 	if node.Kind != yaml.SequenceNode {
 		return nil, fmt.Errorf("field %q in %q must be a sequence", field, source)
 	}
 	values := make([]string, 0, len(node.Content))
 	for _, child := range node.Content {
-		value, err := resourcePath(child, source, field, resources)
+		value, err := resourcePath(child, source, field, resources, warnings)
 		if err != nil {
 			return nil, err
 		}
