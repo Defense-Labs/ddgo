@@ -124,6 +124,14 @@ ordinary Markdown such as `https://example.org`, `12:30`, and
 a recovered unindented Markdown block. A line whose structure remains genuinely
 ambiguous is rejected rather than silently reassigned.
 
+Within a recovered Markdown block, a colon-bearing list item remains Markdown
+after an ordinary Markdown bullet has established a list. Known sequence items
+(`step_name` and `manifest_file`) still end the block. An unknown sequence
+mapping without that list context remains ambiguous and is rejected. The same
+unindented literal recovery applies narrowly to `step_manifest: |`; its value
+is retained under the original unknown metadata key rather than being treated
+as Markdown or an inclusion.
+
 Internally, all compatibility adjustments use one normalization pipeline: a
 line scanner retains original source lines, a small structural context tracks
 job, step, metadata, and scalar relationships, rule handlers make only the

@@ -838,6 +838,141 @@ func TestLegacyTrailingTabsPreserveLiteralContent(t *testing.T) {
 	}
 }
 
+func TestLegacyMarkdownListBoundariesAndStepManifestMatchStrictSemantics(t *testing.T) {
+	root := `- job_name: Example
+  job_steps:
+    - manifest_file: notes.yml
+`
+	strict := `- step_name: Configuration
+  step_markdown: |
+    Select an option:
+
+    - Glock 17, 19, 20 or 26: First option.
+    - P320: Second option.
+    - 1911: Third option.
+    - M&P 2.0: Fourth option.
+
+    Continue to the next step.
+  step_text: Configuration complete
+- manifest_file: child.yml
+- step_name: Completion
+  step_manifest: |
+    Operation completed.
+
+    Machine will now home.
+  step_image: Images/home.png
+  step_gcode: Code/home.nc
+`
+	legacy := `- step_name: Configuration
+   step_markdown: |
+Select an option:
+
+- Glock 17, 19, 20 or 26: First option.
+- P320: Second option.
+- 1911: Third option.
+- M&P 2.0: Fourth option.
+
+Continue to the next step.
+   step_text: Configuration complete
+- manifest_file: child.yml
+- step_name: Completion
+   step_manifest: |
+Operation completed.
+
+Machine will now home.
+   step_image: Images/home.png
+   step_gcode: Code/home.nc
+`
+	child := `- step_name: Included
+  step_text: Child step.
+`
+	resources := []zipEntry{
+		{name: manifestName, data: root},
+		{name: "child.yml", data: child},
+		{name: "Images/home.png", data: "image"},
+		{name: "Code/home.nc", data: "G0 X1\n"},
+	}
+	strictPkg, err := Load(writePackage(t, append(resources, zipEntry{name: "notes.yml", data: strict})...))
+	if err != nil {
+		t.Fatalf("Load(strict) error: %v", err)
+	}
+	legacyPkg, err := Load(writePackage(t, append(resources, zipEntry{name: "notes.yml", data: legacy})...))
+	if err != nil {
+		t.Fatalf("Load(legacy) error: %v", err)
+	}
+	if !reflect.DeepEqual(legacyPkg.Jobs, strictPkg.Jobs) {
+		t.Fatalf("legacy semantics differ:\nlegacy=%+v\nstrict=%+v", legacyPkg.Jobs, strictPkg.Jobs)
+	}
+	steps := legacyPkg.Jobs[0].Steps
+	if len(steps) != 3 || steps[0].Text != "Configuration complete" ||
+		steps[0].Markdown != "Select an option:\n\n- Glock 17, 19, 20 or 26: First option.\n- P320: Second option.\n- 1911: Third option.\n- M&P 2.0: Fourth option.\n\nContinue to the next step.\n" ||
+		steps[1].Name != "Included" || steps[2].Metadata["step_manifest"] != "Operation completed.\n\nMachine will now home.\n" ||
+		steps[2].Markdown != "" || steps[2].ImagePath != "Images/home.png" || steps[2].GCodePath != "Code/home.nc" {
+		t.Fatalf("legacy combined steps = %+v", steps)
+	}
+	foundManifestWarning := false
+	for _, warning := range legacyPkg.Warnings {
+		if warning.Path == "notes.yml" && warning.Field == "line 14" && warning.Message == "accepted legacy unindented step_manifest block" {
+			foundManifestWarning = true
+		}
+	}
+	if !foundManifestWarning {
+		t.Fatalf("missing step_manifest compatibility warning: %+v", legacyPkg.Warnings)
+	}
+}
+
+func TestLegacyMarkdownListBoundaryInRootStepList(t *testing.T) {
+	manifest := `- job_name: Example
+  job_steps:
+    - step_name: Configuration
+      step_markdown: |
+Choose one:
+
+- Ordinary bullet
+- P320: Mapping-looking Markdown bullet
+
+Continue.
+      step_text: Ready.
+    - step_name: Following
+      step_text: Next.
+`
+	pkg, err := Load(writePackage(t, zipEntry{name: manifestName, data: manifest}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps := pkg.Jobs[0].Steps
+	if len(steps) != 2 || steps[0].Markdown != "Choose one:\n\n- Ordinary bullet\n- P320: Mapping-looking Markdown bullet\n\nContinue.\n" || steps[0].Text != "Ready." || steps[1].Name != "Following" {
+		t.Fatalf("root Markdown list boundary = %+v", steps)
+	}
+}
+
+func TestLegacyMarkdownListBoundaryRejectsAmbiguousSequenceMapping(t *testing.T) {
+	manifest := `- job_name: Example
+  job_steps:
+    - step_name: Instructions
+      step_markdown: |
+Introductory text.
+- future_step_field: retained
+`
+	pkg, err := Load(writePackage(t, zipEntry{name: manifestName, data: manifest}))
+	if pkg != nil || err == nil || !strings.Contains(err.Error(), "ambiguous unindented Markdown boundary") {
+		t.Fatalf("Load() = pkg=%v err=%v, want ambiguous sequence-mapping rejection", pkg, err)
+	}
+}
+
+func TestLegacyUnknownUnindentedLiteralBlockRemainsRejected(t *testing.T) {
+	manifest := `- job_name: Example
+  job_steps:
+    - step_name: Instructions
+      future_literal: |
+Unindented unknown content.
+`
+	pkg, err := Load(writePackage(t, zipEntry{name: manifestName, data: manifest}))
+	if pkg != nil || err == nil {
+		t.Fatalf("Load() = pkg=%v err=%v, want unknown unindented literal rejection", pkg, err)
+	}
+}
+
 func TestLegacyCompatibilityOutputLimit(t *testing.T) {
 	input := strings.Repeat(" ", 24) + "step_markdown: |\n" + "x\n" + "x\n" + "x\n" + "x\n"
 	if len(input) >= 64 {

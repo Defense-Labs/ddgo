@@ -120,6 +120,10 @@ type legacyMarkdownRecovery struct {
 	headerIndent        int
 	jobFieldIndent      int
 	legacySiblingIndent int
+	// sawPlainListItem permits a following mapping-looking bullet to remain
+	// Markdown only after the block has unambiguously entered a Markdown list.
+	// Without that context, an unknown sequence mapping remains ambiguous.
+	sawPlainListItem bool
 }
 
 func newLegacyNormalizationContext() legacyNormalizationContext {
@@ -137,6 +141,7 @@ func newLegacyNormalizationContext() legacyNormalizationContext {
 
 type legacyNormalizationActions struct {
 	markdownLines    []int
+	manifestLines    []int
 	colonLines       []int
 	whitespaceLines  []int
 	trailingTabLines []int
@@ -235,7 +240,7 @@ func (n *legacyManifestNormalizer) normalize() error {
 	for index := 0; index < len(n.lines); {
 		line := n.lines[index]
 		if n.context.markdown != nil {
-			boundary, ambiguous := legacyMarkdownBoundary(line.Content, n.context.markdown.headerIndent, n.context.markdown.jobFieldIndent, n.context.markdown.legacySiblingIndent)
+			boundary, ambiguous := legacyMarkdownBoundary(line.Content, n.context.markdown)
 			if ambiguous {
 				return fmt.Errorf("line %d is an ambiguous unindented Markdown boundary", line.Number)
 			}
@@ -246,6 +251,7 @@ func (n *legacyManifestNormalizer) normalize() error {
 			if err := n.emitter.emitIndented(line, n.context.markdown.headerIndent+2); err != nil {
 				return err
 			}
+			n.context.markdown.observeMarkdownContent(line.Content)
 			index++
 			continue
 		}
@@ -266,14 +272,18 @@ func (n *legacyManifestNormalizer) normalize() error {
 		}
 		line = n.normalizeSequenceMarker(line)
 		line = n.normalizeStepSiblingIndent(line)
-		if line.HasCandidateMap && !line.Field.list && line.Field.key == "step_markdown" && strings.TrimSpace(line.Field.value) == "|" {
+		if line.HasCandidateMap && !line.Field.list && legacyUnindentedLiteralField[line.Field.key] && strings.TrimSpace(line.Field.value) == "|" {
 			if legacyMarkdownNeedsIndent(n.lines, index+1, line.Field.indent) {
 				if err := n.emitter.emit(line, line.Content); err != nil {
 					return err
 				}
 				n.context.markdown = &legacyMarkdownRecovery{headerIndent: line.Field.indent, jobFieldIndent: n.context.jobFieldIndent, legacySiblingIndent: n.context.legacyStepSiblingIndent}
 				n.changed = true
-				n.actions.markdownLines = append(n.actions.markdownLines, line.Number)
+				if line.Field.key == "step_markdown" {
+					n.actions.markdownLines = append(n.actions.markdownLines, line.Number)
+				} else {
+					n.actions.manifestLines = append(n.actions.manifestLines, line.Number)
+				}
 				index++
 				continue
 			}
@@ -472,6 +482,9 @@ func (n *legacyManifestNormalizer) diagnostics(source string) []Diagnostic {
 	if len(n.actions.markdownLines) != 0 {
 		warnings = append(warnings, Diagnostic{Path: source, Field: fmt.Sprintf("line %d", n.actions.markdownLines[0]), Message: "accepted legacy unindented Markdown block"})
 	}
+	if len(n.actions.manifestLines) != 0 {
+		warnings = append(warnings, Diagnostic{Path: source, Field: fmt.Sprintf("line %d", n.actions.manifestLines[0]), Message: "accepted legacy unindented step_manifest block"})
+	}
 	if len(n.actions.colonLines) != 0 {
 		warnings = append(warnings, Diagnostic{Path: source, Field: fmt.Sprintf("line %d", n.actions.colonLines[0]), Message: "accepted unquoted free-text value containing a colon"})
 	}
@@ -531,6 +544,11 @@ func literalContentIndent(lines []legacyManifestLine, start, headerIndent int) i
 func isLiteralHeader(value string) bool {
 	value = strings.TrimSpace(value)
 	return strings.HasPrefix(value, "|") || strings.HasPrefix(value, ">")
+}
+
+var legacyUnindentedLiteralField = map[string]bool{
+	"step_markdown": true,
+	"step_manifest": true,
 }
 
 // legacyMarkdownNeedsIndent distinguishes the observed zero-column legacy
@@ -660,11 +678,21 @@ func legacyQuotedKey(key string) bool {
 	return (key[0] == '\'' && key[len(key)-1] == '\'') || (key[0] == '"' && key[len(key)-1] == '"')
 }
 
-func legacyMarkdownBoundary(line string, headerIndent, jobFieldIndent, legacySiblingIndent int) (boundary, ambiguous bool) {
+func (recovery *legacyMarkdownRecovery) observeMarkdownContent(line string) {
+	trimmed := strings.TrimLeft(line, " ")
+	if strings.HasPrefix(trimmed, "- ") {
+		if _, mapping := legacyField(line); !mapping {
+			recovery.sawPlainListItem = true
+		}
+	}
+}
+
+func legacyMarkdownBoundary(line string, recovery *legacyMarkdownRecovery) (boundary, ambiguous bool) {
 	field, ok := legacyField(line)
 	if !ok {
 		return false, false
 	}
+	headerIndent, jobFieldIndent, legacySiblingIndent := recovery.headerIndent, recovery.jobFieldIndent, recovery.legacySiblingIndent
 	// Any mapping key aligned with the Markdown field belongs to the same
 	// step, including unknown metadata retained by DDGo.
 	if !field.list && field.indent == headerIndent {
@@ -676,14 +704,29 @@ func legacyMarkdownBoundary(line string, headerIndent, jobFieldIndent, legacySib
 	if !field.list && legacySiblingIndent >= 0 && field.indent == legacySiblingIndent {
 		return true, false
 	}
-	// A new item at the enclosing step-list indentation is a later step.
-	if field.list && field.indent == headerIndent-2 {
-		return true, false
-	}
 	// Root job entries have a stable structural key, even when the current
 	// step's exact indentation differs from the conventional two spaces.
 	if field.list && field.key == "job_name" && field.indent < headerIndent {
 		return true, false
+	}
+	// A known sequence item at the enclosing step-list indentation is a later
+	// step or included step list. A mapping-looking Markdown bullet can appear
+	// at the same indentation, so only the known structural keys end the block.
+	if field.list && field.indent == headerIndent-2 {
+		if field.key == "step_name" || field.key == "manifest_file" {
+			return true, false
+		}
+		if recovery.sawPlainListItem {
+			return false, false
+		}
+		return false, true
+	}
+	// Legacy Markdown bodies can begin at column zero even when their field is
+	// nested further in a root job. Once a plain bullet has established a list,
+	// keep its mapping-looking peers as Markdown; a root job key remains a
+	// structural boundary below.
+	if field.list && field.key != "job_name" && field.indent < headerIndent && recovery.sawPlainListItem {
+		return false, false
 	}
 	// A job-level mapping after job_steps can be unknown metadata. Its
 	// indentation was observed from the actual job_steps field, not guessed.
