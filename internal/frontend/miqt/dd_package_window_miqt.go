@@ -31,7 +31,8 @@ type DDPackageWindow struct {
 	openGCode         *qt.QPushButton
 	runStep           *qt.QPushButton
 	selectedStatus    *qt.QLabel
-	warnings          *qt.QLabel
+	warningSection    *qt.QGroupBox
+	warnings          *qt.QPlainTextEdit
 	executionIdentity *qt.QLabel
 	executionStatus   *qt.QLabel
 	executionProgress *qt.QLabel
@@ -148,10 +149,18 @@ func newDDPackageWindow(id app.DocumentID, pkg *ddpackage.Package, openStep func
 	w.executionError.SetStyleSheet("color: #b00020;")
 	stripLayout.AddWidget(w.executionError.QWidget)
 	layout.AddWidget(strip.QWidget)
-	w.warnings = qt.NewQLabel(nil)
-	w.warnings.SetWordWrap(true)
-	w.warnings.SetStyleSheet("color: #8a5a00;")
-	layout.AddWidget(w.warnings.QWidget)
+	w.warningSection = qt.NewQGroupBox(nil)
+	w.warningSection.SetTitle("Package compatibility notes")
+	w.warningSection.SetMaximumHeight(160)
+	warningLayout := qt.NewQVBoxLayout(nil)
+	w.warningSection.SetLayout(warningLayout.QLayout)
+	w.warnings = qt.NewQPlainTextEdit(nil)
+	w.warnings.SetReadOnly(true)
+	w.warnings.SetLineWrapMode(qt.QPlainTextEdit__WidgetWidth)
+	w.warnings.SetMaximumHeight(130)
+	warningLayout.AddWidget(w.warnings.QWidget)
+	w.warningSection.SetVisible(false)
+	layout.AddWidget(w.warningSection.QWidget)
 	w.window.SetCentralWidget(central)
 
 	for _, job := range pkg.Jobs {
@@ -197,11 +206,8 @@ func newDDPackageWindow(id app.DocumentID, pkg *ddpackage.Package, openStep func
 		w.selectJob(0)
 	}
 	if len(pkg.Warnings) > 0 {
-		messages := make([]string, 0, len(pkg.Warnings))
-		for _, warning := range pkg.Warnings {
-			messages = append(messages, frontend.FormatPackageDiagnostic(warning))
-		}
-		w.warnings.SetText("Package compatibility notes: " + strings.Join(messages, "\n"))
+		w.warnings.SetPlainText(frontend.PresentPackageDiagnostics(pkg.Warnings).Text())
+		w.warningSection.SetVisible(true)
 	}
 	w.renderExecution()
 	return w
