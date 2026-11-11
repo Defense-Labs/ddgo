@@ -36,7 +36,7 @@ type DDPackageWindow struct {
 	executionIdentity *qt.QLabel
 	executionStatus   *qt.QLabel
 	executionProgress *qt.QLabel
-	executionError    *qt.QLabel
+	executionError    *qt.QPlainTextEdit
 	executionBar      *qt.QProgressBar
 	pauseExecution    *qt.QPushButton
 	resumeExecution   *qt.QPushButton
@@ -112,10 +112,12 @@ func newDDPackageWindow(id app.DocumentID, pkg *ddpackage.Package, openStep func
 	split.AddWidget(right)
 	split.SetStretchFactor(0, 2)
 	split.SetStretchFactor(1, 5)
-	layout.AddWidget(split.QWidget)
+	split.QWidget.SetSizePolicy2(qt.QSizePolicy__Expanding, qt.QSizePolicy__Expanding)
+	layout.AddWidget2(split.QWidget, 1)
 
 	strip := qt.NewQGroupBox(nil)
 	strip.SetTitle("Package Execution")
+	strip.SetSizePolicy2(qt.QSizePolicy__Preferred, qt.QSizePolicy__Maximum)
 	stripLayout := qt.NewQVBoxLayout(nil)
 	strip.SetLayout(stripLayout.QLayout)
 	w.executionIdentity = qt.NewQLabel(nil)
@@ -144,14 +146,17 @@ func newDDPackageWindow(id app.DocumentID, pkg *ddpackage.Package, openStep func
 		item.set(button)
 		stripLayout.AddWidget(button.QWidget)
 	}
-	w.executionError = qt.NewQLabel(nil)
-	w.executionError.SetWordWrap(true)
-	w.executionError.SetStyleSheet("color: #b00020;")
+	w.executionError = qt.NewQPlainTextEdit(nil)
+	w.executionError.SetReadOnly(true)
+	w.executionError.SetLineWrapMode(qt.QPlainTextEdit__WidgetWidth)
+	w.executionError.SetMaximumHeight(84)
+	w.executionError.SetVisible(false)
 	stripLayout.AddWidget(w.executionError.QWidget)
 	layout.AddWidget(strip.QWidget)
 	w.warningSection = qt.NewQGroupBox(nil)
 	w.warningSection.SetTitle("Package compatibility notes")
 	w.warningSection.SetMaximumHeight(160)
+	w.warningSection.SetSizePolicy2(qt.QSizePolicy__Preferred, qt.QSizePolicy__Maximum)
 	warningLayout := qt.NewQVBoxLayout(nil)
 	w.warningSection.SetLayout(warningLayout.QLayout)
 	w.warnings = qt.NewQPlainTextEdit(nil)
@@ -443,7 +448,8 @@ func (w *DDPackageWindow) SetPackageExecution(snapshot frontend.PackageExecution
 	w.executionProgress.SetText(display.Progress)
 	w.executionBar.SetMaximum(display.ProgressMaximum)
 	w.executionBar.SetValue(display.ProgressValue)
-	w.executionError.SetText(display.Error)
+	w.executionError.SetPlainText(display.Error)
+	w.executionError.SetVisible(display.Error != "")
 	w.pauseExecution.SetEnabled(display.PauseEnabled)
 	w.resumeExecution.SetEnabled(display.ResumeEnabled)
 	w.stopExecution.SetEnabled(display.StopEnabled)
@@ -460,6 +466,7 @@ func (w *DDPackageWindow) renderExecution() {
 	w.executionBar.SetMaximum(1)
 	w.executionBar.SetValue(0)
 	w.executionError.Clear()
+	w.executionError.SetVisible(false)
 	w.pauseExecution.SetEnabled(false)
 	w.resumeExecution.SetEnabled(false)
 	w.stopExecution.SetEnabled(false)
