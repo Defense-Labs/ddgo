@@ -31,8 +31,8 @@ type DDPackageWindow struct {
 	openGCode         *qt.QPushButton
 	runStep           *qt.QPushButton
 	selectedStatus    *qt.QLabel
-	warningSection    *qt.QGroupBox
-	warnings          *qt.QPlainTextEdit
+	packageLogSection *qt.QGroupBox
+	packageLog        *qt.QPlainTextEdit
 	executionIdentity *qt.QLabel
 	executionStatus   *qt.QLabel
 	executionProgress *qt.QLabel
@@ -152,21 +152,22 @@ func newDDPackageWindow(id app.DocumentID, pkg *ddpackage.Package, openStep func
 	w.executionError.SetMaximumHeight(84)
 	w.executionError.SetVisible(false)
 	stripLayout.AddWidget(w.executionError.QWidget)
-	w.warningSection = qt.NewQGroupBox(nil)
-	w.warningSection.SetTitle("Package compatibility notes")
-	w.warningSection.SetMaximumHeight(160)
-	w.warningSection.SetSizePolicy2(qt.QSizePolicy__Expanding, qt.QSizePolicy__Maximum)
-	warningLayout := qt.NewQVBoxLayout(nil)
-	w.warningSection.SetLayout(warningLayout.QLayout)
-	w.warnings = qt.NewQPlainTextEdit(nil)
-	w.warnings.SetReadOnly(true)
-	w.warnings.SetLineWrapMode(qt.QPlainTextEdit__WidgetWidth)
-	w.warnings.SetMaximumHeight(130)
-	warningLayout.AddWidget(w.warnings.QWidget)
-	w.warningSection.SetVisible(false)
+	w.packageLogSection = qt.NewQGroupBox(nil)
+	w.packageLogSection.SetTitle("Package Log")
+	// Ignored prevents the log's content size from making the lower row taller
+	// than the content-sized execution panel.
+	w.packageLogSection.SetSizePolicy2(qt.QSizePolicy__Expanding, qt.QSizePolicy__Ignored)
+	logLayout := qt.NewQVBoxLayout(nil)
+	w.packageLogSection.SetLayout(logLayout.QLayout)
+	w.packageLog = qt.NewQPlainTextEdit(nil)
+	w.packageLog.SetReadOnly(true)
+	w.packageLog.SetLineWrapMode(qt.QPlainTextEdit__WidgetWidth)
+	w.packageLog.SetSizePolicy2(qt.QSizePolicy__Expanding, qt.QSizePolicy__Ignored)
+	logLayout.AddWidget(w.packageLog.QWidget)
+	w.packageLogSection.SetVisible(false)
 	lowerPanels := qt.NewQHBoxLayout(nil)
 	lowerPanels.AddWidget3(strip.QWidget, 0, qt.AlignTop)
-	lowerPanels.AddWidget3(w.warningSection.QWidget, 1, qt.AlignTop)
+	lowerPanels.AddWidget2(w.packageLogSection.QWidget, 1)
 	layout.AddLayout(lowerPanels.QLayout)
 	w.window.SetCentralWidget(central)
 
@@ -213,8 +214,8 @@ func newDDPackageWindow(id app.DocumentID, pkg *ddpackage.Package, openStep func
 		w.selectJob(0)
 	}
 	if len(pkg.Warnings) > 0 {
-		w.warnings.SetPlainText(frontend.PresentPackageDiagnostics(pkg.Warnings).Text())
-		w.warningSection.SetVisible(true)
+		w.packageLog.SetPlainText(frontend.PresentPackageDiagnostics(pkg.Warnings).Text())
+		w.packageLogSection.SetVisible(true)
 	}
 	w.renderExecution()
 	return w
