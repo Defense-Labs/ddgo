@@ -25,6 +25,9 @@ func confirmShutdown(t *testing.T, coordinator *ShutdownCoordinator, attempt Shu
 
 func TestShutdownCoordinatorCancelledConfirmationCannotResume(t *testing.T) {
 	coordinator, attempt := beginShutdown(t, []app.DocumentID{1, 2})
+	if !coordinator.Active() || !coordinator.ConfirmationPending() || coordinator.TeardownActive() {
+		t.Fatal("confirmation phase was not distinguished from confirmed teardown")
+	}
 	if phase := coordinator.ConfirmApplication(attempt, false); phase != ShutdownIdle {
 		t.Fatalf("cancelled confirmation phase = %v, want idle", phase)
 	}
@@ -36,7 +39,7 @@ func TestShutdownCoordinatorCancelledConfirmationCannotResume(t *testing.T) {
 	}
 }
 
-func TestShutdownCoordinatorConfirmedExitIgnoresMachineAndProgramState(t *testing.T) {
+func TestAllowsApplicationExitIgnoresMachineAndProgramState(t *testing.T) {
 	states := []struct {
 		name  string
 		state app.State
@@ -50,18 +53,50 @@ func TestShutdownCoordinatorConfirmedExitIgnoresMachineAndProgramState(t *testin
 		{"stopping", app.State{ProgramStatus: app.ProgramStopping, MachineReadiness: app.MachineReadinessStopping}},
 		{"failed stop", app.State{ProgramStatus: app.ProgramFailed, MachineReadiness: app.MachineReadinessRecoveryRequired}},
 		{"pending admission", app.State{ProgramStatus: app.ProgramLoaded, MachineReadiness: app.MachineReadinessRecoveryRequired}},
+		{"unresponsive controller", app.State{ConnectionStatus: app.ConnectionConnected, MachineReadiness: app.MachineReadinessRecoveryRequired}},
 	}
 	for _, test := range states {
 		t.Run(test.name, func(t *testing.T) {
-			// ShutdownCoordinator intentionally accepts no controller state. This
-			// declaration documents the states that must not affect an accepted
-			// application exit.
-			_ = test.state
-			coordinator, attempt := beginShutdown(t, []app.DocumentID{7})
-			confirmShutdown(t, coordinator, attempt)
-			id, ok := coordinator.NextDocumentToClose(attempt)
-			if !ok || id != 7 || !coordinator.AllowsDocumentClose(attempt, id) {
-				t.Fatalf("machine/program state blocked document closure: id=%d ok=%v phase=%v", id, ok, coordinator.Phase())
+			if !AllowsApplicationExit(test.state, 1) {
+				t.Fatal("machine or pending start admission blocked application exit")
+			}
+		})
+	}
+}
+
+func TestShutdownCoordinatorConfirmedExitBeginsTeardownWithoutMachineInput(t *testing.T) {
+	coordinator, attempt := beginShutdown(t, []app.DocumentID{7})
+	confirmShutdown(t, coordinator, attempt)
+	if coordinator.ConfirmationPending() || !coordinator.TeardownActive() {
+		t.Fatal("accepted exit did not enter confirmed teardown")
+	}
+	id, ok := coordinator.NextDocumentToClose(attempt)
+	if !ok || id != 7 || !coordinator.AllowsDocumentClose(attempt, id) {
+		t.Fatalf("confirmed exit did not authorize document closure: id=%d ok=%v phase=%v", id, ok, coordinator.Phase())
+	}
+}
+
+func TestShutdownAsyncDispositionPreservesResultsUntilConfirmationOutcome(t *testing.T) {
+	tests := []struct {
+		name  string
+		phase ShutdownPhase
+		kind  ShutdownAsyncResultKind
+		want  ShutdownAsyncResultDisposition
+	}{
+		{"idle start", ShutdownIdle, ShutdownAsyncStartResult, ShutdownAsyncApply},
+		{"idle action", ShutdownIdle, ShutdownAsyncActionResult, ShutdownAsyncApply},
+		{"idle stop", ShutdownIdle, ShutdownAsyncStopAndCloseResult, ShutdownAsyncApply},
+		{"confirmation pending start", ShutdownConfirming, ShutdownAsyncStartResult, ShutdownAsyncDefer},
+		{"confirmation pending action", ShutdownConfirming, ShutdownAsyncActionResult, ShutdownAsyncApply},
+		{"confirmation pending stop", ShutdownConfirming, ShutdownAsyncStopAndCloseResult, ShutdownAsyncDefer},
+		{"confirmed teardown start", ShutdownClosingDocuments, ShutdownAsyncStartResult, ShutdownAsyncDiscard},
+		{"confirmed teardown action", ShutdownReadyToCloseMain, ShutdownAsyncActionResult, ShutdownAsyncDiscard},
+		{"finished stop", ShutdownFinished, ShutdownAsyncStopAndCloseResult, ShutdownAsyncDiscard},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ShutdownAsyncDisposition(test.phase, test.kind); got != test.want {
+				t.Fatalf("ShutdownAsyncDisposition(%v, %v) = %v, want %v", test.phase, test.kind, got, test.want)
 			}
 		})
 	}
@@ -103,8 +138,21 @@ func TestShutdownCoordinatorAuthorizesOnlySelectedDocumentAndRejectsStaleCallbac
 	if !ok || !coordinator.AllowsDocumentClose(first, id) {
 		t.Fatal("missing selected document")
 	}
-	if coordinator.DocumentClosed(first, 99) || coordinator.DocumentClosed(first, 2) {
+	unselected := app.DocumentID(1)
+	for _, candidate := range []app.DocumentID{1, 2, 3} {
+		if candidate != id {
+			unselected = candidate
+			break
+		}
+	}
+	if unselected == id {
+		t.Fatal("test fixture did not provide an unselected document")
+	}
+	if coordinator.DocumentClosed(first, 99) || coordinator.DocumentClosed(first, unselected) {
 		t.Fatal("stale or unselected callback was accepted")
+	}
+	if !coordinator.AllowsDocumentClose(first, id) {
+		t.Fatal("rejected callback revoked selected document authorization")
 	}
 	if !coordinator.Cancel(first) {
 		t.Fatal("first attempt was not cancelled")
@@ -116,6 +164,9 @@ func TestShutdownCoordinatorAuthorizesOnlySelectedDocumentAndRejectsStaleCallbac
 	confirmShutdown(t, coordinator, second)
 	if coordinator.AllowsDocumentClose(first, id) {
 		t.Fatal("old attempt authorization survived cancellation")
+	}
+	if coordinator.DocumentClosed(first, id) || coordinator.DocumentCloseRejected(first, id) {
+		t.Fatal("stale callback from abandoned attempt affected the new attempt")
 	}
 	if next, ok := coordinator.NextDocumentToClose(second); !ok || next != id || !coordinator.DocumentClosed(second, id) {
 		t.Fatalf("second attempt close = %d, %v", next, ok)

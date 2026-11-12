@@ -30,6 +30,11 @@ func NewViewDispatcher(state app.State, revision app.StateRevision) *ViewDispatc
 	return &ViewDispatcher{state: state, revision: revision}
 }
 
+// State returns the newest controller state already admitted to the UI event
+// stream. It performs no controller I/O and is intended for UI-thread policy
+// decisions such as a user-requested application exit.
+func (d *ViewDispatcher) State() app.State { return d.state }
+
 // Register adds a view and immediately applies the dispatcher's current state.
 func (d *ViewDispatcher) Register(view EventView) ViewID {
 	id := d.views.add(view)

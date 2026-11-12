@@ -29,11 +29,13 @@ type Application struct {
 	mainWindow *MainWindow
 
 	pendingDocumentCloses    map[app.DocumentID]app.RunID
+	deferredDocumentCloses   map[app.DocumentID]documentCloseResult
 	pendingAdmissionCloses   map[app.DocumentID]app.RunID
 	approvedDocumentCloses   frontend.DocumentCloseApprovals
 	documentCloseResults     chan documentCloseResult
 	exitDone                 chan struct{}
 	pendingDocumentStarts    map[frontend.ExecutionSessionID]documentStartRequest
+	deferredDocumentStarts   map[frontend.ExecutionSessionID]documentStartResult
 	documentStartResults     chan documentStartResult
 	pendingDocumentActions   map[frontend.ExecutionSessionID]app.RunID
 	documentActionResults    chan documentActionResult
@@ -86,11 +88,13 @@ func (a *Application) Run() error {
 	a.documents.SetOnClose(a.documentClosed)
 	a.sessions = frontend.NewExecutionSessions(state, revision)
 	a.pendingDocumentCloses = make(map[app.DocumentID]app.RunID)
+	a.deferredDocumentCloses = make(map[app.DocumentID]documentCloseResult)
 	a.pendingAdmissionCloses = make(map[app.DocumentID]app.RunID)
 	a.approvedDocumentCloses = make(frontend.DocumentCloseApprovals)
 	a.documentCloseResults = make(chan documentCloseResult, 16)
 	a.exitDone = make(chan struct{})
 	a.pendingDocumentStarts = make(map[frontend.ExecutionSessionID]documentStartRequest)
+	a.deferredDocumentStarts = make(map[frontend.ExecutionSessionID]documentStartResult)
 	a.documentStartResults = make(chan documentStartResult, 16)
 	a.pendingDocumentActions = make(map[frontend.ExecutionSessionID]app.RunID)
 	a.documentActionResults = make(chan documentActionResult, 16)
@@ -448,49 +452,71 @@ func (a *Application) drainDocumentStartResults() {
 			if !pending || request.id != result.requestID {
 				continue
 			}
-			delete(a.pendingDocumentStarts, result.sessionID)
-			// A confirmed application exit deliberately does not wait for, or
-			// publish UI state from, a late controller admission result.
-			if a.shutdown.Active() {
+			if frontend.ShutdownAsyncDisposition(a.shutdown.Phase(), frontend.ShutdownAsyncStartResult) == frontend.ShutdownAsyncDefer {
+				// A modal confirmation can run the UI timer. Keep the accepted
+				// admission result until cancellation rather than applying a close
+				// side effect behind the dialog or losing it permanently.
+				a.deferredDocumentStarts[result.sessionID] = result
 				continue
 			}
-			entry, open := a.documents.Entry(result.documentID)
-			if !open {
-				continue
-			}
-			if !a.sessions.AssociateRun(result.sessionID, result.requestID, result.runID, result.err) {
-				continue
-			}
-			disposition := frontend.ResolveDeferredAdmissionClose(a.documents.ClosePending(result.documentID), result.runID, result.err, false)
-			if disposition == frontend.DeferredAdmissionCloseNone {
-				continue
-			}
-			if disposition == frontend.DeferredAdmissionCloseRetryNormal {
-				a.documents.ClearClosePending(result.documentID)
-				// Reissue normal close policy even when another document owns an
-				// active run. A failed package admission has no RunID to stop and
-				// must not leave this package permanently close-pending.
-				_ = entry.Window.Close()
-				continue
-			}
-			// The controller may return Start before its revisioned state event
-			// reaches the UI. Keep the document alive until that exact RunID is
-			// observable; then reissue the native close so normal Stop-and-Close
-			// (or terminal close) decides safely.
-			a.pendingAdmissionCloses[result.documentID] = result.runID
-			a.resolvePendingAdmissionCloses()
+			a.applyDocumentStartResult(result)
 		default:
 			return
 		}
 	}
 }
 
+func (a *Application) applyDocumentStartResult(result documentStartResult) {
+	request, pending := a.pendingDocumentStarts[result.sessionID]
+	if !pending || request.id != result.requestID {
+		return
+	}
+	delete(a.pendingDocumentStarts, result.sessionID)
+	delete(a.deferredDocumentStarts, result.sessionID)
+	// A confirmed application exit deliberately does not wait for, or publish
+	// UI state from, a late controller admission result.
+	if a.shutdown.TeardownActive() {
+		return
+	}
+	entry, open := a.documents.Entry(result.documentID)
+	if !open {
+		return
+	}
+	if !a.sessions.AssociateRun(result.sessionID, result.requestID, result.runID, result.err) {
+		return
+	}
+	disposition := frontend.ResolveDeferredAdmissionClose(a.documents.ClosePending(result.documentID), result.runID, result.err, false)
+	if disposition == frontend.DeferredAdmissionCloseNone {
+		return
+	}
+	if disposition == frontend.DeferredAdmissionCloseRetryNormal {
+		a.documents.ClearClosePending(result.documentID)
+		// Reissue normal close policy even when another document owns an active
+		// run. A failed package admission has no RunID to stop and must not leave
+		// this package permanently close-pending.
+		_ = entry.Window.Close()
+		return
+	}
+	// The controller may return Start before its revisioned state event reaches
+	// the UI. Keep the document alive until that exact RunID is observable; then
+	// reissue the native close so normal Stop-and-Close (or terminal close)
+	// decides safely.
+	a.pendingAdmissionCloses[result.documentID] = result.runID
+	a.resolvePendingAdmissionCloses()
+}
+
 func (a *Application) resolvePendingAdmissionCloses() {
-	if a.shutdown.Active() {
+	if a.shutdown.TeardownActive() {
 		for documentID := range a.pendingAdmissionCloses {
 			delete(a.pendingAdmissionCloses, documentID)
 			a.documents.ClearClosePending(documentID)
 		}
+		return
+	}
+	// The ordinary confirmation dialog may run a nested Qt event loop. Keep
+	// deferred admission closes intact until the user either cancels (when
+	// normal Stop-and-Close handling resumes) or confirms teardown.
+	if a.shutdown.ConfirmationPending() {
 		return
 	}
 	for documentID, runID := range a.pendingAdmissionCloses {
@@ -572,6 +598,9 @@ func (a *Application) drainDocumentActionResults() {
 				continue
 			}
 			delete(a.pendingDocumentActions, result.sessionID)
+			if frontend.ShutdownAsyncDisposition(a.shutdown.Phase(), frontend.ShutdownAsyncActionResult) == frontend.ShutdownAsyncDiscard {
+				continue
+			}
 			if _, ok := a.documents.Entry(result.documentID); ok {
 				_ = a.sessions.FinishAction(result.sessionID, result.runID, result.err)
 			}
@@ -690,40 +719,71 @@ func (a *Application) drainDocumentCloseResults() {
 			if !pending || expectedRun != result.runID {
 				continue
 			}
-			delete(a.pendingDocumentCloses, result.documentID)
-			if a.shutdown.Active() {
-				// A Stop requested before application exit may finish late. It has no
-				// authority to delay or cancel the accepted application teardown.
-				a.documents.ClearClosePending(result.documentID)
-				delete(a.approvedDocumentCloses, result.documentID)
+			if frontend.ShutdownAsyncDisposition(a.shutdown.Phase(), frontend.ShutdownAsyncStopAndCloseResult) == frontend.ShutdownAsyncDefer {
+				// Do not lose an independently requested Stop while a cancellable
+				// modal exit dialog is open, and do not let it close a document
+				// behind that dialog. One result per document is possible here.
+				a.deferredDocumentCloses[result.documentID] = result
 				continue
 			}
-			entry, stillOpen := a.documents.Entry(result.documentID)
-			state := a.controller.Snapshot()
-			disposition := frontend.ClassifyDocumentStopResult(result.err, stillOpen, result.documentID, result.runID, state)
-			if disposition == frontend.DocumentStopInvalid {
-				a.documents.ClearClosePending(result.documentID)
-				if stillOpen {
-					a.warnDocumentStopFailure(entry, result.err)
-				}
-				continue
-			}
-			a.approvedDocumentCloses[result.documentID] = result.runID
-			if !entry.Window.Close() {
-				delete(a.approvedDocumentCloses, result.documentID)
-				a.documents.ClearClosePending(result.documentID)
-				qt.QMessageBox_Warning(documentParent(entry), "Document Remains Open", "The program stopped safely, but the document window did not close. You may try closing it again.")
-			}
+			a.applyDocumentCloseResult(result)
 		default:
 			return
 		}
 	}
 }
 
+// applyDocumentCloseResult completes independent Stop-and-Close after the
+// result is safe to act on. Confirmed application teardown deliberately drops
+// it: teardown owns native document closure and never waits for controller I/O.
+func (a *Application) applyDocumentCloseResult(result documentCloseResult) {
+	expectedRun, pending := a.pendingDocumentCloses[result.documentID]
+	if !pending || expectedRun != result.runID {
+		return
+	}
+	delete(a.pendingDocumentCloses, result.documentID)
+	delete(a.deferredDocumentCloses, result.documentID)
+	if a.shutdown.TeardownActive() {
+		a.documents.ClearClosePending(result.documentID)
+		delete(a.approvedDocumentCloses, result.documentID)
+		return
+	}
+	entry, stillOpen := a.documents.Entry(result.documentID)
+	state := a.controller.Snapshot()
+	disposition := frontend.ClassifyDocumentStopResult(result.err, stillOpen, result.documentID, result.runID, state)
+	if disposition == frontend.DocumentStopInvalid {
+		a.documents.ClearClosePending(result.documentID)
+		if stillOpen {
+			a.warnDocumentStopFailure(entry, result.err)
+		}
+		return
+	}
+	a.approvedDocumentCloses[result.documentID] = result.runID
+	if !entry.Window.Close() {
+		delete(a.approvedDocumentCloses, result.documentID)
+		a.documents.ClearClosePending(result.documentID)
+		qt.QMessageBox_Warning(documentParent(entry), "Document Remains Open", "The program stopped safely, but the document window did not close. You may try closing it again.")
+	}
+}
+
+func (a *Application) applyDeferredDocumentCloseResults() {
+	if a.shutdown.Active() {
+		return
+	}
+	for _, result := range a.deferredDocumentStarts {
+		a.applyDocumentStartResult(result)
+	}
+	for _, result := range a.deferredDocumentCloses {
+		a.applyDocumentCloseResult(result)
+	}
+}
+
 func (a *Application) documentClosed(entry frontend.DocumentEntry) {
 	delete(a.pendingDocumentCloses, entry.ID)
+	delete(a.deferredDocumentCloses, entry.ID)
 	delete(a.pendingAdmissionCloses, entry.ID)
 	delete(a.pendingDocumentStarts, frontend.StandaloneExecutionSessionID(entry.ID))
+	delete(a.deferredDocumentStarts, frontend.StandaloneExecutionSessionID(entry.ID))
 	delete(a.pendingDocumentActions, frontend.StandaloneExecutionSessionID(entry.ID))
 	delete(a.approvedDocumentCloses, entry.ID)
 	if a.sessions != nil {
@@ -748,6 +808,7 @@ func (a *Application) documentClosed(entry frontend.DocumentEntry) {
 		delete(a.selectedPackageSessions, entry.ID)
 		for id := range a.packageSessions[entry.ID] {
 			delete(a.pendingDocumentStarts, id)
+			delete(a.deferredDocumentStarts, id)
 			delete(a.pendingDocumentActions, id)
 		}
 		for id := range a.packageSessions[entry.ID] {
@@ -759,7 +820,7 @@ func (a *Application) documentClosed(entry frontend.DocumentEntry) {
 	}
 	// Do not close the main window here: this callback runs inside native
 	// document destruction. The next UI timer turn advances the coordinator.
-	if a.shutdown.Active() {
+	if a.shutdown.TeardownActive() {
 		a.shutdown.DocumentClosed(a.shutdown.Attempt(), entry.ID)
 	}
 	a.refreshExecutionFocusAvailability()
@@ -802,6 +863,9 @@ func (a *Application) requestMainClose() bool {
 	if a.shutdown.Active() {
 		return false
 	}
+	if !frontend.AllowsApplicationExit(a.dispatcher.State(), a.programStarts.Outstanding()) {
+		return false
+	}
 
 	documents := a.documents.Entries()
 	documentIDs := make([]app.DocumentID, 0, len(documents))
@@ -818,6 +882,10 @@ func (a *Application) requestMainClose() bool {
 	a.programStarts.Freeze()
 	if !confirmApplicationClose(a.mainParent(), len(documentIDs)) {
 		a.shutdown.ConfirmApplication(attempt, false)
+		// Results can arrive in the confirmation dialog's nested event loop.
+		// Resume independent deferred close work only after cancellation.
+		a.applyDeferredDocumentCloseResults()
+		a.resolvePendingAdmissionCloses()
 		return false
 	}
 	a.shutdown.ConfirmApplication(attempt, true)

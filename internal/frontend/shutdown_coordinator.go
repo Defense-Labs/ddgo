@@ -37,6 +37,20 @@ func (c *ShutdownCoordinator) Active() bool {
 	return c.phase != ShutdownIdle && c.phase != ShutdownFinished
 }
 
+// ConfirmationPending reports that ordinary exit confirmation is open but the
+// user has not yet authorized teardown. Frontend results must remain usable if
+// the user cancels the dialog.
+func (c *ShutdownCoordinator) ConfirmationPending() bool {
+	return c.phase == ShutdownConfirming
+}
+
+// TeardownActive reports that the user accepted application exit and native
+// document teardown is now in progress (or complete). Unlike Active, this
+// intentionally excludes the cancellable confirmation phase.
+func (c *ShutdownCoordinator) TeardownActive() bool {
+	return c.phase == ShutdownClosingDocuments || c.phase == ShutdownReadyToCloseMain || c.phase == ShutdownFinished
+}
+
 // Begin records the open logical documents before ordinary exit confirmation.
 func (c *ShutdownCoordinator) Begin(documents []app.DocumentID) (ShutdownAttemptID, bool) {
 	if c.Active() || c.finalIssued {
