@@ -202,12 +202,12 @@ func TestPackageLifecycleVerifiedStopRequiresExactRunAndAuxiliaryTeardown(t *tes
 	addTestAuxiliary(t, windows, &views, entry.ID, step, false)
 
 	running := sessionState(entry.ID, 51, app.ProgramRunning, 1)
-	if got := ClassifyDocumentStopResult(nil, true, entry.ID, 51, running, false); got != DocumentStopInvalid {
+	if got := ClassifyDocumentStopResult(nil, true, entry.ID, 51, running); got != DocumentStopInvalid {
 		t.Fatalf("active run was closeable: %v", got)
 	}
 	draining := running
 	draining.ProgramStatus = app.ProgramDraining
-	if got := ClassifyDocumentStopResult(nil, true, entry.ID, 51, draining, false); got != DocumentStopInvalid {
+	if got := ClassifyDocumentStopResult(nil, true, entry.ID, 51, draining); got != DocumentStopInvalid {
 		t.Fatalf("draining run was closeable: %v", got)
 	}
 	if views.Len(entry.ID) != 1 || registry.Len() != 1 {
@@ -215,10 +215,10 @@ func TestPackageLifecycleVerifiedStopRequiresExactRunAndAuxiliaryTeardown(t *tes
 	}
 
 	stopped := stoppedDocumentState(entry.ID, 51)
-	if got := ClassifyDocumentStopResult(nil, true, entry.ID, 52, stopped, false); got != DocumentStopInvalid {
+	if got := ClassifyDocumentStopResult(nil, true, entry.ID, 52, stopped); got != DocumentStopInvalid {
 		t.Fatalf("wrong RunID was accepted: %v", got)
 	}
-	if got := ClassifyDocumentStopResult(nil, true, entry.ID, 51, stopped, false); got != DocumentStopCloseIndependently {
+	if got := ClassifyDocumentStopResult(nil, true, entry.ID, 51, stopped); got != DocumentStopCloseIndependently {
 		t.Fatalf("verified exact Stop was not approved: %v", got)
 	}
 	approvals := DocumentCloseApprovals{entry.ID: 51}
@@ -244,12 +244,11 @@ func TestPackageLifecycleShutdownClosesOneLogicalDocumentAfterAuxiliaries(t *tes
 	}
 	var shutdown ShutdownCoordinator
 	attempt, ok := shutdown.Begin([]app.DocumentID{entry.ID})
-	if !ok || shutdown.ConfirmApplication(attempt, true) != ShutdownWaitingForRunAdmission ||
-		shutdown.ResolveRunAdmission(attempt, app.State{MachineReadiness: app.MachineReadinessNormal}) != ShutdownClosingDocuments {
+	if !ok || shutdown.ConfirmApplication(attempt, true) != ShutdownClosingDocuments {
 		t.Fatalf("shutdown did not reach document closure: phase=%v", shutdown.Phase())
 	}
 	id, ok := shutdown.NextDocumentToClose(attempt)
-	if !ok || id != entry.ID || !shutdown.CanCloseSelectedDocument(attempt, id, app.State{MachineReadiness: app.MachineReadinessNormal}) {
+	if !ok || id != entry.ID || !shutdown.AllowsDocumentClose(attempt, id) {
 		t.Fatalf("package was not the one authorized shutdown document: %d, %v", id, ok)
 	}
 	if !closeTestPackage(entry, &views) || !shutdown.DocumentClosed(attempt, id) {
@@ -273,7 +272,6 @@ func TestPackageLifecycleShutdownCancelsWhenAuxiliaryRefusesClose(t *testing.T) 
 	var shutdown ShutdownCoordinator
 	attempt, _ := shutdown.Begin([]app.DocumentID{entry.ID})
 	shutdown.ConfirmApplication(attempt, true)
-	shutdown.ResolveRunAdmission(attempt, app.State{MachineReadiness: app.MachineReadinessNormal})
 	id, ok := shutdown.NextDocumentToClose(attempt)
 	if !ok || id != entry.ID || closeTestPackage(entry, &views) {
 		t.Fatal("refusing auxiliary was accepted as package teardown")

@@ -21,23 +21,21 @@ func TestClassifyDocumentStopResult(t *testing.T) {
 	const documentID app.DocumentID = 7
 	const runID app.RunID = 11
 	for _, tt := range []struct {
-		name     string
-		err      error
-		open     bool
-		state    app.State
-		shutdown bool
-		want     DocumentStopDisposition
+		name  string
+		err   error
+		open  bool
+		state app.State
+		want  DocumentStopDisposition
 	}{
-		{"independent success", nil, true, stoppedDocumentState(documentID, runID), false, DocumentStopCloseIndependently},
-		{"shutdown transfer", nil, true, stoppedDocumentState(documentID, runID), true, DocumentStopTransferToShutdown},
-		{"controller failure", errors.New("stop failed"), true, stoppedDocumentState(documentID, runID), true, DocumentStopInvalid},
-		{"draining is still active", nil, true, app.State{ProgramDocumentID: documentID, ProgramRunID: runID, ProgramStatus: app.ProgramDraining, MachineReadiness: app.MachineReadinessNormal}, false, DocumentStopInvalid},
-		{"recovery required", nil, true, app.State{ProgramDocumentID: documentID, ProgramRunID: runID, ProgramStatus: app.ProgramFailed, MachineReadiness: app.MachineReadinessRecoveryRequired}, true, DocumentStopInvalid},
-		{"replacement run", nil, true, stoppedDocumentState(documentID, runID+1), true, DocumentStopInvalid},
-		{"closed old document", nil, false, stoppedDocumentState(documentID, runID), false, DocumentStopInvalid},
+		{"independent success", nil, true, stoppedDocumentState(documentID, runID), DocumentStopCloseIndependently},
+		{"controller failure", errors.New("stop failed"), true, stoppedDocumentState(documentID, runID), DocumentStopInvalid},
+		{"draining is still active", nil, true, app.State{ProgramDocumentID: documentID, ProgramRunID: runID, ProgramStatus: app.ProgramDraining, MachineReadiness: app.MachineReadinessNormal}, DocumentStopInvalid},
+		{"recovery required", nil, true, app.State{ProgramDocumentID: documentID, ProgramRunID: runID, ProgramStatus: app.ProgramFailed, MachineReadiness: app.MachineReadinessRecoveryRequired}, DocumentStopInvalid},
+		{"replacement run", nil, true, stoppedDocumentState(documentID, runID+1), DocumentStopInvalid},
+		{"closed old document", nil, false, stoppedDocumentState(documentID, runID), DocumentStopInvalid},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := ClassifyDocumentStopResult(tt.err, tt.open, documentID, runID, tt.state, tt.shutdown); got != tt.want {
+			if got := ClassifyDocumentStopResult(tt.err, tt.open, documentID, runID, tt.state); got != tt.want {
 				t.Fatalf("ClassifyDocumentStopResult() = %v, want %v", got, tt.want)
 			}
 		})

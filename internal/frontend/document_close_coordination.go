@@ -46,20 +46,16 @@ func ResolveDeferredAdmissionClose(closePending bool, runID app.RunID, err error
 const (
 	DocumentStopInvalid DocumentStopDisposition = iota
 	DocumentStopCloseIndependently
-	DocumentStopTransferToShutdown
 )
 
 // ClassifyDocumentStopResult verifies that a Stop result still belongs to the
 // original document/run and reached the controller's verified stopped state.
-// During application shutdown, valid Stop completion transfers only native
-// close ownership to the shutdown coordinator; it never starts a second Stop.
-func ClassifyDocumentStopResult(err error, documentOpen bool, documentID app.DocumentID, runID app.RunID, state app.State, shutdownActive bool) DocumentStopDisposition {
+// Application teardown handles pending Stop results separately and never
+// borrows their controller lifecycle.
+func ClassifyDocumentStopResult(err error, documentOpen bool, documentID app.DocumentID, runID app.RunID, state app.State) DocumentStopDisposition {
 	if err != nil || !documentOpen || runID == 0 || state.ProgramDocumentID != documentID || state.ProgramRunID != runID ||
 		state.ProgramStatus != app.ProgramStopped || state.MachineReadiness != app.MachineReadinessNormal {
 		return DocumentStopInvalid
-	}
-	if shutdownActive {
-		return DocumentStopTransferToShutdown
 	}
 	return DocumentStopCloseIndependently
 }

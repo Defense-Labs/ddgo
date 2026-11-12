@@ -4,7 +4,6 @@ package miqt
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,6 +32,7 @@ type Application struct {
 	pendingAdmissionCloses   map[app.DocumentID]app.RunID
 	approvedDocumentCloses   frontend.DocumentCloseApprovals
 	documentCloseResults     chan documentCloseResult
+	exitDone                 chan struct{}
 	pendingDocumentStarts    map[frontend.ExecutionSessionID]documentStartRequest
 	documentStartResults     chan documentStartResult
 	pendingDocumentActions   map[frontend.ExecutionSessionID]app.RunID
@@ -43,10 +43,9 @@ type Application struct {
 	selectedPackageObservers map[app.DocumentID]func()
 	selectedPackageSessions  map[app.DocumentID]frontend.ExecutionSessionID
 
-	shutdown            frontend.ShutdownCoordinator
-	shutdownStopResults chan shutdownStopResult
-	mainCloseIssued     bool
-	programStarts       frontend.ProgramStartGate
+	shutdown        frontend.ShutdownCoordinator
+	mainCloseIssued bool
+	programStarts   frontend.ProgramStartGate
 }
 
 type documentCloseResult struct {
@@ -69,11 +68,6 @@ type documentActionResult struct {
 	runID      app.RunID
 	err        error
 }
-type shutdownStopResult struct {
-	attempt frontend.ShutdownAttemptID
-	target  frontend.ShutdownStopTarget
-	err     error
-}
 
 func newApplication(controller *app.Controller) *Application {
 	return &Application{controller: controller}
@@ -95,6 +89,7 @@ func (a *Application) Run() error {
 	a.pendingAdmissionCloses = make(map[app.DocumentID]app.RunID)
 	a.approvedDocumentCloses = make(frontend.DocumentCloseApprovals)
 	a.documentCloseResults = make(chan documentCloseResult, 16)
+	a.exitDone = make(chan struct{})
 	a.pendingDocumentStarts = make(map[frontend.ExecutionSessionID]documentStartRequest)
 	a.documentStartResults = make(chan documentStartResult, 16)
 	a.pendingDocumentActions = make(map[frontend.ExecutionSessionID]app.RunID)
@@ -103,8 +98,6 @@ func (a *Application) Run() error {
 	a.packageObservers = make(map[app.DocumentID]func())
 	a.selectedPackageObservers = make(map[app.DocumentID]func())
 	a.selectedPackageSessions = make(map[app.DocumentID]frontend.ExecutionSessionID)
-	a.shutdownStopResults = make(chan shutdownStopResult, 2)
-
 	mainWindow := newMainWindow(a.controller, func() { a.openGCodeFile() }, a.showExecutionDocument, a.canShowExecutionDocument)
 	a.mainWindow = mainWindow
 	mainWindow.SetOnCloseRequest(a.requestMainClose)
@@ -396,7 +389,6 @@ func (a *Application) drainControllerEvents() {
 			a.drainDocumentStartResults()
 			a.drainDocumentActionResults()
 			a.drainDocumentCloseResults()
-			a.drainShutdownStopResults()
 			a.progressShutdown()
 			a.syncProgramStartGate()
 			return
@@ -433,12 +425,19 @@ func (a *Application) startDocumentProgram(sessionID frontend.ExecutionSessionID
 	go func() {
 		defer admission.Release()
 		if parseErr != nil {
-			a.documentStartResults <- documentStartResult{documentID: id, sessionID: sessionID, requestID: request.id, err: parseErr}
+			a.sendDocumentStartResult(documentStartResult{documentID: id, sessionID: sessionID, requestID: request.id, err: parseErr})
 			return
 		}
 		runID, err := a.controller.StartDocumentProgram(context.Background(), id, program)
-		a.documentStartResults <- documentStartResult{documentID: id, sessionID: sessionID, requestID: request.id, runID: runID, err: err}
+		a.sendDocumentStartResult(documentStartResult{documentID: id, sessionID: sessionID, requestID: request.id, runID: runID, err: err})
 	}()
+}
+
+func (a *Application) sendDocumentStartResult(result documentStartResult) {
+	select {
+	case a.documentStartResults <- result:
+	case <-a.exitDone:
+	}
 }
 
 func (a *Application) drainDocumentStartResults() {
@@ -450,6 +449,11 @@ func (a *Application) drainDocumentStartResults() {
 				continue
 			}
 			delete(a.pendingDocumentStarts, result.sessionID)
+			// A confirmed application exit deliberately does not wait for, or
+			// publish UI state from, a late controller admission result.
+			if a.shutdown.Active() {
+				continue
+			}
 			entry, open := a.documents.Entry(result.documentID)
 			if !open {
 				continue
@@ -482,6 +486,13 @@ func (a *Application) drainDocumentStartResults() {
 }
 
 func (a *Application) resolvePendingAdmissionCloses() {
+	if a.shutdown.Active() {
+		for documentID := range a.pendingAdmissionCloses {
+			delete(a.pendingAdmissionCloses, documentID)
+			a.documents.ClearClosePending(documentID)
+		}
+		return
+	}
 	for documentID, runID := range a.pendingAdmissionCloses {
 		if a.hasPendingSessionStart(documentID) {
 			continue
@@ -541,8 +552,15 @@ func (a *Application) documentProgramAction(sessionID frontend.ExecutionSessionI
 		case "stop":
 			err = a.controller.StopProgramRun(context.Background(), id, runID)
 		}
-		a.documentActionResults <- documentActionResult{documentID: id, sessionID: sessionID, runID: runID, err: err}
+		a.sendDocumentActionResult(documentActionResult{documentID: id, sessionID: sessionID, runID: runID, err: err})
 	}()
+}
+
+func (a *Application) sendDocumentActionResult(result documentActionResult) {
+	select {
+	case a.documentActionResults <- result:
+	case <-a.exitDone:
+	}
 }
 
 func (a *Application) drainDocumentActionResults() {
@@ -594,18 +612,11 @@ func (a *Application) requestDocumentClose(id app.DocumentID) bool {
 	defer a.syncProgramStartGate()
 	if a.shutdown.Active() {
 		attempt := a.shutdown.Attempt()
-		state := a.controller.Snapshot()
 		if !a.shutdown.AllowsDocumentClose(attempt, id) {
 			return false
 		}
-		// Selection is necessary but not sufficient: controller execution may
-		// have changed after shutdown preflight. Never translate an older close
-		// request into an unscoped Stop of a newly admitted run.
-		if !a.shutdown.CanCloseSelectedDocument(attempt, id, state) {
-			a.shutdown.DocumentCloseRejected(attempt, id)
-			a.warnMain("Shutdown Cancelled", "Controller execution or machine recovery became active before the document could close.")
-			return false
-		}
+		// Application teardown never initiates or verifies controller work.
+		// The shutdown coordinator's selected-document ownership is sufficient.
 		return a.closePackageAuxiliaries(id)
 	}
 	if _, approved := a.approvedDocumentCloses[id]; approved {
@@ -641,9 +652,16 @@ func (a *Application) requestDocumentClose(id app.DocumentID) bool {
 	a.pendingDocumentCloses[id] = runID
 	go func() {
 		err := a.controller.StopProgramRun(context.Background(), id, runID)
-		a.documentCloseResults <- documentCloseResult{documentID: id, runID: runID, err: err}
+		a.sendDocumentCloseResult(documentCloseResult{documentID: id, runID: runID, err: err})
 	}()
 	return false
+}
+
+func (a *Application) sendDocumentCloseResult(result documentCloseResult) {
+	select {
+	case a.documentCloseResults <- result:
+	case <-a.exitDone:
+	}
 }
 
 // closePackageAuxiliaries is stage B of package close coordination. Stage A
@@ -673,25 +691,21 @@ func (a *Application) drainDocumentCloseResults() {
 				continue
 			}
 			delete(a.pendingDocumentCloses, result.documentID)
+			if a.shutdown.Active() {
+				// A Stop requested before application exit may finish late. It has no
+				// authority to delay or cancel the accepted application teardown.
+				a.documents.ClearClosePending(result.documentID)
+				delete(a.approvedDocumentCloses, result.documentID)
+				continue
+			}
 			entry, stillOpen := a.documents.Entry(result.documentID)
 			state := a.controller.Snapshot()
-			disposition := frontend.ClassifyDocumentStopResult(result.err, stillOpen, result.documentID, result.runID, state, a.shutdown.Active())
+			disposition := frontend.ClassifyDocumentStopResult(result.err, stillOpen, result.documentID, result.runID, state)
 			if disposition == frontend.DocumentStopInvalid {
 				a.documents.ClearClosePending(result.documentID)
 				if stillOpen {
 					a.warnDocumentStopFailure(entry, result.err)
 				}
-				if a.shutdown.Active() {
-					a.shutdown.Cancel(a.shutdown.Attempt())
-					a.warnMain("Shutdown Cancelled", "An active document stop did not reach a verified stopped state. DDGo remains open for recovery.")
-				}
-				continue
-			}
-			if disposition == frontend.DocumentStopTransferToShutdown {
-				// Shutdown owns native close selection. This independently accepted
-				// Stop remains valid, but it may not borrow shutdown authorization.
-				a.documents.ClearClosePending(result.documentID)
-				delete(a.approvedDocumentCloses, result.documentID)
 				continue
 			}
 			a.approvedDocumentCloses[result.documentID] = result.runID
@@ -788,11 +802,6 @@ func (a *Application) requestMainClose() bool {
 	if a.shutdown.Active() {
 		return false
 	}
-	state := a.controller.Snapshot()
-	if state.MachineReadiness != app.MachineReadinessNormal {
-		a.warnMain("Machine Recovery Required", "DDGo has not verified the controller's safe condition. Complete recovery before exiting.")
-		return false
-	}
 
 	documents := a.documents.Entries()
 	documentIDs := make([]app.DocumentID, 0, len(documents))
@@ -817,86 +826,13 @@ func (a *Application) requestMainClose() bool {
 	return false
 }
 
-func (a *Application) startShutdownStop(attempt frontend.ShutdownAttemptID, target frontend.ShutdownStopTarget) {
-	go func() {
-		err := a.controller.StopProgramRun(context.Background(), target.DocumentID, target.RunID)
-		a.shutdownStopResults <- shutdownStopResult{attempt: attempt, target: target, err: err}
-	}()
-}
-
-func (a *Application) drainShutdownStopResults() {
-	for {
-		select {
-		case result := <-a.shutdownStopResults:
-			if result.attempt != a.shutdown.Attempt() || a.shutdown.Phase() != frontend.ShutdownWaitingForStop {
-				continue
-			}
-			if errors.Is(result.err, app.ErrStopInProgress) {
-				a.shutdown.StopAlreadyInProgress(result.attempt, result.target)
-				continue
-			}
-			state := a.controller.Snapshot()
-			verified := result.err == nil && state.ProgramStatus == app.ProgramStopped && state.MachineReadiness == app.MachineReadinessNormal &&
-				state.ProgramDocumentID == result.target.DocumentID && state.ProgramRunID == result.target.RunID
-			if !a.shutdown.StopResult(result.attempt, result.target, verified) {
-				a.warnMain("Program Stop Failed", stopFailureText(result.err))
-			}
-		default:
-			return
-		}
-	}
-}
-
 func (a *Application) progressShutdown() {
 	defer a.syncProgramStartGate()
 	if !a.shutdown.Active() || a.mainCloseIssued {
 		return
 	}
 	attempt := a.shutdown.Attempt()
-	if a.shutdown.Phase() == frontend.ShutdownWaitingForRunAdmission {
-		if !a.programStarts.Quiescent() {
-			return
-		}
-		// StartProgram updates controller state before its goroutine releases
-		// the gate admission. Read only after observing quiescence so this
-		// snapshot cannot predate the last accepted start's controller result.
-		state := a.controller.Snapshot()
-		if phase := a.shutdown.ResolveRunAdmission(attempt, state); phase == frontend.ShutdownIdle {
-			a.warnMain("Shutdown Cancelled", "Machine recovery became necessary while program start admission was settling.")
-		}
-		return
-	}
-	if a.shutdown.Phase() == frontend.ShutdownWaitingForStopConfirmation {
-		if !confirmStopAndClose(a.mainParent()) {
-			a.shutdown.ConfirmStop(attempt, false)
-			return
-		}
-		if target, ok := a.shutdown.ConfirmStop(attempt, true); ok {
-			a.startShutdownStop(attempt, target)
-		}
-		return
-	}
-	state := a.controller.Snapshot()
-	if a.shutdown.Phase() == frontend.ShutdownWaitingForStop {
-		if a.shutdown.ObserveExternalStop(state) {
-			return
-		}
-		if !a.shutdown.Active() {
-			a.warnMain("Shutdown Cancelled", "The execution changed or did not reach a verified stopped state. DDGo remains open.")
-			return
-		}
-		if state.ProgramStatus == app.ProgramFailed || state.MachineReadiness == app.MachineReadinessRecoveryRequired {
-			a.shutdown.Cancel(attempt)
-			a.warnMain("Program Stop Failed", "The active program did not reach a verified stopped state. DDGo remains open for recovery.")
-		}
-		return
-	}
 	if a.shutdown.Phase() == frontend.ShutdownClosingDocuments {
-		if state.ProgramStatus.IsActive() || state.MachineReadiness != app.MachineReadinessNormal {
-			a.shutdown.Cancel(attempt)
-			a.warnMain("Shutdown Cancelled", "Controller execution or machine recovery became active before documents could close.")
-			return
-		}
 		id, ok := a.shutdown.NextDocumentToClose(attempt)
 		if !ok {
 			return
@@ -913,15 +849,16 @@ func (a *Application) progressShutdown() {
 		return
 	}
 	if a.shutdown.Phase() == frontend.ShutdownReadyToCloseMain {
-		if a.documents.Len() != 0 || state.ProgramStatus.IsActive() || state.MachineReadiness != app.MachineReadinessNormal {
+		if a.documents.Len() != 0 {
 			a.shutdown.Cancel(attempt)
-			a.warnMain("Shutdown Cancelled", "DDGo state changed before final shutdown could be verified.")
+			a.warnMain("Shutdown Cancelled", "A document remained open before final shutdown could be completed.")
 			return
 		}
 		if a.shutdown.CommitMainClose(attempt) {
 			// Commit first; WA_DeleteOnClose means no later callback may safely
 			// invoke this window again.
 			a.mainCloseIssued = true
+			close(a.exitDone)
 			mainWindow := a.mainWindow
 			a.mainWindow = nil
 			mainWindow.Close()
@@ -961,9 +898,9 @@ func documentParent(entry frontend.DocumentEntry) *qt.QWidget {
 // Dialogs are modal only for user choices. Controller Stop completion is
 // asynchronous and returns through the application's regular UI timer.
 func confirmApplicationClose(parent *qt.QWidget, documentCount int) bool {
-	message := "Exit DDGo?"
+	message := "Exit DDGo? Exiting does not guarantee that the physical machine has stopped."
 	if documentCount > 0 {
-		message = "Close all open documents and exit DDGo?"
+		message = "Close all open documents and exit DDGo? Exiting does not guarantee that the physical machine has stopped."
 	}
 	return qt.QMessageBox_Question(parent, "Close DDGo?", message) == qt.QMessageBox__Yes
 }
