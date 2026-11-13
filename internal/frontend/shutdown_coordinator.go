@@ -44,11 +44,24 @@ func (c *ShutdownCoordinator) ConfirmationPending() bool {
 	return c.phase == ShutdownConfirming
 }
 
+// ProvisionalTeardown reports that the user accepted application exit and
+// native document closure is underway, but a document may still refuse to
+// close and return the application to normal operation.
+func (c *ShutdownCoordinator) ProvisionalTeardown() bool {
+	return c.phase == ShutdownClosingDocuments || c.phase == ShutdownReadyToCloseMain
+}
+
+// ExitCommitted reports that CommitMainClose succeeded. At this point no
+// surviving native UI owner may receive asynchronous frontend results.
+func (c *ShutdownCoordinator) ExitCommitted() bool {
+	return c.phase == ShutdownFinished
+}
+
 // TeardownActive reports that the user accepted application exit and native
-// document teardown is now in progress (or complete). Unlike Active, this
-// intentionally excludes the cancellable confirmation phase.
+// document teardown is in progress or final exit has been committed. Unlike
+// Active, this intentionally excludes the cancellable confirmation phase.
 func (c *ShutdownCoordinator) TeardownActive() bool {
-	return c.phase == ShutdownClosingDocuments || c.phase == ShutdownReadyToCloseMain || c.phase == ShutdownFinished
+	return c.ProvisionalTeardown() || c.ExitCommitted()
 }
 
 // Begin records the open logical documents before ordinary exit confirmation.

@@ -38,6 +38,7 @@ type Application struct {
 	deferredDocumentStarts   map[frontend.ExecutionSessionID]documentStartResult
 	documentStartResults     chan documentStartResult
 	pendingDocumentActions   map[frontend.ExecutionSessionID]app.RunID
+	deferredDocumentActions  map[frontend.ExecutionSessionID]documentActionResult
 	documentActionResults    chan documentActionResult
 	packageViews             frontend.PackageAuxiliaryViews
 	packageSessions          map[app.DocumentID]map[frontend.ExecutionSessionID]struct{}
@@ -45,9 +46,11 @@ type Application struct {
 	selectedPackageObservers map[app.DocumentID]func()
 	selectedPackageSessions  map[app.DocumentID]frontend.ExecutionSessionID
 
-	shutdown        frontend.ShutdownCoordinator
-	mainCloseIssued bool
-	programStarts   frontend.ProgramStartGate
+	shutdown                frontend.ShutdownCoordinator
+	shutdownRecoveryPending bool
+	shutdownRecoveryReady   bool
+	mainCloseIssued         bool
+	programStarts           frontend.ProgramStartGate
 }
 
 type documentCloseResult struct {
@@ -97,6 +100,7 @@ func (a *Application) Run() error {
 	a.deferredDocumentStarts = make(map[frontend.ExecutionSessionID]documentStartResult)
 	a.documentStartResults = make(chan documentStartResult, 16)
 	a.pendingDocumentActions = make(map[frontend.ExecutionSessionID]app.RunID)
+	a.deferredDocumentActions = make(map[frontend.ExecutionSessionID]documentActionResult)
 	a.documentActionResults = make(chan documentActionResult, 16)
 	a.packageSessions = make(map[app.DocumentID]map[frontend.ExecutionSessionID]struct{})
 	a.packageObservers = make(map[app.DocumentID]func())
@@ -393,6 +397,7 @@ func (a *Application) drainControllerEvents() {
 			a.drainDocumentStartResults()
 			a.drainDocumentActionResults()
 			a.drainDocumentCloseResults()
+			a.recoverAbortedShutdown()
 			a.progressShutdown()
 			a.syncProgramStartGate()
 			return
@@ -452,10 +457,10 @@ func (a *Application) drainDocumentStartResults() {
 			if !pending || request.id != result.requestID {
 				continue
 			}
-			if frontend.ShutdownAsyncDisposition(a.shutdown.Phase(), frontend.ShutdownAsyncStartResult) == frontend.ShutdownAsyncDefer {
-				// A modal confirmation can run the UI timer. Keep the accepted
-				// admission result until cancellation rather than applying a close
-				// side effect behind the dialog or losing it permanently.
+			if a.shutdownAsyncDisposition(frontend.ShutdownAsyncStartResult) == frontend.ShutdownAsyncDefer {
+				// Confirmation and native document closure are both provisional.
+				// Retain the admission result until cancellation or final exit rather
+				// than applying a document-close side effect behind either phase.
 				a.deferredDocumentStarts[result.sessionID] = result
 				continue
 			}
@@ -473,9 +478,8 @@ func (a *Application) applyDocumentStartResult(result documentStartResult) {
 	}
 	delete(a.pendingDocumentStarts, result.sessionID)
 	delete(a.deferredDocumentStarts, result.sessionID)
-	// A confirmed application exit deliberately does not wait for, or publish
-	// UI state from, a late controller admission result.
-	if a.shutdown.TeardownActive() {
+	// After CommitMainClose no native UI owner can safely receive a result.
+	if a.shutdown.ExitCommitted() {
 		return
 	}
 	entry, open := a.documents.Entry(result.documentID)
@@ -506,17 +510,17 @@ func (a *Application) applyDocumentStartResult(result documentStartResult) {
 }
 
 func (a *Application) resolvePendingAdmissionCloses() {
-	if a.shutdown.TeardownActive() {
+	if a.shutdown.ExitCommitted() {
 		for documentID := range a.pendingAdmissionCloses {
 			delete(a.pendingAdmissionCloses, documentID)
 			a.documents.ClearClosePending(documentID)
 		}
 		return
 	}
-	// The ordinary confirmation dialog may run a nested Qt event loop. Keep
-	// deferred admission closes intact until the user either cancels (when
-	// normal Stop-and-Close handling resumes) or confirms teardown.
-	if a.shutdown.ConfirmationPending() {
+	// Confirmation and document teardown may both be abandoned. Keep deferred
+	// admission closes intact until ordinary operation resumes or final exit is
+	// committed, so a surviving document is not stranded close-pending.
+	if a.shutdownRecoveryPending || a.shutdown.Phase() != frontend.ShutdownIdle {
 		return
 	}
 	for documentID, runID := range a.pendingAdmissionCloses {
@@ -597,16 +601,29 @@ func (a *Application) drainDocumentActionResults() {
 			if !pending || runID != result.runID {
 				continue
 			}
-			delete(a.pendingDocumentActions, result.sessionID)
-			if frontend.ShutdownAsyncDisposition(a.shutdown.Phase(), frontend.ShutdownAsyncActionResult) == frontend.ShutdownAsyncDiscard {
+			if a.shutdownAsyncDisposition(frontend.ShutdownAsyncActionResult) == frontend.ShutdownAsyncDefer {
+				a.deferredDocumentActions[result.sessionID] = result
 				continue
 			}
-			if _, ok := a.documents.Entry(result.documentID); ok {
-				_ = a.sessions.FinishAction(result.sessionID, result.runID, result.err)
-			}
+			a.applyDocumentActionResult(result)
 		default:
 			return
 		}
+	}
+}
+
+func (a *Application) applyDocumentActionResult(result documentActionResult) {
+	runID, pending := a.pendingDocumentActions[result.sessionID]
+	if !pending || runID != result.runID {
+		return
+	}
+	delete(a.pendingDocumentActions, result.sessionID)
+	delete(a.deferredDocumentActions, result.sessionID)
+	if a.shutdown.ExitCommitted() {
+		return
+	}
+	if _, ok := a.documents.Entry(result.documentID); ok {
+		_ = a.sessions.FinishAction(result.sessionID, result.runID, result.err)
 	}
 }
 
@@ -615,7 +632,7 @@ func (a *Application) syncProgramStartGate() {
 		a.programStarts.Finalize()
 		return
 	}
-	if a.shutdown.Active() {
+	if a.shutdown.Active() || a.shutdownRecoveryPending {
 		a.programStarts.Freeze()
 		return
 	}
@@ -639,6 +656,9 @@ func (a *Application) hasPendingSessionStart(documentID app.DocumentID) bool {
 // second document Stop request or an accidental partial shutdown.
 func (a *Application) requestDocumentClose(id app.DocumentID) bool {
 	defer a.syncProgramStartGate()
+	if a.shutdownRecoveryPending {
+		return false
+	}
 	if a.shutdown.Active() {
 		attempt := a.shutdown.Attempt()
 		if !a.shutdown.AllowsDocumentClose(attempt, id) {
@@ -719,10 +739,10 @@ func (a *Application) drainDocumentCloseResults() {
 			if !pending || expectedRun != result.runID {
 				continue
 			}
-			if frontend.ShutdownAsyncDisposition(a.shutdown.Phase(), frontend.ShutdownAsyncStopAndCloseResult) == frontend.ShutdownAsyncDefer {
-				// Do not lose an independently requested Stop while a cancellable
-				// modal exit dialog is open, and do not let it close a document
-				// behind that dialog. One result per document is possible here.
+			if a.shutdownAsyncDisposition(frontend.ShutdownAsyncStopAndCloseResult) == frontend.ShutdownAsyncDefer {
+				// Do not lose an independently requested Stop while confirmation or
+				// native teardown may still be cancelled, and do not let it close a
+				// document behind either phase. One result per document is possible.
 				a.deferredDocumentCloses[result.documentID] = result
 				continue
 			}
@@ -734,8 +754,8 @@ func (a *Application) drainDocumentCloseResults() {
 }
 
 // applyDocumentCloseResult completes independent Stop-and-Close after the
-// result is safe to act on. Confirmed application teardown deliberately drops
-// it: teardown owns native document closure and never waits for controller I/O.
+// result is safe to act on. Only a committed main-window exit drops it;
+// provisional native teardown can still be cancelled.
 func (a *Application) applyDocumentCloseResult(result documentCloseResult) {
 	expectedRun, pending := a.pendingDocumentCloses[result.documentID]
 	if !pending || expectedRun != result.runID {
@@ -743,7 +763,7 @@ func (a *Application) applyDocumentCloseResult(result documentCloseResult) {
 	}
 	delete(a.pendingDocumentCloses, result.documentID)
 	delete(a.deferredDocumentCloses, result.documentID)
-	if a.shutdown.TeardownActive() {
+	if a.shutdown.ExitCommitted() {
 		a.documents.ClearClosePending(result.documentID)
 		delete(a.approvedDocumentCloses, result.documentID)
 		return
@@ -766,16 +786,40 @@ func (a *Application) applyDocumentCloseResult(result documentCloseResult) {
 	}
 }
 
-func (a *Application) applyDeferredDocumentCloseResults() {
+func (a *Application) reconcileDeferredAsyncResults() {
 	if a.shutdown.Active() {
 		return
 	}
 	for _, result := range a.deferredDocumentStarts {
 		a.applyDocumentStartResult(result)
 	}
+	for _, result := range a.deferredDocumentActions {
+		a.applyDocumentActionResult(result)
+	}
 	for _, result := range a.deferredDocumentCloses {
 		a.applyDocumentCloseResult(result)
 	}
+	a.resolvePendingAdmissionCloses()
+}
+
+// recoverAbortedShutdown runs on the next normal UI timer turn after native
+// teardown refused a document. At that point any warning dialog has returned,
+// surviving document ownership is authoritative, and deferred results can use
+// the ordinary independent-close policy without recursive close callbacks.
+func (a *Application) recoverAbortedShutdown() {
+	if !a.shutdownRecoveryPending || !a.shutdownRecoveryReady || a.shutdown.Active() || a.mainCloseIssued {
+		return
+	}
+	a.shutdownRecoveryPending = false
+	a.shutdownRecoveryReady = false
+	a.reconcileDeferredAsyncResults()
+}
+
+func (a *Application) shutdownAsyncDisposition(kind frontend.ShutdownAsyncResultKind) frontend.ShutdownAsyncResultDisposition {
+	if a.shutdownRecoveryPending {
+		return frontend.ShutdownAsyncDefer
+	}
+	return frontend.ShutdownAsyncDisposition(a.shutdown.Phase(), kind)
 }
 
 func (a *Application) documentClosed(entry frontend.DocumentEntry) {
@@ -785,6 +829,7 @@ func (a *Application) documentClosed(entry frontend.DocumentEntry) {
 	delete(a.pendingDocumentStarts, frontend.StandaloneExecutionSessionID(entry.ID))
 	delete(a.deferredDocumentStarts, frontend.StandaloneExecutionSessionID(entry.ID))
 	delete(a.pendingDocumentActions, frontend.StandaloneExecutionSessionID(entry.ID))
+	delete(a.deferredDocumentActions, frontend.StandaloneExecutionSessionID(entry.ID))
 	delete(a.approvedDocumentCloses, entry.ID)
 	if a.sessions != nil {
 		a.sessions.Remove(frontend.StandaloneExecutionSessionID(entry.ID))
@@ -810,6 +855,7 @@ func (a *Application) documentClosed(entry frontend.DocumentEntry) {
 			delete(a.pendingDocumentStarts, id)
 			delete(a.deferredDocumentStarts, id)
 			delete(a.pendingDocumentActions, id)
+			delete(a.deferredDocumentActions, id)
 		}
 		for id := range a.packageSessions[entry.ID] {
 			if a.sessions != nil {
@@ -860,6 +906,9 @@ func (a *Application) requestMainClose() bool {
 	if a.mainCloseIssued {
 		return true
 	}
+	if a.shutdownRecoveryPending {
+		return false
+	}
 	if a.shutdown.Active() {
 		return false
 	}
@@ -884,8 +933,7 @@ func (a *Application) requestMainClose() bool {
 		a.shutdown.ConfirmApplication(attempt, false)
 		// Results can arrive in the confirmation dialog's nested event loop.
 		// Resume independent deferred close work only after cancellation.
-		a.applyDeferredDocumentCloseResults()
-		a.resolvePendingAdmissionCloses()
+		a.reconcileDeferredAsyncResults()
 		return false
 	}
 	a.shutdown.ConfirmApplication(attempt, true)
@@ -911,15 +959,24 @@ func (a *Application) progressShutdown() {
 			return
 		}
 		if !entry.Window.Close() {
-			a.shutdown.DocumentCloseRejected(attempt, id)
-			a.warnMain("Shutdown Cancelled", "A document refused to close. DDGo remains open.")
+			if a.shutdown.DocumentCloseRejected(attempt, id) {
+				// Keep incoming results deferred even though the coordinator is now
+				// idle: the warning dialog below runs a nested event loop. Reconcile
+				// on a later normal timer turn once the dialog has returned.
+				a.shutdownRecoveryPending = true
+				a.warnMain("Shutdown Cancelled", "A document refused to close. DDGo remains open.")
+				a.shutdownRecoveryReady = true
+			}
 		}
 		return
 	}
 	if a.shutdown.Phase() == frontend.ShutdownReadyToCloseMain {
 		if a.documents.Len() != 0 {
-			a.shutdown.Cancel(attempt)
-			a.warnMain("Shutdown Cancelled", "A document remained open before final shutdown could be completed.")
+			if a.shutdown.Cancel(attempt) {
+				a.shutdownRecoveryPending = true
+				a.warnMain("Shutdown Cancelled", "A document remained open before final shutdown could be completed.")
+				a.shutdownRecoveryReady = true
+			}
 			return
 		}
 		if a.shutdown.CommitMainClose(attempt) {

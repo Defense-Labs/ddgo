@@ -89,8 +89,9 @@ func TestShutdownAsyncDispositionPreservesResultsUntilConfirmationOutcome(t *tes
 		{"confirmation pending start", ShutdownConfirming, ShutdownAsyncStartResult, ShutdownAsyncDefer},
 		{"confirmation pending action", ShutdownConfirming, ShutdownAsyncActionResult, ShutdownAsyncApply},
 		{"confirmation pending stop", ShutdownConfirming, ShutdownAsyncStopAndCloseResult, ShutdownAsyncDefer},
-		{"confirmed teardown start", ShutdownClosingDocuments, ShutdownAsyncStartResult, ShutdownAsyncDiscard},
-		{"confirmed teardown action", ShutdownReadyToCloseMain, ShutdownAsyncActionResult, ShutdownAsyncDiscard},
+		{"provisional teardown start", ShutdownClosingDocuments, ShutdownAsyncStartResult, ShutdownAsyncDefer},
+		{"provisional teardown action", ShutdownClosingDocuments, ShutdownAsyncActionResult, ShutdownAsyncDefer},
+		{"ready-to-commit stop", ShutdownReadyToCloseMain, ShutdownAsyncStopAndCloseResult, ShutdownAsyncDefer},
 		{"finished stop", ShutdownFinished, ShutdownAsyncStopAndCloseResult, ShutdownAsyncDiscard},
 	}
 	for _, test := range tests {
@@ -99,6 +100,64 @@ func TestShutdownAsyncDispositionPreservesResultsUntilConfirmationOutcome(t *tes
 				t.Fatalf("ShutdownAsyncDisposition(%v, %v) = %v, want %v", test.phase, test.kind, got, test.want)
 			}
 		})
+	}
+}
+
+func TestShutdownCoordinatorAbortedTeardownMakesDeferredResultsRecoverable(t *testing.T) {
+	coordinator, attempt := beginShutdown(t, []app.DocumentID{1, 2})
+	confirmShutdown(t, coordinator, attempt)
+	first, ok := coordinator.NextDocumentToClose(attempt)
+	if !ok || !coordinator.DocumentClosed(attempt, first) {
+		t.Fatal("first document did not close during provisional teardown")
+	}
+	second, ok := coordinator.NextDocumentToClose(attempt)
+	if !ok || second == first {
+		t.Fatal("second document was not selected after partial teardown")
+	}
+	for _, kind := range []ShutdownAsyncResultKind{
+		ShutdownAsyncStartResult,
+		ShutdownAsyncActionResult,
+		ShutdownAsyncStopAndCloseResult,
+	} {
+		if got := ShutdownAsyncDisposition(coordinator.Phase(), kind); got != ShutdownAsyncDefer {
+			t.Fatalf("provisional result kind %v = %v, want defer", kind, got)
+		}
+	}
+	if !coordinator.DocumentCloseRejected(attempt, second) || coordinator.Phase() != ShutdownIdle {
+		t.Fatalf("failed teardown phase = %v", coordinator.Phase())
+	}
+	for _, kind := range []ShutdownAsyncResultKind{
+		ShutdownAsyncStartResult,
+		ShutdownAsyncActionResult,
+		ShutdownAsyncStopAndCloseResult,
+	} {
+		if got := ShutdownAsyncDisposition(coordinator.Phase(), kind); got != ShutdownAsyncApply {
+			t.Fatalf("aborted teardown result kind %v = %v, want apply", kind, got)
+		}
+	}
+	if next, ok := coordinator.Begin([]app.DocumentID{second}); !ok || next == attempt {
+		t.Fatal("aborted teardown did not permit a fresh exit attempt")
+	}
+}
+
+func TestShutdownCoordinatorCommittedExitDiscardsDeferredResults(t *testing.T) {
+	coordinator, attempt := beginShutdown(t, []app.DocumentID{1})
+	confirmShutdown(t, coordinator, attempt)
+	id, ok := coordinator.NextDocumentToClose(attempt)
+	if !ok || !coordinator.DocumentClosed(attempt, id) {
+		t.Fatal("document close did not reach final commit")
+	}
+	if _, ok := coordinator.NextDocumentToClose(attempt); ok || !coordinator.CommitMainClose(attempt) || !coordinator.ExitCommitted() {
+		t.Fatal("shutdown did not commit final exit")
+	}
+	for _, kind := range []ShutdownAsyncResultKind{
+		ShutdownAsyncStartResult,
+		ShutdownAsyncActionResult,
+		ShutdownAsyncStopAndCloseResult,
+	} {
+		if got := ShutdownAsyncDisposition(coordinator.Phase(), kind); got != ShutdownAsyncDiscard {
+			t.Fatalf("committed result kind %v = %v, want discard", kind, got)
+		}
 	}
 }
 
